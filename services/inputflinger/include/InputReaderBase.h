@@ -126,7 +126,20 @@ struct InputReaderConfiguration {
     // The suggested display ID to show the cursor.
     int32_t defaultPointerDisplayId;
 
+    // The mouse pointer speed, as a number from -7 (slowest) to 7 (fastest).
+    //
+    // Currently only used when the enable_new_mouse_pointer_ballistics flag is enabled.
+    int32_t mousePointerSpeed;
+
+    // Displays on which an acceleration curve shouldn't be applied for pointer movements from mice.
+    //
+    // Currently only used when the enable_new_mouse_pointer_ballistics flag is enabled.
+    std::set<int32_t> displaysWithMousePointerAccelerationDisabled;
+
     // Velocity control parameters for mouse pointer movements.
+    //
+    // If the enable_new_mouse_pointer_ballistics flag is enabled, these are ignored and the values
+    // of mousePointerSpeed and mousePointerAccelerationEnabled used instead.
     VelocityControlParameters pointerVelocityControlParameters;
 
     // Velocity control parameters for mouse wheel movements.
@@ -213,6 +226,9 @@ struct InputReaderConfiguration {
     // True to enable tap-to-click on touchpads.
     bool touchpadTapToClickEnabled;
 
+    // True to enable tap dragging on touchpads.
+    bool touchpadTapDraggingEnabled;
+
     // True to enable a zone on the right-hand side of touchpads where clicks will be turned into
     // context (a.k.a. "right") clicks.
     bool touchpadRightClickZoneEnabled;
@@ -229,6 +245,8 @@ struct InputReaderConfiguration {
 
     InputReaderConfiguration()
           : virtualKeyQuietTime(0),
+            mousePointerSpeed(0),
+            displaysWithMousePointerAccelerationDisabled(),
             pointerVelocityControlParameters(1.0f, 500.0f, 3000.0f,
                                              static_cast<float>(
                                                      android::os::IInputConstants::
@@ -251,6 +269,7 @@ struct InputReaderConfiguration {
             touchpadPointerSpeed(0),
             touchpadNaturalScrollingEnabled(true),
             touchpadTapToClickEnabled(true),
+            touchpadTapDraggingEnabled(false),
             touchpadRightClickZoneEnabled(false),
             stylusButtonMotionEventsEnabled(true),
             stylusPointerIconEnabled(false) {}
@@ -437,7 +456,8 @@ public:
 
     /* Gets the keyboard layout for a particular input device. */
     virtual std::shared_ptr<KeyCharacterMap> getKeyboardLayoutOverlay(
-            const InputDeviceIdentifier& identifier) = 0;
+            const InputDeviceIdentifier& identifier,
+            const std::optional<KeyboardLayoutInfo> keyboardLayoutInfo) = 0;
 
     /* Gets a user-supplied alias for a particular input device, or an empty string if none. */
     virtual std::string getDeviceAlias(const InputDeviceIdentifier& identifier) = 0;
@@ -450,6 +470,15 @@ public:
 
     /* Returns true if any InputConnection is currently active. */
     virtual bool isInputMethodConnectionActive() = 0;
+
+    /* Gets the viewport of a particular display that the pointer device is associated with. If
+     * the pointer device is not associated with any display, it should ADISPLAY_IS_NONE to get
+     * the viewport that should be used. The device should get a new viewport using this method
+     * every time there is a display configuration change. The logical bounds of the viewport should
+     * be used as the range of possible values for pointing devices, like mice and touchpads.
+     */
+    virtual std::optional<DisplayViewport> getPointerViewportForAssociatedDisplay(
+            int32_t associatedDisplayId = ADISPLAY_ID_NONE) = 0;
 };
 
 } // namespace android

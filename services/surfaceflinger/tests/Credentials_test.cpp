@@ -275,18 +275,6 @@ TEST_F(CredentialsTest, CreateDisplayTest) {
     ASSERT_NO_FATAL_FAILURE(checkWithPrivileges(condition, true, false));
 }
 
-TEST_F(CredentialsTest, CaptureTest) {
-    const auto display = getFirstDisplayToken();
-    std::function<status_t()> condition = [=]() {
-        sp<GraphicBuffer> outBuffer;
-        DisplayCaptureArgs captureArgs;
-        captureArgs.displayToken = display;
-        ScreenCaptureResults captureResults;
-        return ScreenCapture::captureDisplay(captureArgs, captureResults);
-    };
-    ASSERT_NO_FATAL_FAILURE(checkWithPrivileges<status_t>(condition, NO_ERROR, PERMISSION_DENIED));
-}
-
 TEST_F(CredentialsTest, CaptureLayersTest) {
     setupBackgroundSurface();
     sp<GraphicBuffer> outBuffer;
@@ -401,8 +389,13 @@ TEST_F(CredentialsTest, TransactionPermissionTest) {
                 .apply();
     }
 
-    // Called from non privileged process
-    Transaction().setTrustedOverlay(surfaceControl, true);
+    // Attempt to set a trusted overlay from a non-privileged process. This should fail silently.
+    {
+        UIDFaker f{AID_BIN};
+        Transaction().setTrustedOverlay(surfaceControl, true).apply(/*synchronous=*/true);
+    }
+
+    // Verify that the layer was not made a trusted overlay.
     {
         UIDFaker f(AID_SYSTEM);
         auto windowIsPresentAndNotTrusted = [&](const std::vector<WindowInfo>& windowInfos) {
@@ -413,12 +406,14 @@ TEST_F(CredentialsTest, TransactionPermissionTest) {
             }
             return !foundWindowInfo->inputConfig.test(WindowInfo::InputConfig::TRUSTED_OVERLAY);
         };
-        windowInfosListenerUtils.waitForWindowInfosPredicate(windowIsPresentAndNotTrusted);
+        ASSERT_TRUE(
+                windowInfosListenerUtils.waitForWindowInfosPredicate(windowIsPresentAndNotTrusted));
     }
 
+    // Verify that privileged processes are able to set trusted overlays.
     {
         UIDFaker f(AID_SYSTEM);
-        Transaction().setTrustedOverlay(surfaceControl, true);
+        Transaction().setTrustedOverlay(surfaceControl, true).apply(/*synchronous=*/true);
         auto windowIsPresentAndTrusted = [&](const std::vector<WindowInfo>& windowInfos) {
             auto foundWindowInfo =
                     WindowInfosListenerUtils::findMatchingWindowInfo(windowInfo, windowInfos);
@@ -427,7 +422,8 @@ TEST_F(CredentialsTest, TransactionPermissionTest) {
             }
             return foundWindowInfo->inputConfig.test(WindowInfo::InputConfig::TRUSTED_OVERLAY);
         };
-        windowInfosListenerUtils.waitForWindowInfosPredicate(windowIsPresentAndTrusted);
+        ASSERT_TRUE(
+                windowInfosListenerUtils.waitForWindowInfosPredicate(windowIsPresentAndTrusted));
     }
 }
 

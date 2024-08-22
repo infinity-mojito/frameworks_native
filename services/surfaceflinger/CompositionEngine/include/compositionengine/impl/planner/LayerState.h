@@ -227,6 +227,7 @@ public:
     // Returns the bit-set of differing fields between this LayerState and another LayerState.
     // This bit-set is based on NonUniqueFields only, and excludes GraphicBuffers.
     ftl::Flags<LayerStateField> getDifferingFields(const LayerState& other) const;
+    bool isSourceCropSizeEqual(const LayerState& other) const;
 
     compositionengine::OutputLayer* getOutputLayer() const { return mOutputLayer; }
     int32_t getId() const { return mId.get(); }
@@ -256,11 +257,6 @@ public:
     bool isProtected() const { return mIsProtected.get(); }
 
     gui::CachingHint getCachingHint() const { return mCachingHint.get(); }
-
-    bool hasSolidColorCompositionType() const {
-        return getOutputLayer()->getLayerFE().getCompositionState()->compositionType ==
-                aidl::android::hardware::graphics::composer3::Composition::SOLID_COLOR;
-    }
 
     float getFps() const { return getOutputLayer()->getLayerFE().getCompositionState()->fps; }
 

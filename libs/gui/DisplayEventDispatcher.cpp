@@ -173,7 +173,13 @@ bool DisplayEventDispatcher::processPendingEvents(nsecs_t* outTimestamp,
                     *outVsyncEventData = ev.vsync.vsyncData;
                     break;
                 case DisplayEventReceiver::DISPLAY_EVENT_HOTPLUG:
-                    dispatchHotplug(ev.header.timestamp, ev.header.displayId, ev.hotplug.connected);
+                    if (ev.hotplug.connectionError == 0) {
+                        dispatchHotplug(ev.header.timestamp, ev.header.displayId,
+                                        ev.hotplug.connected);
+                    } else {
+                        dispatchHotplugConnectionError(ev.header.timestamp,
+                                                       ev.hotplug.connectionError);
+                    }
                     break;
                 case DisplayEventReceiver::DISPLAY_EVENT_MODE_CHANGE:
                     dispatchModeChanged(ev.header.timestamp, ev.header.displayId,
@@ -188,6 +194,11 @@ bool DisplayEventDispatcher::processPendingEvents(nsecs_t* outTimestamp,
                 case DisplayEventReceiver::DISPLAY_EVENT_FRAME_RATE_OVERRIDE_FLUSH:
                     dispatchFrameRateOverrides(ev.header.timestamp, ev.header.displayId,
                                                std::move(mFrameRateOverrides));
+                    break;
+                case DisplayEventReceiver::DISPLAY_EVENT_HDCP_LEVELS_CHANGE:
+                    dispatchHdcpLevelsChanged(ev.header.displayId,
+                                              ev.hdcpLevelsChange.connectedLevel,
+                                              ev.hdcpLevelsChange.maxLevel);
                     break;
                 default:
                     ALOGW("dispatcher %p ~ ignoring unknown event type %#x", this, ev.header.type);

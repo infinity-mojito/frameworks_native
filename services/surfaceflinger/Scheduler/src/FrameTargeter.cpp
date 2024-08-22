@@ -27,28 +27,28 @@ FrameTarget::FrameTarget(const std::string& displayLabel)
         mHwcFrameMissed("PrevHwcFrameMissed " + displayLabel, false),
         mGpuFrameMissed("PrevGpuFrameMissed " + displayLabel, false) {}
 
-TimePoint FrameTarget::pastVsyncTime(Period vsyncPeriod) const {
+TimePoint FrameTarget::pastVsyncTime(Period minFramePeriod) const {
     // TODO(b/267315508): Generalize to N VSYNCs.
-    const int shift = static_cast<int>(targetsVsyncsAhead<2>(vsyncPeriod));
-    return mExpectedPresentTime - Period::fromNs(vsyncPeriod.ns() << shift);
+    const int shift = static_cast<int>(targetsVsyncsAhead<2>(minFramePeriod));
+    return mExpectedPresentTime - Period::fromNs(minFramePeriod.ns() << shift);
 }
 
-const FenceTimePtr& FrameTarget::presentFenceForPastVsync(Period vsyncPeriod) const {
+const FenceTimePtr& FrameTarget::presentFenceForPastVsync(Period minFramePeriod) const {
     // TODO(b/267315508): Generalize to N VSYNCs.
-    const size_t i = static_cast<size_t>(targetsVsyncsAhead<2>(vsyncPeriod));
+    const size_t i = static_cast<size_t>(targetsVsyncsAhead<2>(minFramePeriod));
     return mPresentFences[i].fenceTime;
 }
 
-bool FrameTarget::wouldPresentEarly(Period vsyncPeriod) const {
+bool FrameTarget::wouldPresentEarly(Period minFramePeriod) const {
     // TODO(b/241285475): Since this is called during `composite`, the calls to `targetsVsyncsAhead`
     // should use `TimePoint::now()` in case of delays since `mFrameBeginTime`.
 
     // TODO(b/267315508): Generalize to N VSYNCs.
-    if (targetsVsyncsAhead<3>(vsyncPeriod)) {
+    if (targetsVsyncsAhead<3>(minFramePeriod)) {
         return true;
     }
 
-    const auto fence = presentFenceForPastVsync(vsyncPeriod);
+    const auto fence = presentFenceForPastVsync(minFramePeriod);
     return fence->isValid() && fence->getSignalTime() != Fence::SIGNAL_TIME_PENDING;
 }
 
@@ -68,6 +68,7 @@ void FrameTargeter::beginFrame(const BeginFrameArgs& args, const IVsyncSource& v
     mScheduledPresentTime = args.expectedVsyncTime;
 
     const Period vsyncPeriod = vsyncSource.period();
+    const Period minFramePeriod = vsyncSource.minFramePeriod();
 
     // Calculate the expected present time once and use the cached value throughout this frame to
     // make sure all layers are seeing this same value.
@@ -81,11 +82,15 @@ void FrameTargeter::beginFrame(const BeginFrameArgs& args, const IVsyncSource& v
         }
     }
 
+    if (!mSupportsExpectedPresentTime) {
+        mEarliestPresentTime = computeEarliestPresentTime(minFramePeriod, args.hwcMinWorkDuration);
+    }
+
     ATRACE_FORMAT("%s %" PRId64 " vsyncIn %.2fms%s", __func__, ftl::to_underlying(args.vsyncId),
                   ticks<std::milli, float>(mExpectedPresentTime - TimePoint::now()),
                   mExpectedPresentTime == args.expectedVsyncTime ? "" : " (adjusted)");
 
-    const FenceTimePtr& pastPresentFence = presentFenceForPastVsync(vsyncPeriod);
+    const FenceTimePtr& pastPresentFence = presentFenceForPastVsync(minFramePeriod);
 
     // In cases where the present fence is about to fire, give it a small grace period instead of
     // giving up on the frame.
@@ -118,6 +123,14 @@ void FrameTargeter::beginFrame(const BeginFrameArgs& args, const IVsyncSource& v
     if (mFrameMissed) mFrameMissedCount++;
     if (mHwcFrameMissed) mHwcFrameMissedCount++;
     if (mGpuFrameMissed) mGpuFrameMissedCount++;
+}
+
+std::optional<TimePoint> FrameTargeter::computeEarliestPresentTime(Period minFramePeriod,
+                                                                   Duration hwcMinWorkDuration) {
+    if (wouldPresentEarly(minFramePeriod)) {
+        return previousFrameVsyncTime(minFramePeriod) - hwcMinWorkDuration;
+    }
+    return {};
 }
 
 void FrameTargeter::endFrame(const CompositeResult& result) {

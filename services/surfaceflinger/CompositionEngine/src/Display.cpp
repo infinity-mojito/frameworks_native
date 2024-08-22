@@ -57,6 +57,7 @@ void Display::setConfiguration(const compositionengine::DisplayCreationArgs& arg
     mId = args.id;
     mPowerAdvisor = args.powerAdvisor;
     editState().isSecure = args.isSecure;
+    editState().isProtected = args.isProtected;
     editState().displaySpace.setBounds(args.pixels);
     setName(args.name);
 }
@@ -71,6 +72,10 @@ DisplayId Display::getId() const {
 
 bool Display::isSecure() const {
     return getState().isSecure;
+}
+
+void Display::setSecure(bool secure) {
+    editState().isSecure = secure;
 }
 
 bool Display::isVirtual() const {
@@ -107,14 +112,9 @@ void Display::setColorTransform(const compositionengine::CompositionRefreshArgs&
 }
 
 void Display::setColorProfile(const ColorProfile& colorProfile) {
-    const ui::Dataspace targetDataspace =
-            getDisplayColorProfile()->getTargetDataspace(colorProfile.mode, colorProfile.dataspace,
-                                                         colorProfile.colorSpaceAgnosticDataspace);
-
     if (colorProfile.mode == getState().colorMode &&
         colorProfile.dataspace == getState().dataspace &&
-        colorProfile.renderIntent == getState().renderIntent &&
-        targetDataspace == getState().targetDataspace) {
+        colorProfile.renderIntent == getState().renderIntent) {
         return;
     }
 
@@ -204,13 +204,12 @@ void Display::setReleasedLayers(const compositionengine::CompositionRefreshArgs&
     setReleasedLayers(std::move(releasedLayers));
 }
 
-void Display::applyDisplayBrightness(const bool applyImmediately) {
-    auto& hwc = getCompositionEngine().getHwComposer();
-    const auto halDisplayId = HalDisplayId::tryCast(*getDisplayId());
-    if (const auto physicalDisplayId = PhysicalDisplayId::tryCast(*halDisplayId);
-        physicalDisplayId && getState().displayBrightness) {
+void Display::applyDisplayBrightness(bool applyImmediately) {
+    if (const auto displayId = ftl::Optional(getDisplayId()).and_then(PhysicalDisplayId::tryCast);
+        displayId && getState().displayBrightness) {
+        auto& hwc = getCompositionEngine().getHwComposer();
         const status_t result =
-                hwc.setDisplayBrightness(*physicalDisplayId, *getState().displayBrightness,
+                hwc.setDisplayBrightness(*displayId, *getState().displayBrightness,
                                          getState().displayBrightnessNits,
                                          Hwc2::Composer::DisplayBrightnessOptions{
                                                  .applyImmediately = applyImmediately})
@@ -259,10 +258,10 @@ bool Display::chooseCompositionStrategy(
 
     const TimePoint hwcValidateStartTime = TimePoint::now();
 
-    if (status_t result =
-                hwc.getDeviceCompositionChanges(*halDisplayId, requiresClientComposition,
-                                                getState().earliestPresentTime,
-                                                getState().expectedPresentTime, outChanges);
+    if (status_t result = hwc.getDeviceCompositionChanges(*halDisplayId, requiresClientComposition,
+                                                          getState().earliestPresentTime,
+                                                          getState().expectedPresentTime,
+                                                          getState().frameInterval, outChanges);
         result != NO_ERROR) {
         ALOGE("chooseCompositionStrategy failed for %s: %d (%s)", getName().c_str(), result,
               strerror(-result));
@@ -366,8 +365,8 @@ void Display::applyClientTargetRequests(const ClientTargetProperty& clientTarget
             static_cast<ui::PixelFormat>(clientTargetProperty.clientTargetProperty.pixelFormat));
 }
 
-compositionengine::Output::FrameFences Display::presentAndGetFrameFences() {
-    auto fences = impl::Output::presentAndGetFrameFences();
+compositionengine::Output::FrameFences Display::presentFrame() {
+    auto fences = impl::Output::presentFrame();
 
     const auto halDisplayIdOpt = HalDisplayId::tryCast(mId);
     if (mIsDisconnected || !halDisplayIdOpt) {
@@ -432,6 +431,15 @@ void Display::finishFrame(GpuCompositionResult&& result) {
     }
 
     impl::Output::finishFrame(std::move(result));
+}
+
+bool Display::supportsOffloadPresent() const {
+    if (const auto halDisplayId = HalDisplayId::tryCast(mId)) {
+        const auto& hwc = getCompositionEngine().getHwComposer();
+        return hwc.hasDisplayCapability(*halDisplayId, DisplayCapability::MULTI_THREADED_PRESENT);
+    }
+
+    return false;
 }
 
 } // namespace android::compositionengine::impl

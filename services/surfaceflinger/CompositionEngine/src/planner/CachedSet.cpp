@@ -184,7 +184,7 @@ void CachedSet::render(renderengine::RenderEngine& renderEngine, TexturePool& te
             targetSettings{.clip = Region(viewport),
                            .needsFiltering = false,
                            .isSecure = outputState.isSecure,
-                           .supportsProtectedContent = false,
+                           .isProtected = false,
                            .viewport = viewport,
                            .dataspace = outputDataspace,
                            .realContentIsVisible = true,
@@ -275,11 +275,9 @@ void CachedSet::render(renderengine::RenderEngine& renderEngine, TexturePool& te
         bufferFence.reset(texture->getReadyFence()->dup());
     }
 
-    constexpr bool kUseFramebufferCache = false;
-
     auto fenceResult = renderEngine
                                .drawLayers(displaySettings, layerSettings, texture->get(),
-                                           kUseFramebufferCache, std::move(bufferFence))
+                                           std::move(bufferFence))
                                .get();
 
     if (fenceStatus(fenceResult) == NO_ERROR) {
@@ -393,12 +391,6 @@ bool CachedSet::hasUnsupportedDataspace() const {
 bool CachedSet::hasProtectedLayers() const {
     return std::any_of(mLayers.cbegin(), mLayers.cend(),
                        [](const Layer& layer) { return layer.getState()->isProtected(); });
-}
-
-bool CachedSet::hasSolidColorLayers() const {
-    return std::any_of(mLayers.cbegin(), mLayers.cend(), [](const Layer& layer) {
-        return layer.getState()->hasSolidColorCompositionType();
-    });
 }
 
 bool CachedSet::cachingHintExcludesLayers() const {

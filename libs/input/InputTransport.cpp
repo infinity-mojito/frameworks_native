@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -23,7 +24,11 @@
 #include <log/log.h>
 #include <utils/Trace.h>
 
+#include <com_android_input_flags.h>
 #include <input/InputTransport.h>
+#include <input/TraceTools.h>
+
+namespace input_flags = com::android::input::flags;
 
 namespace {
 
@@ -75,10 +80,35 @@ bool debugTransportPublisher() {
 
 /**
  * Log debug messages about touch event resampling.
- * Enable this via "adb shell setprop log.tag.InputTransportResampling DEBUG" (requires restart)
+ *
+ * Enable this via "adb shell setprop log.tag.InputTransportResampling DEBUG".
+ * This requires a restart on non-debuggable (e.g. user) builds, but should take effect immediately
+ * on debuggable builds (e.g. userdebug).
  */
-const bool DEBUG_RESAMPLING =
-        __android_log_is_loggable(ANDROID_LOG_DEBUG, LOG_TAG "Resampling", ANDROID_LOG_INFO);
+bool debugResampling() {
+    if (!IS_DEBUGGABLE_BUILD) {
+        static const bool DEBUG_TRANSPORT_RESAMPLING =
+                __android_log_is_loggable(ANDROID_LOG_DEBUG, LOG_TAG "Resampling",
+                                          ANDROID_LOG_INFO);
+        return DEBUG_TRANSPORT_RESAMPLING;
+    }
+    return __android_log_is_loggable(ANDROID_LOG_DEBUG, LOG_TAG "Resampling", ANDROID_LOG_INFO);
+}
+
+android::base::unique_fd dupChannelFd(int fd) {
+    android::base::unique_fd newFd(::dup(fd));
+    if (!newFd.ok()) {
+        ALOGE("Could not duplicate fd %i : %s", fd, strerror(errno));
+        const bool hitFdLimit = errno == EMFILE || errno == ENFILE;
+        // If this process is out of file descriptors, then throwing that might end up exploding
+        // on the other side of a binder call, which isn't really helpful.
+        // Better to just crash here and hope that the FD leak is slow.
+        // Other failures could be client errors, so we still propagate those back to the caller.
+        LOG_ALWAYS_FATAL_IF(hitFdLimit, "Too many open files, could not duplicate input channel");
+        return {};
+    }
+    return newFd;
+}
 
 } // namespace
 
@@ -128,7 +158,8 @@ static const char* PROPERTY_RESAMPLING_ENABLED = "ro.input.resampling";
  * Enable this via "adb shell setprop log.tag.InputTransportVerifyEvents DEBUG"
  */
 static bool verifyEvents() {
-    return __android_log_is_loggable(ANDROID_LOG_DEBUG, LOG_TAG "VerifyEvents", ANDROID_LOG_INFO);
+    return input_flags::enable_outbound_event_verification() ||
+            __android_log_is_loggable(ANDROID_LOG_DEBUG, LOG_TAG "VerifyEvents", ANDROID_LOG_INFO);
 }
 
 template<typename T>
@@ -379,15 +410,23 @@ std::unique_ptr<InputChannel> InputChannel::create(const std::string& name,
     return std::unique_ptr<InputChannel>(new InputChannel(name, std::move(fd), token));
 }
 
-InputChannel::InputChannel(const std::string name, android::base::unique_fd fd, sp<IBinder> token)
-      : mName(std::move(name)), mFd(std::move(fd)), mToken(std::move(token)) {
+std::unique_ptr<InputChannel> InputChannel::create(
+        android::os::InputChannelCore&& parceledChannel) {
+    return InputChannel::create(parceledChannel.name, parceledChannel.fd.release(),
+                                parceledChannel.token);
+}
+
+InputChannel::InputChannel(const std::string name, android::base::unique_fd fd, sp<IBinder> token) {
+    this->name = std::move(name);
+    this->fd.reset(std::move(fd));
+    this->token = std::move(token);
     ALOGD_IF(DEBUG_CHANNEL_LIFECYCLE, "Input channel constructed: name='%s', fd=%d",
-             getName().c_str(), getFd().get());
+             getName().c_str(), getFd());
 }
 
 InputChannel::~InputChannel() {
     ALOGD_IF(DEBUG_CHANNEL_LIFECYCLE, "Input channel destroyed: name='%s', fd=%d",
-             getName().c_str(), getFd().get());
+             getName().c_str(), getFd());
 }
 
 status_t InputChannel::openInputChannelPair(const std::string& name,
@@ -409,7 +448,7 @@ status_t InputChannel::openInputChannelPair(const std::string& name,
     setsockopt(sockets[1], SOL_SOCKET, SO_SNDBUF, &bufferSize, sizeof(bufferSize));
     setsockopt(sockets[1], SOL_SOCKET, SO_RCVBUF, &bufferSize, sizeof(bufferSize));
 
-    sp<IBinder> token = new BBinder();
+    sp<IBinder> token = sp<BBinder>::make();
 
     std::string serverChannelName = name + " (server)";
     android::base::unique_fd serverFd(sockets[0]);
@@ -422,18 +461,22 @@ status_t InputChannel::openInputChannelPair(const std::string& name,
 }
 
 status_t InputChannel::sendMessage(const InputMessage* msg) {
+    ATRACE_NAME_IF(ATRACE_ENABLED(),
+                   StringPrintf("sendMessage(inputChannel=%s, seq=0x%" PRIx32 ", type=0x%" PRIx32
+                                ")",
+                                name.c_str(), msg->header.seq, msg->header.type));
     const size_t msgLength = msg->size();
     InputMessage cleanMsg;
     msg->getSanitizedCopy(&cleanMsg);
     ssize_t nWrite;
     do {
-        nWrite = ::send(getFd().get(), &cleanMsg, msgLength, MSG_DONTWAIT | MSG_NOSIGNAL);
+        nWrite = ::send(getFd(), &cleanMsg, msgLength, MSG_DONTWAIT | MSG_NOSIGNAL);
     } while (nWrite == -1 && errno == EINTR);
 
     if (nWrite < 0) {
         int error = errno;
         ALOGD_IF(DEBUG_CHANNEL_MESSAGES, "channel '%s' ~ error sending message of type %s, %s",
-                 mName.c_str(), ftl::enum_string(msg->header.type).c_str(), strerror(error));
+                 name.c_str(), ftl::enum_string(msg->header.type).c_str(), strerror(error));
         if (error == EAGAIN || error == EWOULDBLOCK) {
             return WOULD_BLOCK;
         }
@@ -445,33 +488,27 @@ status_t InputChannel::sendMessage(const InputMessage* msg) {
 
     if (size_t(nWrite) != msgLength) {
         ALOGD_IF(DEBUG_CHANNEL_MESSAGES,
-                 "channel '%s' ~ error sending message type %s, send was incomplete", mName.c_str(),
+                 "channel '%s' ~ error sending message type %s, send was incomplete", name.c_str(),
                  ftl::enum_string(msg->header.type).c_str());
         return DEAD_OBJECT;
     }
 
-    ALOGD_IF(DEBUG_CHANNEL_MESSAGES, "channel '%s' ~ sent message of type %s", mName.c_str(),
+    ALOGD_IF(DEBUG_CHANNEL_MESSAGES, "channel '%s' ~ sent message of type %s", name.c_str(),
              ftl::enum_string(msg->header.type).c_str());
 
-    if (ATRACE_ENABLED()) {
-        std::string message =
-                StringPrintf("sendMessage(inputChannel=%s, seq=0x%" PRIx32 ", type=0x%" PRIx32 ")",
-                             mName.c_str(), msg->header.seq, msg->header.type);
-        ATRACE_NAME(message.c_str());
-    }
     return OK;
 }
 
 status_t InputChannel::receiveMessage(InputMessage* msg) {
     ssize_t nRead;
     do {
-        nRead = ::recv(getFd().get(), msg, sizeof(InputMessage), MSG_DONTWAIT);
+        nRead = ::recv(getFd(), msg, sizeof(InputMessage), MSG_DONTWAIT);
     } while (nRead == -1 && errno == EINTR);
 
     if (nRead < 0) {
         int error = errno;
         ALOGD_IF(DEBUG_CHANNEL_MESSAGES, "channel '%s' ~ receive message failed, errno=%d",
-                 mName.c_str(), errno);
+                 name.c_str(), errno);
         if (error == EAGAIN || error == EWOULDBLOCK) {
             return WOULD_BLOCK;
         }
@@ -483,81 +520,85 @@ status_t InputChannel::receiveMessage(InputMessage* msg) {
 
     if (nRead == 0) { // check for EOF
         ALOGD_IF(DEBUG_CHANNEL_MESSAGES,
-                 "channel '%s' ~ receive message failed because peer was closed", mName.c_str());
+                 "channel '%s' ~ receive message failed because peer was closed", name.c_str());
         return DEAD_OBJECT;
     }
 
     if (!msg->isValid(nRead)) {
-        ALOGE("channel '%s' ~ received invalid message of size %zd", mName.c_str(), nRead);
+        ALOGE("channel '%s' ~ received invalid message of size %zd", name.c_str(), nRead);
         return BAD_VALUE;
     }
 
-    ALOGD_IF(DEBUG_CHANNEL_MESSAGES, "channel '%s' ~ received message of type %s", mName.c_str(),
+    ALOGD_IF(DEBUG_CHANNEL_MESSAGES, "channel '%s' ~ received message of type %s", name.c_str(),
              ftl::enum_string(msg->header.type).c_str());
-
     if (ATRACE_ENABLED()) {
+        // Add an additional trace point to include data about the received message.
         std::string message = StringPrintf("receiveMessage(inputChannel=%s, seq=0x%" PRIx32
                                            ", type=0x%" PRIx32 ")",
-                                           mName.c_str(), msg->header.seq, msg->header.type);
+                                           name.c_str(), msg->header.seq, msg->header.type);
         ATRACE_NAME(message.c_str());
     }
     return OK;
 }
 
+bool InputChannel::probablyHasInput() const {
+    struct pollfd pfds = {.fd = fd.get(), .events = POLLIN};
+    if (::poll(&pfds, /*nfds=*/1, /*timeout=*/0) <= 0) {
+        // This can be a false negative because EINTR and ENOMEM are not handled. The latter should
+        // be extremely rare. The EINTR is also unlikely because it happens only when the signal
+        // arrives while the syscall is executed, and the syscall is quick. Hitting EINTR too often
+        // would be a sign of having too many signals, which is a bigger performance problem. A
+        // common tradition is to repeat the syscall on each EINTR, but it is not necessary here.
+        // In other words, the missing one liner is replaced by a multiline explanation.
+        return false;
+    }
+    // From poll(2): The bits returned in |revents| can include any of those specified in |events|,
+    // or one of the values POLLERR, POLLHUP, or POLLNVAL.
+    return (pfds.revents & POLLIN) != 0;
+}
+
+void InputChannel::waitForMessage(std::chrono::milliseconds timeout) const {
+    if (timeout < 0ms) {
+        LOG(FATAL) << "Timeout cannot be negative, received " << timeout.count();
+    }
+    struct pollfd pfds = {.fd = fd.get(), .events = POLLIN};
+    int ret;
+    std::chrono::time_point<std::chrono::steady_clock> stopTime =
+            std::chrono::steady_clock::now() + timeout;
+    std::chrono::milliseconds remaining = timeout;
+    do {
+        ret = ::poll(&pfds, /*nfds=*/1, /*timeout=*/remaining.count());
+        remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                stopTime - std::chrono::steady_clock::now());
+    } while (ret == -1 && errno == EINTR && remaining > 0ms);
+}
+
 std::unique_ptr<InputChannel> InputChannel::dup() const {
-    base::unique_fd newFd(dupFd());
+    base::unique_fd newFd(dupChannelFd(fd.get()));
     return InputChannel::create(getName(), std::move(newFd), getConnectionToken());
 }
 
-void InputChannel::copyTo(InputChannel& outChannel) const {
-    outChannel.mName = getName();
-    outChannel.mFd = dupFd();
-    outChannel.mToken = getConnectionToken();
+void InputChannel::copyTo(android::os::InputChannelCore& outChannel) const {
+    outChannel.name = getName();
+    outChannel.fd.reset(dupChannelFd(fd.get()));
+    outChannel.token = getConnectionToken();
 }
 
-status_t InputChannel::writeToParcel(android::Parcel* parcel) const {
-    if (parcel == nullptr) {
-        ALOGE("%s: Null parcel", __func__);
-        return BAD_VALUE;
-    }
-    return parcel->writeStrongBinder(mToken)
-            ?: parcel->writeUtf8AsUtf16(mName) ?: parcel->writeUniqueFileDescriptor(mFd);
-}
-
-status_t InputChannel::readFromParcel(const android::Parcel* parcel) {
-    if (parcel == nullptr) {
-        ALOGE("%s: Null parcel", __func__);
-        return BAD_VALUE;
-    }
-    mToken = parcel->readStrongBinder();
-    return parcel->readUtf8FromUtf16(&mName) ?: parcel->readUniqueFileDescriptor(&mFd);
+void InputChannel::moveChannel(std::unique_ptr<InputChannel> from,
+                               android::os::InputChannelCore& outChannel) {
+    outChannel.name = from->getName();
+    outChannel.fd = android::os::ParcelFileDescriptor(std::move(from->fd));
+    outChannel.token = from->getConnectionToken();
 }
 
 sp<IBinder> InputChannel::getConnectionToken() const {
-    return mToken;
-}
-
-base::unique_fd InputChannel::dupFd() const {
-    base::unique_fd newFd(::dup(getFd().get()));
-    if (!newFd.ok()) {
-        ALOGE("Could not duplicate fd %i for channel %s: %s", getFd().get(), getName().c_str(),
-              strerror(errno));
-        const bool hitFdLimit = errno == EMFILE || errno == ENFILE;
-        // If this process is out of file descriptors, then throwing that might end up exploding
-        // on the other side of a binder call, which isn't really helpful.
-        // Better to just crash here and hope that the FD leak is slow.
-        // Other failures could be client errors, so we still propagate those back to the caller.
-        LOG_ALWAYS_FATAL_IF(hitFdLimit, "Too many open files, could not duplicate input channel %s",
-                            getName().c_str());
-        return {};
-    }
-    return newFd;
+    return token;
 }
 
 // --- InputPublisher ---
 
 InputPublisher::InputPublisher(const std::shared_ptr<InputChannel>& channel)
-      : mChannel(channel), mInputVerifier(channel->getName()) {}
+      : mChannel(channel), mInputVerifier(mChannel->getName()) {}
 
 InputPublisher::~InputPublisher() {
 }
@@ -568,13 +609,10 @@ status_t InputPublisher::publishKeyEvent(uint32_t seq, int32_t eventId, int32_t 
                                          int32_t flags, int32_t keyCode, int32_t scanCode,
                                          int32_t metaState, int32_t repeatCount, nsecs_t downTime,
                                          nsecs_t eventTime) {
-    if (ATRACE_ENABLED()) {
-        std::string message =
-                StringPrintf("publishKeyEvent(inputChannel=%s, action=%s, keyCode=%s)",
-                             mChannel->getName().c_str(), KeyEvent::actionToString(action),
-                             KeyEvent::getLabel(keyCode));
-        ATRACE_NAME(message.c_str());
-    }
+    ATRACE_NAME_IF(ATRACE_ENABLED(),
+                   StringPrintf("publishKeyEvent(inputChannel=%s, action=%s, keyCode=%s)",
+                                mChannel->getName().c_str(), KeyEvent::actionToString(action),
+                                KeyEvent::getLabel(keyCode)));
     ALOGD_IF(debugTransportPublisher(),
              "channel '%s' publisher ~ %s: seq=%u, id=%d, deviceId=%d, source=%s, "
              "action=%s, flags=0x%x, keyCode=%s, scanCode=%d, metaState=0x%x, repeatCount=%d,"
@@ -616,16 +654,14 @@ status_t InputPublisher::publishMotionEvent(
         const ui::Transform& rawTransform, nsecs_t downTime, nsecs_t eventTime,
         uint32_t pointerCount, const PointerProperties* pointerProperties,
         const PointerCoords* pointerCoords) {
-    if (ATRACE_ENABLED()) {
-        std::string message = StringPrintf("publishMotionEvent(inputChannel=%s, action=%s)",
-                                           mChannel->getName().c_str(),
-                                           MotionEvent::actionToString(action).c_str());
-        ATRACE_NAME(message.c_str());
-    }
+    ATRACE_NAME_IF(ATRACE_ENABLED(),
+                   StringPrintf("publishMotionEvent(inputChannel=%s, action=%s)",
+                                mChannel->getName().c_str(),
+                                MotionEvent::actionToString(action).c_str()));
     if (verifyEvents()) {
         Result<void> result =
-                mInputVerifier.processMovement(deviceId, action, pointerCount, pointerProperties,
-                                               pointerCoords, flags);
+                mInputVerifier.processMovement(deviceId, source, action, pointerCount,
+                                               pointerProperties, pointerCoords, flags);
         if (!result.ok()) {
             LOG(FATAL) << "Bad stream: " << result.error();
         }
@@ -638,7 +674,7 @@ status_t InputPublisher::publishMotionEvent(
               "action=%s, actionButton=0x%08x, flags=0x%x, edgeFlags=0x%x, "
               "metaState=0x%x, buttonState=0x%x, classification=%s,"
               "xPrecision=%f, yPrecision=%f, downTime=%" PRId64 ", eventTime=%" PRId64 ", "
-              "pointerCount=%" PRIu32 " \n%s",
+              "pointerCount=%" PRIu32 "\n%s",
               mChannel->getName().c_str(), __func__, seq, eventId, deviceId,
               inputEventSourceToString(source).c_str(), displayId,
               MotionEvent::actionToString(action).c_str(), actionButton, flags, edgeFlags,
@@ -692,19 +728,17 @@ status_t InputPublisher::publishMotionEvent(
     msg.body.motion.eventTime = eventTime;
     msg.body.motion.pointerCount = pointerCount;
     for (uint32_t i = 0; i < pointerCount; i++) {
-        msg.body.motion.pointers[i].properties.copyFrom(pointerProperties[i]);
-        msg.body.motion.pointers[i].coords.copyFrom(pointerCoords[i]);
+        msg.body.motion.pointers[i].properties = pointerProperties[i];
+        msg.body.motion.pointers[i].coords = pointerCoords[i];
     }
 
     return mChannel->sendMessage(&msg);
 }
 
 status_t InputPublisher::publishFocusEvent(uint32_t seq, int32_t eventId, bool hasFocus) {
-    if (ATRACE_ENABLED()) {
-        std::string message = StringPrintf("publishFocusEvent(inputChannel=%s, hasFocus=%s)",
-                                           mChannel->getName().c_str(), toString(hasFocus));
-        ATRACE_NAME(message.c_str());
-    }
+    ATRACE_NAME_IF(ATRACE_ENABLED(),
+                   StringPrintf("publishFocusEvent(inputChannel=%s, hasFocus=%s)",
+                                mChannel->getName().c_str(), toString(hasFocus)));
     ALOGD_IF(debugTransportPublisher(), "channel '%s' publisher ~ %s: seq=%u, id=%d, hasFocus=%s",
              mChannel->getName().c_str(), __func__, seq, eventId, toString(hasFocus));
 
@@ -718,12 +752,9 @@ status_t InputPublisher::publishFocusEvent(uint32_t seq, int32_t eventId, bool h
 
 status_t InputPublisher::publishCaptureEvent(uint32_t seq, int32_t eventId,
                                              bool pointerCaptureEnabled) {
-    if (ATRACE_ENABLED()) {
-        std::string message =
-                StringPrintf("publishCaptureEvent(inputChannel=%s, pointerCaptureEnabled=%s)",
-                             mChannel->getName().c_str(), toString(pointerCaptureEnabled));
-        ATRACE_NAME(message.c_str());
-    }
+    ATRACE_NAME_IF(ATRACE_ENABLED(),
+                   StringPrintf("publishCaptureEvent(inputChannel=%s, pointerCaptureEnabled=%s)",
+                                mChannel->getName().c_str(), toString(pointerCaptureEnabled)));
     ALOGD_IF(debugTransportPublisher(),
              "channel '%s' publisher ~ %s: seq=%u, id=%d, pointerCaptureEnabled=%s",
              mChannel->getName().c_str(), __func__, seq, eventId, toString(pointerCaptureEnabled));
@@ -738,12 +769,9 @@ status_t InputPublisher::publishCaptureEvent(uint32_t seq, int32_t eventId,
 
 status_t InputPublisher::publishDragEvent(uint32_t seq, int32_t eventId, float x, float y,
                                           bool isExiting) {
-    if (ATRACE_ENABLED()) {
-        std::string message =
-                StringPrintf("publishDragEvent(inputChannel=%s, x=%f, y=%f, isExiting=%s)",
-                             mChannel->getName().c_str(), x, y, toString(isExiting));
-        ATRACE_NAME(message.c_str());
-    }
+    ATRACE_NAME_IF(ATRACE_ENABLED(),
+                   StringPrintf("publishDragEvent(inputChannel=%s, x=%f, y=%f, isExiting=%s)",
+                                mChannel->getName().c_str(), x, y, toString(isExiting)));
     ALOGD_IF(debugTransportPublisher(),
              "channel '%s' publisher ~ %s: seq=%u, id=%d, x=%f, y=%f, isExiting=%s",
              mChannel->getName().c_str(), __func__, seq, eventId, x, y, toString(isExiting));
@@ -759,12 +787,9 @@ status_t InputPublisher::publishDragEvent(uint32_t seq, int32_t eventId, float x
 }
 
 status_t InputPublisher::publishTouchModeEvent(uint32_t seq, int32_t eventId, bool isInTouchMode) {
-    if (ATRACE_ENABLED()) {
-        std::string message =
-                StringPrintf("publishTouchModeEvent(inputChannel=%s, isInTouchMode=%s)",
-                             mChannel->getName().c_str(), toString(isInTouchMode));
-        ATRACE_NAME(message.c_str());
-    }
+    ATRACE_NAME_IF(ATRACE_ENABLED(),
+                   StringPrintf("publishTouchModeEvent(inputChannel=%s, isInTouchMode=%s)",
+                                mChannel->getName().c_str(), toString(isInTouchMode)));
     ALOGD_IF(debugTransportPublisher(),
              "channel '%s' publisher ~ %s: seq=%u, id=%d, isInTouchMode=%s",
              mChannel->getName().c_str(), __func__, seq, eventId, toString(isInTouchMode));
@@ -781,8 +806,10 @@ android::base::Result<InputPublisher::ConsumerResponse> InputPublisher::receiveC
     InputMessage msg;
     status_t result = mChannel->receiveMessage(&msg);
     if (result) {
-        ALOGD_IF(debugTransportPublisher(), "channel '%s' publisher ~ %s: %s",
-                 mChannel->getName().c_str(), __func__, strerror(result));
+        if (debugTransportPublisher() && result != WOULD_BLOCK) {
+            LOG(INFO) << "channel '" << mChannel->getName() << "' publisher ~ " << __func__ << ": "
+                      << strerror(result);
+        }
         return android::base::Error(result);
     }
     if (msg.header.type == InputMessage::Type::FINISHED) {
@@ -851,6 +878,9 @@ status_t InputConsumer::consume(InputEventFactoryInterface* factory, bool consum
                         mConsumeTimes.emplace(mMsg.header.seq, systemTime(SYSTEM_TIME_MONOTONIC));
                 LOG_ALWAYS_FATAL_IF(!inserted, "Already have a consume time for seq=%" PRIu32,
                                     mMsg.header.seq);
+
+                // Trace the event processing timeline - event was just read from the socket
+                ATRACE_ASYNC_BEGIN("InputConsumer processing", /*cookie=*/mMsg.header.seq);
             }
             if (result) {
                 // Consume the next batched event unless batches are being held for later.
@@ -1158,7 +1188,7 @@ void InputConsumer::rewriteMessage(TouchState& state, InputMessage& msg) {
                     state.recentCoordinatesAreIdentical(id)) {
                 PointerCoords& msgCoords = msg.body.motion.pointers[i].coords;
                 const PointerCoords& resampleCoords = state.lastResample.getPointerById(id);
-                ALOGD_IF(DEBUG_RESAMPLING, "[%d] - rewrite (%0.3f, %0.3f), old (%0.3f, %0.3f)", id,
+                ALOGD_IF(debugResampling(), "[%d] - rewrite (%0.3f, %0.3f), old (%0.3f, %0.3f)", id,
                          resampleCoords.getX(), resampleCoords.getY(), msgCoords.getX(),
                          msgCoords.getY());
                 msgCoords.setAxisValue(AMOTION_EVENT_AXIS_X, resampleCoords.getX());
@@ -1181,13 +1211,13 @@ void InputConsumer::resampleTouchState(nsecs_t sampleTime, MotionEvent* event,
 
     ssize_t index = findTouchState(event->getDeviceId(), event->getSource());
     if (index < 0) {
-        ALOGD_IF(DEBUG_RESAMPLING, "Not resampled, no touch state for device.");
+        ALOGD_IF(debugResampling(), "Not resampled, no touch state for device.");
         return;
     }
 
     TouchState& touchState = mTouchStates[index];
     if (touchState.historySize < 1) {
-        ALOGD_IF(DEBUG_RESAMPLING, "Not resampled, no history for device.");
+        ALOGD_IF(debugResampling(), "Not resampled, no history for device.");
         return;
     }
 
@@ -1197,7 +1227,7 @@ void InputConsumer::resampleTouchState(nsecs_t sampleTime, MotionEvent* event,
     for (size_t i = 0; i < pointerCount; i++) {
         uint32_t id = event->getPointerId(i);
         if (!current->idBits.hasBit(id)) {
-            ALOGD_IF(DEBUG_RESAMPLING, "Not resampled, missing id %d", id);
+            ALOGD_IF(debugResampling(), "Not resampled, missing id %d", id);
             return;
         }
     }
@@ -1213,7 +1243,7 @@ void InputConsumer::resampleTouchState(nsecs_t sampleTime, MotionEvent* event,
         other = &future;
         nsecs_t delta = future.eventTime - current->eventTime;
         if (delta < RESAMPLE_MIN_DELTA) {
-            ALOGD_IF(DEBUG_RESAMPLING, "Not resampled, delta time is too small: %" PRId64 " ns.",
+            ALOGD_IF(debugResampling(), "Not resampled, delta time is too small: %" PRId64 " ns.",
                      delta);
             return;
         }
@@ -1224,17 +1254,17 @@ void InputConsumer::resampleTouchState(nsecs_t sampleTime, MotionEvent* event,
         other = touchState.getHistory(1);
         nsecs_t delta = current->eventTime - other->eventTime;
         if (delta < RESAMPLE_MIN_DELTA) {
-            ALOGD_IF(DEBUG_RESAMPLING, "Not resampled, delta time is too small: %" PRId64 " ns.",
+            ALOGD_IF(debugResampling(), "Not resampled, delta time is too small: %" PRId64 " ns.",
                      delta);
             return;
         } else if (delta > RESAMPLE_MAX_DELTA) {
-            ALOGD_IF(DEBUG_RESAMPLING, "Not resampled, delta time is too large: %" PRId64 " ns.",
+            ALOGD_IF(debugResampling(), "Not resampled, delta time is too large: %" PRId64 " ns.",
                      delta);
             return;
         }
         nsecs_t maxPredict = current->eventTime + min(delta / 2, RESAMPLE_MAX_PREDICTION);
         if (sampleTime > maxPredict) {
-            ALOGD_IF(DEBUG_RESAMPLING,
+            ALOGD_IF(debugResampling(),
                      "Sample time is too far in the future, adjusting prediction "
                      "from %" PRId64 " to %" PRId64 " ns.",
                      sampleTime - current->eventTime, maxPredict - current->eventTime);
@@ -1242,7 +1272,7 @@ void InputConsumer::resampleTouchState(nsecs_t sampleTime, MotionEvent* event,
         }
         alpha = float(current->eventTime - sampleTime) / delta;
     } else {
-        ALOGD_IF(DEBUG_RESAMPLING, "Not resampled, insufficient data.");
+        ALOGD_IF(debugResampling(), "Not resampled, insufficient data.");
         return;
     }
 
@@ -1270,27 +1300,27 @@ void InputConsumer::resampleTouchState(nsecs_t sampleTime, MotionEvent* event,
             // We know here that the coordinates for the pointer haven't changed because we
             // would've cleared the resampled bit in rewriteMessage if they had. We can't modify
             // lastResample in place becasue the mapping from pointer ID to index may have changed.
-            touchState.lastResample.pointers[i].copyFrom(oldLastResample.getPointerById(id));
+            touchState.lastResample.pointers[i] = oldLastResample.getPointerById(id);
             continue;
         }
 
         PointerCoords& resampledCoords = touchState.lastResample.pointers[i];
         const PointerCoords& currentCoords = current->getPointerById(id);
-        resampledCoords.copyFrom(currentCoords);
+        resampledCoords = currentCoords;
+        resampledCoords.isResampled = true;
         if (other->idBits.hasBit(id) && shouldResampleTool(event->getToolType(i))) {
             const PointerCoords& otherCoords = other->getPointerById(id);
             resampledCoords.setAxisValue(AMOTION_EVENT_AXIS_X,
                                          lerp(currentCoords.getX(), otherCoords.getX(), alpha));
             resampledCoords.setAxisValue(AMOTION_EVENT_AXIS_Y,
                                          lerp(currentCoords.getY(), otherCoords.getY(), alpha));
-            resampledCoords.isResampled = true;
-            ALOGD_IF(DEBUG_RESAMPLING,
+            ALOGD_IF(debugResampling(),
                      "[%d] - out (%0.3f, %0.3f), cur (%0.3f, %0.3f), "
                      "other (%0.3f, %0.3f), alpha %0.3f",
                      id, resampledCoords.getX(), resampledCoords.getY(), currentCoords.getX(),
                      currentCoords.getY(), otherCoords.getX(), otherCoords.getY(), alpha);
         } else {
-            ALOGD_IF(DEBUG_RESAMPLING, "[%d] - out (%0.3f, %0.3f), cur (%0.3f, %0.3f)", id,
+            ALOGD_IF(debugResampling(), "[%d] - out (%0.3f, %0.3f), cur (%0.3f, %0.3f)", id,
                      resampledCoords.getX(), resampledCoords.getY(), currentCoords.getX(),
                      currentCoords.getY());
         }
@@ -1389,6 +1419,9 @@ status_t InputConsumer::sendUnchainedFinishedSignal(uint32_t seq, bool handled) 
         // message anymore. If the socket write did not succeed, we will try again and will still
         // need consume time.
         popConsumeTime(seq);
+
+        // Trace the event processing timeline - event was just finished
+        ATRACE_ASYNC_END("InputConsumer processing", /*cookie=*/seq);
     }
     return result;
 }
@@ -1405,6 +1438,10 @@ int32_t InputConsumer::getPendingBatchSource() const {
     const Batch& batch = mBatches[0];
     const InputMessage& head = batch.samples[0];
     return head.body.motion.source;
+}
+
+bool InputConsumer::probablyHasInput() const {
+    return hasPendingBatch() || mChannel->probablyHasInput();
 }
 
 ssize_t InputConsumer::findBatch(int32_t deviceId, int32_t source) const {
@@ -1454,8 +1491,8 @@ void InputConsumer::initializeMotionEvent(MotionEvent* event, const InputMessage
     PointerProperties pointerProperties[pointerCount];
     PointerCoords pointerCoords[pointerCount];
     for (uint32_t i = 0; i < pointerCount; i++) {
-        pointerProperties[i].copyFrom(msg->body.motion.pointers[i].properties);
-        pointerCoords[i].copyFrom(msg->body.motion.pointers[i].coords);
+        pointerProperties[i] = msg->body.motion.pointers[i].properties;
+        pointerCoords[i] = msg->body.motion.pointers[i].coords;
     }
 
     ui::Transform transform;
@@ -1484,7 +1521,7 @@ void InputConsumer::addSample(MotionEvent* event, const InputMessage* msg) {
     uint32_t pointerCount = msg->body.motion.pointerCount;
     PointerCoords pointerCoords[pointerCount];
     for (uint32_t i = 0; i < pointerCount; i++) {
-        pointerCoords[i].copyFrom(msg->body.motion.pointers[i].coords);
+        pointerCoords[i] = msg->body.motion.pointers[i].coords;
     }
 
     event->setMetaState(event->getMetaState() | msg->body.motion.metaState);

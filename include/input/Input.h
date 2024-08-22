@@ -180,7 +180,8 @@ static constexpr size_t MAX_POINTERS = 16;
  * Declare a concrete type for the NDK's input event forward declaration.
  */
 struct AInputEvent {
-    virtual ~AInputEvent() { }
+    virtual ~AInputEvent() {}
+    bool operator==(const AInputEvent&) const = default;
 };
 
 /*
@@ -257,6 +258,10 @@ enum class KeyState {
 
 bool isStylusToolType(ToolType toolType);
 
+struct PointerProperties;
+
+bool isStylusEvent(uint32_t source, const std::vector<PointerProperties>& properties);
+
 /*
  * Flags that flow alongside events in the input dispatch system to help with certain
  * policy decisions such as waking from device sleep.
@@ -282,6 +287,7 @@ enum {
 
     // Indicates that the key represents a special gesture that has been detected by
     // the touch firmware or driver.  Causes touch events from the same device to be canceled.
+    // This policy flag prevents key events from changing touch mode state.
     POLICY_FLAG_GESTURE = 0x00000008,
 
     // Indicates that key usage mapping represents a fallback mapping.
@@ -502,13 +508,18 @@ struct PointerProperties {
         toolType = ToolType::UNKNOWN;
     }
 
-    bool operator==(const PointerProperties& other) const;
+    bool operator==(const PointerProperties& other) const = default;
     inline bool operator!=(const PointerProperties& other) const {
         return !(*this == other);
     }
 
-    void copyFrom(const PointerProperties& other);
+    PointerProperties& operator=(const PointerProperties&) = default;
 };
+
+std::ostream& operator<<(std::ostream& out, const PointerProperties& properties);
+
+// TODO(b/211379801) : Use a strong type from ftl/mixins.h instead
+using DeviceId = int32_t;
 
 /*
  * Input events.
@@ -521,7 +532,7 @@ public:
 
     inline int32_t getId() const { return mId; }
 
-    inline int32_t getDeviceId() const { return mDeviceId; }
+    inline DeviceId getDeviceId() const { return mDeviceId; }
 
     inline uint32_t getSource() const { return mSource; }
 
@@ -535,14 +546,16 @@ public:
 
     static int32_t nextId();
 
+    bool operator==(const InputEvent&) const = default;
+
 protected:
-    void initialize(int32_t id, int32_t deviceId, uint32_t source, int32_t displayId,
+    void initialize(int32_t id, DeviceId deviceId, uint32_t source, int32_t displayId,
                     std::array<uint8_t, 32> hmac);
 
     void initialize(const InputEvent& from);
 
     int32_t mId;
-    int32_t mDeviceId;
+    DeviceId mDeviceId;
     uint32_t mSource;
     int32_t mDisplayId;
     std::array<uint8_t, 32> mHmac;
@@ -557,7 +570,7 @@ class KeyEvent : public InputEvent {
 public:
     virtual ~KeyEvent() { }
 
-    virtual InputEventType getType() const { return InputEventType::KEY; }
+    InputEventType getType() const override { return InputEventType::KEY; }
 
     inline int32_t getAction() const { return mAction; }
 
@@ -580,13 +593,15 @@ public:
     static const char* getLabel(int32_t keyCode);
     static std::optional<int> getKeyCodeFromLabel(const char* label);
 
-    void initialize(int32_t id, int32_t deviceId, uint32_t source, int32_t displayId,
+    void initialize(int32_t id, DeviceId deviceId, uint32_t source, int32_t displayId,
                     std::array<uint8_t, 32> hmac, int32_t action, int32_t flags, int32_t keyCode,
                     int32_t scanCode, int32_t metaState, int32_t repeatCount, nsecs_t downTime,
                     nsecs_t eventTime);
     void initialize(const KeyEvent& from);
 
     static const char* actionToString(int32_t action);
+
+    bool operator==(const KeyEvent&) const = default;
 
 protected:
     int32_t mAction;
@@ -608,7 +623,7 @@ class MotionEvent : public InputEvent {
 public:
     virtual ~MotionEvent() { }
 
-    virtual InputEventType getType() const { return InputEventType::MOTION; }
+    InputEventType getType() const override { return InputEventType::MOTION; }
 
     inline int32_t getAction() const { return mAction; }
 
@@ -844,7 +859,7 @@ public:
 
     ssize_t findPointerIndex(int32_t pointerId) const;
 
-    void initialize(int32_t id, int32_t deviceId, uint32_t source, int32_t displayId,
+    void initialize(int32_t id, DeviceId deviceId, uint32_t source, int32_t displayId,
                     std::array<uint8_t, 32> hmac, int32_t action, int32_t actionButton,
                     int32_t flags, int32_t edgeFlags, int32_t metaState, int32_t buttonState,
                     MotionClassification classification, const ui::Transform& transform,
@@ -907,6 +922,9 @@ public:
     // The rounding precision for transformed motion events.
     static constexpr float ROUNDING_PRECISION = 0.001f;
 
+    bool operator==(const MotionEvent&) const;
+    inline bool operator!=(const MotionEvent& o) const { return !(*this == o); };
+
 protected:
     int32_t mAction;
     int32_t mActionButton;
@@ -936,7 +954,7 @@ class FocusEvent : public InputEvent {
 public:
     virtual ~FocusEvent() {}
 
-    virtual InputEventType getType() const override { return InputEventType::FOCUS; }
+    InputEventType getType() const override { return InputEventType::FOCUS; }
 
     inline bool getHasFocus() const { return mHasFocus; }
 
@@ -955,7 +973,7 @@ class CaptureEvent : public InputEvent {
 public:
     virtual ~CaptureEvent() {}
 
-    virtual InputEventType getType() const override { return InputEventType::CAPTURE; }
+    InputEventType getType() const override { return InputEventType::CAPTURE; }
 
     inline bool getPointerCaptureEnabled() const { return mPointerCaptureEnabled; }
 
@@ -974,7 +992,7 @@ class DragEvent : public InputEvent {
 public:
     virtual ~DragEvent() {}
 
-    virtual InputEventType getType() const override { return InputEventType::DRAG; }
+    InputEventType getType() const override { return InputEventType::DRAG; }
 
     inline bool isExiting() const { return mIsExiting; }
 
@@ -998,7 +1016,7 @@ class TouchModeEvent : public InputEvent {
 public:
     virtual ~TouchModeEvent() {}
 
-    virtual InputEventType getType() const override { return InputEventType::TOUCH_MODE; }
+    InputEventType getType() const override { return InputEventType::TOUCH_MODE; }
 
     inline bool isInTouchMode() const { return mIsInTouchMode; }
 
@@ -1022,7 +1040,7 @@ struct __attribute__((__packed__)) VerifiedInputEvent {
     };
 
     Type type;
-    int32_t deviceId;
+    DeviceId deviceId;
     nsecs_t eventTimeNanos;
     uint32_t source;
     int32_t displayId;
@@ -1128,6 +1146,24 @@ private:
     std::queue<std::unique_ptr<CaptureEvent>> mCaptureEventPool;
     std::queue<std::unique_ptr<DragEvent>> mDragEventPool;
     std::queue<std::unique_ptr<TouchModeEvent>> mTouchModeEventPool;
+};
+
+/**
+ * An input event factory implementation that simply creates the input events on the heap, when
+ * needed. The caller is responsible for destroying the returned references.
+ * It is recommended that the caller wrap these return values into std::unique_ptr.
+ */
+class DynamicInputEventFactory : public InputEventFactoryInterface {
+public:
+    explicit DynamicInputEventFactory(){};
+    ~DynamicInputEventFactory(){};
+
+    KeyEvent* createKeyEvent() override { return new KeyEvent(); };
+    MotionEvent* createMotionEvent() override { return new MotionEvent(); };
+    FocusEvent* createFocusEvent() override { return new FocusEvent(); };
+    CaptureEvent* createCaptureEvent() override { return new CaptureEvent(); };
+    DragEvent* createDragEvent() override { return new DragEvent(); };
+    TouchModeEvent* createTouchModeEvent() override { return new TouchModeEvent(); };
 };
 
 /*

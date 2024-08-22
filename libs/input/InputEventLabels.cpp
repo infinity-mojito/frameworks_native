@@ -18,6 +18,7 @@
 
 #include <linux/input-event-codes.h>
 #include <linux/input.h>
+#include <strings.h>
 
 #define DEFINE_KEYCODE(key) { #key, AKEYCODE_##key }
 #define DEFINE_AXIS(axis) { #axis, AMOTION_EVENT_AXIS_##axis }
@@ -347,7 +348,9 @@ namespace android {
     DEFINE_KEYCODE(MACRO_1), \
     DEFINE_KEYCODE(MACRO_2), \
     DEFINE_KEYCODE(MACRO_3), \
-    DEFINE_KEYCODE(MACRO_4)
+    DEFINE_KEYCODE(MACRO_4), \
+    DEFINE_KEYCODE(EMOJI_PICKER), \
+    DEFINE_KEYCODE(SCREENSHOT)
 
 // NOTE: If you add a new axis here you must also add it to several other files.
 //       Refer to frameworks/base/core/java/android/view/MotionEvent.java for the full list.
@@ -524,6 +527,14 @@ std::string getLabel(const label* labels, int value) {
     return labels->name != nullptr ? labels->name : std::to_string(value);
 }
 
+std::optional<int> getValue(const label* labels, const char* searchLabel) {
+    if (labels == nullptr) return {};
+    while (labels->name != nullptr && ::strcasecmp(labels->name, searchLabel) != 0) {
+        labels++;
+    }
+    return labels->name != nullptr ? std::make_optional(labels->value) : std::nullopt;
+}
+
 const label* getCodeLabelsForType(int32_t type) {
     switch (type) {
         case EV_SYN:
@@ -557,7 +568,7 @@ const label* getValueLabelsForTypeAndCode(int32_t type, int32_t code) {
     if (type == EV_KEY) {
         return ev_key_value_labels;
     }
-    if (type == EV_MSC && code == ABS_MT_TOOL_TYPE) {
+    if (type == EV_ABS && code == ABS_MT_TOOL_TYPE) {
         return mt_tool_labels;
     }
     return nullptr;
@@ -571,6 +582,19 @@ EvdevEventLabel InputEventLookup::getLinuxEvdevLabel(int32_t type, int32_t code,
             .code = getLabel(getCodeLabelsForType(type), code),
             .value = getLabel(getValueLabelsForTypeAndCode(type, code), value),
     };
+}
+
+std::optional<int> InputEventLookup::getLinuxEvdevEventTypeByLabel(const char* label) {
+    return getValue(ev_labels, label);
+}
+
+std::optional<int> InputEventLookup::getLinuxEvdevEventCodeByLabel(int32_t type,
+                                                                   const char* label) {
+    return getValue(getCodeLabelsForType(type), label);
+}
+
+std::optional<int> InputEventLookup::getLinuxEvdevInputPropByLabel(const char* label) {
+    return getValue(input_prop_labels, label);
 }
 
 } // namespace android

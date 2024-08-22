@@ -222,8 +222,8 @@ Rect OutputLayer::calculateOutputDisplayFrame() const {
 
     // Some HWCs may clip client composited input to its displayFrame. Make sure
     // that this does not cut off the shadow.
-    if (layerState.forceClientComposition && layerState.shadowRadius > 0.0f) {
-        const auto outset = layerState.shadowRadius;
+    if (layerState.forceClientComposition && layerState.shadowSettings.length > 0.0f) {
+        const auto outset = layerState.shadowSettings.length;
         geomLayerBounds.left -= outset;
         geomLayerBounds.top -= outset;
         geomLayerBounds.right += outset;
@@ -311,12 +311,20 @@ void OutputLayer::updateCompositionState(
         }
     }
 
+    auto pixelFormat = layerFEState->buffer ? std::make_optional(static_cast<ui::PixelFormat>(
+                                                      layerFEState->buffer->getPixelFormat()))
+                                            : std::nullopt;
+
+    auto hdrRenderType =
+            getHdrRenderType(outputState.dataspace, pixelFormat, layerFEState->desiredHdrSdrRatio);
+
     // Determine the output dependent dataspace for this layer. If it is
     // colorspace agnostic, it just uses the dataspace chosen for the output to
     // avoid the need for color conversion.
-    state.dataspace = layerFEState->isColorspaceAgnostic &&
-                    outputState.targetDataspace != ui::Dataspace::UNKNOWN
-            ? outputState.targetDataspace
+    // For now, also respect the colorspace agnostic flag if we're drawing to HDR, to avoid drastic
+    // luminance shift. TODO(b/292162273): we should check if that's true though.
+    state.dataspace = layerFEState->isColorspaceAgnostic && hdrRenderType == HdrRenderType::SDR
+            ? outputState.dataspace
             : layerFEState->dataspace;
 
     // Override the dataspace transfer from 170M to sRGB if the device configuration requests this.
@@ -330,12 +338,8 @@ void OutputLayer::updateCompositionState(
                 (state.dataspace & HAL_DATASPACE_RANGE_MASK) | HAL_DATASPACE_TRANSFER_SRGB);
     }
 
-    auto pixelFormat = layerFEState->buffer ? std::make_optional(static_cast<ui::PixelFormat>(
-                                                      layerFEState->buffer->getPixelFormat()))
-                                            : std::nullopt;
-
-    // get HdrRenderType after the dataspace gets changed.
-    auto hdrRenderType =
+    // re-get HdrRenderType after the dataspace gets changed.
+    hdrRenderType =
             getHdrRenderType(state.dataspace, pixelFormat, layerFEState->desiredHdrSdrRatio);
 
     // For hdr content, treat the white point as the display brightness - HDR content should not be
@@ -390,7 +394,6 @@ void OutputLayer::writeStateToHWC(bool includeGeometry, bool skipLayer, uint32_t
     auto requestedCompositionType = outputIndependentState->compositionType;
 
     if (requestedCompositionType == Composition::SOLID_COLOR && state.overrideInfo.buffer) {
-        // this should never happen, as SOLID_COLOR is skipped from caching, b/230073351
         requestedCompositionType = Composition::DEVICE;
     }
 
@@ -661,6 +664,9 @@ void OutputLayer::uncacheBuffers(const std::vector<uint64_t>& bufferIdsToUncache
 void OutputLayer::writeBufferStateToHWC(HWC2::Layer* hwcLayer,
                                         const LayerFECompositionState& outputIndependentState,
                                         bool skipLayer) {
+    if (skipLayer && outputIndependentState.buffer == nullptr) {
+        return;
+    }
     auto supportedPerFrameMetadata =
             getOutput().getDisplayColorProfile()->getSupportedPerFrameMetadata();
     if (auto error = hwcLayer->setPerFrameMetadata(supportedPerFrameMetadata,
@@ -840,10 +846,16 @@ void OutputLayer::applyDeviceLayerRequest(hal::LayerRequest request) {
 
 bool OutputLayer::needsFiltering() const {
     const auto& state = getState();
-    const auto& displayFrame = state.displayFrame;
     const auto& sourceCrop = state.sourceCrop;
-    return sourceCrop.getHeight() != displayFrame.getHeight() ||
-            sourceCrop.getWidth() != displayFrame.getWidth();
+    auto displayFrameWidth = static_cast<float>(state.displayFrame.getWidth());
+    auto displayFrameHeight = static_cast<float>(state.displayFrame.getHeight());
+
+    if (state.bufferTransform & HAL_TRANSFORM_ROT_90) {
+        std::swap(displayFrameWidth, displayFrameHeight);
+    }
+
+    return sourceCrop.getHeight() != displayFrameHeight ||
+            sourceCrop.getWidth() != displayFrameWidth;
 }
 
 std::optional<LayerFE::LayerSettings> OutputLayer::getOverrideCompositionSettings() const {

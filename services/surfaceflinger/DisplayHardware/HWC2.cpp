@@ -27,6 +27,7 @@
 #include "HWC2.h"
 
 #include <android/configuration.h>
+#include <common/FlagManager.h>
 #include <ui/Fence.h>
 #include <ui/FloatRect.h>
 #include <ui/GraphicBuffer.h>
@@ -281,19 +282,28 @@ Error Display::getRequests(HWC2::DisplayRequest* outDisplayRequests,
     return Error::NONE;
 }
 
-Error Display::getConnectionType(ui::DisplayConnectionType* outType) const {
-    if (mType != DisplayType::PHYSICAL) return Error::BAD_DISPLAY;
+ftl::Expected<ui::DisplayConnectionType, hal::Error> Display::getConnectionType() const {
+    if (!mConnectionType) {
+        mConnectionType = [this]() -> decltype(mConnectionType) {
+            if (mType != DisplayType::PHYSICAL) {
+                return ftl::Unexpected(Error::BAD_DISPLAY);
+            }
 
-    using ConnectionType = Hwc2::IComposerClient::DisplayConnectionType;
-    ConnectionType connectionType;
-    const auto error = static_cast<Error>(mComposer.getDisplayConnectionType(mId, &connectionType));
-    if (error != Error::NONE) {
-        return error;
+            using ConnectionType = Hwc2::IComposerClient::DisplayConnectionType;
+            ConnectionType connectionType;
+
+            if (const auto error = static_cast<Error>(
+                        mComposer.getDisplayConnectionType(mId, &connectionType));
+                error != Error::NONE) {
+                return ftl::Unexpected(error);
+            }
+
+            return connectionType == ConnectionType::INTERNAL ? ui::DisplayConnectionType::Internal
+                                                              : ui::DisplayConnectionType::External;
+        }();
     }
 
-    *outType = connectionType == ConnectionType::INTERNAL ? ui::DisplayConnectionType::Internal
-                                                          : ui::DisplayConnectionType::External;
-    return Error::NONE;
+    return *mConnectionType;
 }
 
 bool Display::hasCapability(DisplayCapability capability) const {
@@ -310,6 +320,14 @@ bool Display::hasCapability(DisplayCapability capability) const {
 }
 
 Error Display::supportsDoze(bool* outSupport) const {
+    {
+        std::scoped_lock lock(mDisplayCapabilitiesMutex);
+        if (!mDisplayCapabilities) {
+            // The display has not turned on since boot, so DOZE support is unknown.
+            ALOGW("%s: haven't queried capabilities yet!", __func__);
+            return Error::NO_RESOURCES;
+        }
+    }
     *outSupport = hasCapability(DisplayCapability::DOZE);
     return Error::NONE;
 }
@@ -408,7 +426,14 @@ Error Display::setActiveConfigWithConstraints(hal::HWConfigId configId,
                                               VsyncPeriodChangeTimeline* outTimeline) {
     ALOGV("[%" PRIu64 "] setActiveConfigWithConstraints", mId);
 
-    if (isVsyncPeriodSwitchSupported()) {
+    // FIXME (b/319505580): At least the first config set on an external display must be
+    // `setActiveConfig`, so skip over the block that calls `setActiveConfigWithConstraints`
+    // for simplicity.
+    const bool connected_display = FlagManager::getInstance().connected_display();
+
+    if (isVsyncPeriodSwitchSupported() &&
+        (!connected_display ||
+         getConnectionType().value_opt() != ui::DisplayConnectionType::External)) {
         Hwc2::IComposerClient::VsyncPeriodChangeConstraints hwc2Constraints;
         hwc2Constraints.desiredTimeNanos = constraints.desiredTimeNanos;
         hwc2Constraints.seamlessRequired = constraints.seamlessRequired;
@@ -437,12 +462,13 @@ Error Display::setActiveConfigWithConstraints(hal::HWConfigId configId,
 }
 
 Error Display::setClientTarget(uint32_t slot, const sp<GraphicBuffer>& target,
-        const sp<Fence>& acquireFence, Dataspace dataspace)
-{
+                               const sp<Fence>& acquireFence, Dataspace dataspace,
+                               float hdrSdrRatio) {
     // TODO: Properly encode client target surface damage
     int32_t fenceFd = acquireFence->dup();
-    auto intError = mComposer.setClientTarget(mId, slot, target,
-            fenceFd, dataspace, std::vector<Hwc2::IComposerClient::Rect>());
+    auto intError =
+            mComposer.setClientTarget(mId, slot, target, fenceFd, dataspace,
+                                      std::vector<Hwc2::IComposerClient::Rect>(), hdrSdrRatio);
     return static_cast<Error>(intError);
 }
 
@@ -508,11 +534,12 @@ Error Display::setVsyncEnabled(Vsync enabled)
     return static_cast<Error>(intError);
 }
 
-Error Display::validate(nsecs_t expectedPresentTime, uint32_t* outNumTypes,
+Error Display::validate(nsecs_t expectedPresentTime, int32_t frameIntervalNs, uint32_t* outNumTypes,
                         uint32_t* outNumRequests) {
     uint32_t numTypes = 0;
     uint32_t numRequests = 0;
-    auto intError = mComposer.validateDisplay(mId, expectedPresentTime, &numTypes, &numRequests);
+    auto intError = mComposer.validateDisplay(mId, expectedPresentTime, frameIntervalNs, &numTypes,
+                                              &numRequests);
     auto error = static_cast<Error>(intError);
     if (error != Error::NONE && !hasChangesError(error)) {
         return error;
@@ -523,14 +550,15 @@ Error Display::validate(nsecs_t expectedPresentTime, uint32_t* outNumTypes,
     return error;
 }
 
-Error Display::presentOrValidate(nsecs_t expectedPresentTime, uint32_t* outNumTypes,
-                                 uint32_t* outNumRequests, sp<android::Fence>* outPresentFence,
-                                 uint32_t* state) {
+Error Display::presentOrValidate(nsecs_t expectedPresentTime, int32_t frameIntervalNs,
+                                 uint32_t* outNumTypes, uint32_t* outNumRequests,
+                                 sp<android::Fence>* outPresentFence, uint32_t* state) {
     uint32_t numTypes = 0;
     uint32_t numRequests = 0;
     int32_t presentFenceFd = -1;
-    auto intError = mComposer.presentOrValidateDisplay(mId, expectedPresentTime, &numTypes,
-                                                       &numRequests, &presentFenceFd, state);
+    auto intError =
+            mComposer.presentOrValidateDisplay(mId, expectedPresentTime, frameIntervalNs, &numTypes,
+                                               &numRequests, &presentFenceFd, state);
     auto error = static_cast<Error>(intError);
     if (error != Error::NONE && !hasChangesError(error)) {
         return error;

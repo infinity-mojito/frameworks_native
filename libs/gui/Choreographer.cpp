@@ -324,6 +324,12 @@ void Choreographer::dispatchHotplug(nsecs_t, PhysicalDisplayId displayId, bool c
           to_string(displayId).c_str(), toString(connected));
 }
 
+void Choreographer::dispatchHotplugConnectionError(nsecs_t, int32_t connectionError) {
+    ALOGV("choreographer %p ~ received hotplug connection error event (connectionError=%d), "
+          "ignoring.",
+          this, connectionError);
+}
+
 void Choreographer::dispatchModeChanged(nsecs_t, PhysicalDisplayId, int32_t, nsecs_t) {
     LOG_ALWAYS_FATAL("dispatchModeChanged was called but was never registered");
 }
@@ -336,6 +342,13 @@ void Choreographer::dispatchFrameRateOverrides(nsecs_t, PhysicalDisplayId,
 void Choreographer::dispatchNullEvent(nsecs_t, PhysicalDisplayId) {
     ALOGV("choreographer %p ~ received null event.", this);
     handleRefreshRateUpdates();
+}
+
+void Choreographer::dispatchHdcpLevelsChanged(PhysicalDisplayId displayId, int32_t connectedLevel,
+                                              int32_t maxLevel) {
+    ALOGV("choreographer %p ~ received hdcp levels change event (displayId=%s, connectedLevel=%d, "
+          "maxLevel=%d), ignoring.",
+          this, to_string(displayId).c_str(), connectedLevel, maxLevel);
 }
 
 void Choreographer::handleMessage(const Message& message) {

@@ -25,6 +25,7 @@ cc_test {
         "TfLiteMotionPredictor_test.cpp",
         "TouchResampling_test.cpp",
         "TouchVideoFrame_test.cpp",
+        "VelocityControl_test.cpp",
         "VelocityTracker_test.cpp",
         "VerifiedInputEvent_test.cpp",
     ],
@@ -63,6 +64,7 @@ cc_test {
         "libPlatformProperties",
         "libtinyxml2",
         "libutils",
+        "server_configurable_flags",
     ],
     data: [
         "data/*",

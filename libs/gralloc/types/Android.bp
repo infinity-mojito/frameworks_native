@@ -19,6 +19,7 @@ package {
     // to get the below license kinds:
     //   SPDX-license-identifier-Apache-2.0
     default_applicable_licenses: ["frameworks_native_license"],
+    default_team: "trendy_team_android_core_graphics_stack",
 }
 
 cc_library {
@@ -58,7 +59,7 @@ cc_library {
     ],
 
     export_shared_lib_headers: [
-        "android.hardware.graphics.common-V4-ndk",
+        "android.hardware.graphics.common-V5-ndk",
         "android.hardware.graphics.mapper@4.0",
         "libhidlbase",
     ],

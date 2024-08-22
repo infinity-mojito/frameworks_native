@@ -26,6 +26,7 @@
 #include <android/gui/IWindowInfosListener.h>
 #include <android/gui/TrustedPresentationThresholds.h>
 #include <android/os/IInputConstants.h>
+#include <gui/FrameRateUtils.h>
 #include <gui/TraceUtils.h>
 #include <utils/Errors.h>
 #include <utils/Log.h>
@@ -55,6 +56,7 @@
 
 #include <android-base/thread_annotations.h>
 #include <gui/LayerStatePermissions.h>
+#include <gui/ScreenCaptureResults.h>
 #include <private/gui/ComposerService.h>
 #include <private/gui/ComposerServiceAIDL.h>
 
@@ -377,7 +379,6 @@ void TransactionCompletedListener::onTransactionCompleted(ListenerStats listener
             }
             auto& [callbackFunction, callbackSurfaceControls] = callbacksMap[callbackId];
             if (!callbackFunction) {
-                ALOGE("cannot call null callback function, skipping");
                 continue;
             }
             std::vector<SurfaceControlStats> surfaceControlStats;
@@ -394,6 +395,11 @@ void TransactionCompletedListener::onTransactionCompleted(ListenerStats listener
 
             callbackFunction(transactionStats.latchTime, transactionStats.presentFence,
                              surfaceControlStats);
+
+            // More than one transaction may contain the same callback id. Erase the callback from
+            // the map to ensure that it is only called once. This can happen if transactions are
+            // parcelled out of process and applied in both processes.
+            callbacksMap.erase(callbackId);
         }
 
         // handle on complete callbacks
@@ -446,7 +452,9 @@ void TransactionCompletedListener::onTransactionCompleted(ListenerStats listener
             callbackFunction(transactionStats.latchTime, transactionStats.presentFence,
                              surfaceControlStats);
         }
+    }
 
+    for (const auto& transactionStats : listenerStats.transactionStats) {
         for (const auto& surfaceStats : transactionStats.surfaceStats) {
             // The callbackMap contains the SurfaceControl object, which we need to look up the
             // layerId. Since we don't know which callback contains the SurfaceControl, iterate
@@ -1220,7 +1228,7 @@ status_t SurfaceComposerClient::Transaction::apply(bool synchronous, bool oneWay
         flags |= ISurfaceComposer::eEarlyWakeupEnd;
     }
 
-    sp<IBinder> applyToken = mApplyToken ? mApplyToken : sApplyToken;
+    sp<IBinder> applyToken = mApplyToken ? mApplyToken : getDefaultApplyToken();
 
     sp<ISurfaceComposer> sf(ComposerService::getComposerService());
     sf->setTransactionState(mFrameTimelineInfo, composerStates, displayStates, flags, applyToken,
@@ -1242,11 +1250,15 @@ status_t SurfaceComposerClient::Transaction::apply(bool synchronous, bool oneWay
 
 sp<IBinder> SurfaceComposerClient::Transaction::sApplyToken = new BBinder();
 
+std::mutex SurfaceComposerClient::Transaction::sApplyTokenMutex;
+
 sp<IBinder> SurfaceComposerClient::Transaction::getDefaultApplyToken() {
+    std::scoped_lock lock{sApplyTokenMutex};
     return sApplyToken;
 }
 
 void SurfaceComposerClient::Transaction::setDefaultApplyToken(sp<IBinder> applyToken) {
+    std::scoped_lock lock{sApplyTokenMutex};
     sApplyToken = applyToken;
 }
 
@@ -1796,6 +1808,20 @@ SurfaceComposerClient::Transaction& SurfaceComposerClient::Transaction::setExten
     return *this;
 }
 
+SurfaceComposerClient::Transaction& SurfaceComposerClient::Transaction::setDesiredHdrHeadroom(
+        const sp<SurfaceControl>& sc, float desiredRatio) {
+    layer_state_t* s = getLayerState(sc);
+    if (!s) {
+        mStatus = BAD_INDEX;
+        return *this;
+    }
+    s->what |= layer_state_t::eDesiredHdrHeadroomChanged;
+    s->desiredHdrSdrRatio = desiredRatio;
+
+    registerSurfaceControlForCallback(sc);
+    return *this;
+}
+
 SurfaceComposerClient::Transaction& SurfaceComposerClient::Transaction::setCachingHint(
         const sp<SurfaceControl>& sc, gui::CachingHint cachingHint) {
     layer_state_t* s = getLayerState(sc);
@@ -2083,6 +2109,32 @@ SurfaceComposerClient::Transaction::setDefaultFrameRateCompatibility(const sp<Su
     }
     s->what |= layer_state_t::eDefaultFrameRateCompatibilityChanged;
     s->defaultFrameRateCompatibility = compatibility;
+    return *this;
+}
+
+SurfaceComposerClient::Transaction& SurfaceComposerClient::Transaction::setFrameRateCategory(
+        const sp<SurfaceControl>& sc, int8_t category, bool smoothSwitchOnly) {
+    layer_state_t* s = getLayerState(sc);
+    if (!s) {
+        mStatus = BAD_INDEX;
+        return *this;
+    }
+    s->what |= layer_state_t::eFrameRateCategoryChanged;
+    s->frameRateCategory = category;
+    s->frameRateCategorySmoothSwitchOnly = smoothSwitchOnly;
+    return *this;
+}
+
+SurfaceComposerClient::Transaction&
+SurfaceComposerClient::Transaction::setFrameRateSelectionStrategy(const sp<SurfaceControl>& sc,
+                                                                  int8_t strategy) {
+    layer_state_t* s = getLayerState(sc);
+    if (!s) {
+        mStatus = BAD_INDEX;
+        return *this;
+    }
+    s->what |= layer_state_t::eFrameRateSelectionStrategyChanged;
+    s->frameRateSelectionStrategy = strategy;
     return *this;
 }
 
@@ -2567,7 +2619,8 @@ void SurfaceComposerClient::getDynamicDisplayInfoInternal(gui::DynamicDisplayInf
         outMode.resolution.height = mode.resolution.height;
         outMode.xDpi = mode.xDpi;
         outMode.yDpi = mode.yDpi;
-        outMode.refreshRate = mode.refreshRate;
+        outMode.peakRefreshRate = mode.peakRefreshRate;
+        outMode.vsyncRate = mode.vsyncRate;
         outMode.appVsyncOffset = mode.appVsyncOffset;
         outMode.sfVsyncOffset = mode.sfVsyncOffset;
         outMode.presentationDeadline = mode.presentationDeadline;
@@ -2744,22 +2797,29 @@ status_t SurfaceComposerClient::getHdrOutputConversionSupport(bool* isSupported)
     return statusTFromBinderStatus(status);
 }
 
-status_t SurfaceComposerClient::setOverrideFrameRate(uid_t uid, float frameRate) {
+status_t SurfaceComposerClient::setGameModeFrameRateOverride(uid_t uid, float frameRate) {
     binder::Status status =
-            ComposerServiceAIDL::getComposerService()->setOverrideFrameRate(uid, frameRate);
+            ComposerServiceAIDL::getComposerService()->setGameModeFrameRateOverride(uid, frameRate);
     return statusTFromBinderStatus(status);
 }
 
-status_t SurfaceComposerClient::updateSmallAreaDetection(std::vector<int32_t>& uids,
+status_t SurfaceComposerClient::setGameDefaultFrameRateOverride(uid_t uid, float frameRate) {
+    binder::Status status =
+            ComposerServiceAIDL::getComposerService()->setGameDefaultFrameRateOverride(uid,
+                                                                                       frameRate);
+    return statusTFromBinderStatus(status);
+}
+
+status_t SurfaceComposerClient::updateSmallAreaDetection(std::vector<int32_t>& appIds,
                                                          std::vector<float>& thresholds) {
     binder::Status status =
-            ComposerServiceAIDL::getComposerService()->updateSmallAreaDetection(uids, thresholds);
+            ComposerServiceAIDL::getComposerService()->updateSmallAreaDetection(appIds, thresholds);
     return statusTFromBinderStatus(status);
 }
 
-status_t SurfaceComposerClient::setSmallAreaDetectionThreshold(uid_t uid, float threshold) {
+status_t SurfaceComposerClient::setSmallAreaDetectionThreshold(int32_t appId, float threshold) {
     binder::Status status =
-            ComposerServiceAIDL::getComposerService()->setSmallAreaDetectionThreshold(uid,
+            ComposerServiceAIDL::getComposerService()->setSmallAreaDetectionThreshold(appId,
                                                                                       threshold);
     return statusTFromBinderStatus(status);
 }
@@ -3072,7 +3132,6 @@ status_t SurfaceComposerClient::removeWindowInfosListener(
             ->removeWindowInfosListener(windowInfosListener,
                                         ComposerServiceAIDL::getComposerService());
 }
-
 // ----------------------------------------------------------------------------
 
 status_t ScreenshotClient::captureDisplay(const DisplayCaptureArgs& captureArgs,
@@ -3084,21 +3143,29 @@ status_t ScreenshotClient::captureDisplay(const DisplayCaptureArgs& captureArgs,
     return statusTFromBinderStatus(status);
 }
 
-status_t ScreenshotClient::captureDisplay(DisplayId displayId,
+status_t ScreenshotClient::captureDisplay(DisplayId displayId, const gui::CaptureArgs& captureArgs,
                                           const sp<IScreenCaptureListener>& captureListener) {
     sp<gui::ISurfaceComposer> s(ComposerServiceAIDL::getComposerService());
     if (s == nullptr) return NO_INIT;
 
-    binder::Status status = s->captureDisplayById(displayId.value, captureListener);
+    binder::Status status = s->captureDisplayById(displayId.value, captureArgs, captureListener);
     return statusTFromBinderStatus(status);
 }
 
 status_t ScreenshotClient::captureLayers(const LayerCaptureArgs& captureArgs,
-                                         const sp<IScreenCaptureListener>& captureListener) {
+                                         const sp<IScreenCaptureListener>& captureListener,
+                                         bool sync) {
     sp<gui::ISurfaceComposer> s(ComposerServiceAIDL::getComposerService());
     if (s == nullptr) return NO_INIT;
 
-    binder::Status status = s->captureLayers(captureArgs, captureListener);
+    binder::Status status;
+    if (sync) {
+        gui::ScreenCaptureResults captureResults;
+        status = s->captureLayersSync(captureArgs, &captureResults);
+        captureListener->onScreenCaptureCompleted(captureResults);
+    } else {
+        status = s->captureLayers(captureArgs, captureListener);
+    }
     return statusTFromBinderStatus(status);
 }
 
