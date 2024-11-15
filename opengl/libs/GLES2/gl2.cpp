@@ -1,33 +1,29 @@
-/* 
+/*
  ** Copyright 2007, The Android Open Source Project
  **
- ** Licensed under the Apache License, Version 2.0 (the "License"); 
- ** you may not use this file except in compliance with the License. 
- ** You may obtain a copy of the License at 
+ ** Licensed under the Apache License, Version 2.0 (the "License");
+ ** you may not use this file except in compliance with the License.
+ ** You may obtain a copy of the License at
  **
- **     http://www.apache.org/licenses/LICENSE-2.0 
+ **     http://www.apache.org/licenses/LICENSE-2.0
  **
- ** Unless required by applicable law or agreed to in writing, software 
- ** distributed under the License is distributed on an "AS IS" BASIS, 
- ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
- ** See the License for the specific language governing permissions and 
+ ** Unless required by applicable law or agreed to in writing, software
+ ** distributed under the License is distributed on an "AS IS" BASIS,
+ ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ ** See the License for the specific language governing permissions and
  ** limitations under the License.
  */
 
 #include <ctype.h>
-#include <string.h>
 #include <errno.h>
-
+#include <string.h>
 #include <sys/ioctl.h>
 
-#include <GLES2/gl2.h>
-#include <GLES2/gl2ext.h>
-
-#include <cutils/log.h>
+#include <log/log.h>
 #include <cutils/properties.h>
 
-#include "hooks.h"
-#include "egl_impl.h"
+#include "../hooks.h"
+#include "../egl_impl.h"
 
 using namespace android;
 
@@ -37,100 +33,270 @@ using namespace android;
 
 #undef API_ENTRY
 #undef CALL_GL_API
+#undef CALL_GL_API_INTERNAL_CALL
+#undef CALL_GL_API_INTERNAL_SET_RETURN_VALUE
+#undef CALL_GL_API_INTERNAL_DO_RETURN
 #undef CALL_GL_API_RETURN
 
-#define DEBUG_CALL_GL_API 0
-
-#if USE_FAST_TLS_KEY
-
-    #ifdef HAVE_ARM_TLS_REGISTER
-        #define GET_TLS(reg) \
-            "mrc p15, 0, " #reg ", c13, c0, 3 \n"
-    #else
-        #define GET_TLS(reg) \
-            "mov   " #reg ", #0xFFFF0FFF      \n"  \
-            "ldr   " #reg ", [" #reg ", #-15] \n"
-    #endif
-
-    #define API_ENTRY(_api) __attribute__((naked)) _api
-
-    #define CALL_GL_API(_api, ...)                              \
-         asm volatile(                                          \
-            GET_TLS(r12)                                        \
-            "ldr   r12, [r12, %[tls]] \n"                       \
-            "cmp   r12, #0            \n"                       \
-            "ldrne pc,  [r12, %[api]] \n"                       \
-            "mov   r0, #0             \n"                       \
-            "bx    lr                 \n"                       \
-            :                                                   \
-            : [tls] "J"(TLS_SLOT_OPENGL_API*4),                 \
-              [api] "J"(__builtin_offsetof(gl_hooks_t, gl._api))    \
-            :                                                   \
-            );
-
-    #define CALL_GL_API_RETURN(_api, ...) \
-        CALL_GL_API(_api, __VA_ARGS__) \
-        return 0; // placate gcc's warnings. never reached.
-
-#else
+#if USE_SLOW_BINDING
 
     #define API_ENTRY(_api) _api
 
-#if DEBUG_CALL_GL_API
-
-    #define CALL_GL_API(_api, ...)                                       \
+    #define CALL_GL_API_INTERNAL_CALL(_api, ...)                         \
         gl_hooks_t::gl_t const * const _c = &getGlThreadSpecific()->gl;  \
-        _c->_api(__VA_ARGS__); \
-        GLenum status = GL_NO_ERROR; \
-        while ((status = glGetError()) != GL_NO_ERROR) { \
-            LOGD("[" #_api "] 0x%x", status); \
-        }
+        if (_c) return _c->_api(__VA_ARGS__);
 
-#else
+    #define CALL_GL_API_INTERNAL_SET_RETURN_VALUE return 0;
 
-    #define CALL_GL_API(_api, ...)                                       \
-        gl_hooks_t::gl_t const * const _c = &getGlThreadSpecific()->gl;  \
-        _c->_api(__VA_ARGS__);
+    // This stays blank, since void functions will implicitly return, and
+    // all of the other functions will return 0 based on the previous macro.
+    #define CALL_GL_API_INTERNAL_DO_RETURN
+
+#elif defined(__arm__)
+
+    #define GET_TLS(reg) "mrc p15, 0, " #reg ", c13, c0, 3 \n"
+
+    #define API_ENTRY(_api) __attribute__((naked,noinline)) _api
+
+    #define CALL_GL_API_INTERNAL_CALL(_api, ...)                 \
+        asm volatile(                                            \
+            GET_TLS(r12)                                         \
+            "ldr   r12, [r12, %[tls]] \n"                        \
+            "cmp   r12, #0            \n"                        \
+            "ldrne pc,  [r12, %[api]] \n"                        \
+            :                                                    \
+            : [tls] "J"(TLS_SLOT_OPENGL_API*4),                  \
+              [api] "J"(__builtin_offsetof(gl_hooks_t, gl._api)) \
+            : "r0", "r1", "r2", "r3", "r12"                      \
+        );
+
+    #define CALL_GL_API_INTERNAL_SET_RETURN_VALUE \
+        asm volatile(                             \
+            "mov r0, #0 \n"                       \
+            :                                     \
+            :                                     \
+            : "r0"                                \
+        );
+
+
+    #define CALL_GL_API_INTERNAL_DO_RETURN \
+        asm volatile(                      \
+            "bx lr \n"                     \
+            :                              \
+            :                              \
+            : "r0"                         \
+        );
+
+#elif defined(__aarch64__)
+
+    #define API_ENTRY(_api) __attribute__((naked,noinline)) _api
+
+    #define CALL_GL_API_INTERNAL_CALL(_api, ...)                    \
+        asm volatile(                                               \
+            "mrs x16, tpidr_el0\n"                                  \
+            "ldr x16, [x16, %[tls]]\n"                              \
+            "cbz x16, 1f\n"                                         \
+            "ldr x16, [x16, %[api]]\n"                              \
+            "br  x16\n"                                             \
+            "1:\n"                                                  \
+            :                                                       \
+            : [tls] "i" (TLS_SLOT_OPENGL_API * sizeof(void*)),      \
+              [api] "i" (__builtin_offsetof(gl_hooks_t, gl._api))   \
+            : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x16" \
+        );
+
+    #define CALL_GL_API_INTERNAL_SET_RETURN_VALUE \
+        asm volatile(                             \
+            "mov w0, wzr \n"                      \
+            :                                     \
+            :                                     \
+            : "w0"                                \
+        );
+
+    #define CALL_GL_API_INTERNAL_DO_RETURN \
+        asm volatile(                      \
+            "ret \n"                       \
+            :                              \
+            :                              \
+            :                              \
+        );
+
+#elif defined(__i386__)
+
+    #define API_ENTRY(_api) __attribute__((naked,noinline)) _api
+
+    #define CALL_GL_API_INTERNAL_CALL(_api, ...)                    \
+        __asm__ volatile(                                           \
+            "mov %%gs:0, %%eax\n"                                   \
+            "mov %P[tls](%%eax), %%eax\n"                           \
+            "test %%eax, %%eax\n"                                   \
+            "je 1f\n"                                               \
+            "jmp *%P[api](%%eax)\n"                                 \
+            "1:\n"                                                  \
+            :                                                       \
+            : [tls] "i" (TLS_SLOT_OPENGL_API*sizeof(void*)),        \
+              [api] "i" (__builtin_offsetof(gl_hooks_t, gl._api))   \
+            : "cc", "%eax"                                          \
+            );
+
+    #define CALL_GL_API_INTERNAL_SET_RETURN_VALUE \
+        __asm__ volatile(                         \
+            "xor %%eax, %%eax\n"                  \
+            :                                     \
+            :                                     \
+            : "%eax"                              \
+        );
+
+    #define CALL_GL_API_INTERNAL_DO_RETURN \
+        __asm__ volatile(                  \
+            "ret\n"                        \
+            :                              \
+            :                              \
+            :                              \
+        );
+
+#elif defined(__x86_64__)
+
+    #define API_ENTRY(_api) __attribute__((naked,noinline)) _api
+
+    #define CALL_GL_API_INTERNAL_CALL(_api, ...)                    \
+        __asm__ volatile(                                           \
+            "mov %%fs:0, %%rax\n"                                   \
+            "mov %P[tls](%%rax), %%rax\n"                           \
+            "test %%rax, %%rax\n"                                   \
+            "je 1f\n"                                               \
+            "jmp *%P[api](%%rax)\n"                                 \
+            "1:\n"                                                  \
+            :                                                       \
+            : [tls] "i" (TLS_SLOT_OPENGL_API*sizeof(void*)),        \
+              [api] "i" (__builtin_offsetof(gl_hooks_t, gl._api))   \
+            : "cc", "%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9",   \
+              "%xmm0", "%xmm1", "%xmm2", "%xmm3", "%xmm4", "%xmm5", \
+              "%xmm6", "%xmm7"                                      \
+        );
+
+    #define CALL_GL_API_INTERNAL_SET_RETURN_VALUE \
+        __asm__ volatile(                         \
+            "xor %%eax, %%eax\n"                  \
+            :                                     \
+            :                                     \
+            : "%eax"                              \
+        );
+
+    #define CALL_GL_API_INTERNAL_DO_RETURN \
+        __asm__ volatile(                  \
+            "retq\n"                       \
+            :                              \
+            :                              \
+            :                              \
+        );
+
+#elif defined(__riscv)
+
+    #define API_ENTRY(_api) __attribute__((naked,noinline)) _api
+
+    #define CALL_GL_API_INTERNAL_CALL(_api, ...)                 \
+        asm volatile(                                            \
+            "mv t0, tp\n"                                        \
+            "li t1, %[tls]\n"                                    \
+            "add t0, t0, t1\n"                                   \
+            "ld t0, 0(t0)\n"                                     \
+            "beqz t0, 1f\n"                                      \
+            "li t1, %[api]\n"                                    \
+            "add t0, t0, t1\n"                                   \
+            "ld t0, 0(t0)\n"                                     \
+            "jalr x0, t0\n"                                      \
+            "1:\n"                                               \
+            :                                                    \
+            : [tls] "i"(TLS_SLOT_OPENGL_API*sizeof(void *)),     \
+              [api] "i"(__builtin_offsetof(gl_hooks_t, gl._api)) \
+            : "t0", "t1", "t2", "a0", "a1", "a2", "a3", "a4",    \
+              "a5", "t6", "t3", "t4", "t5", "t6"                 \
+        );
+
+    #define CALL_GL_API_INTERNAL_SET_RETURN_VALUE \
+        asm volatile(                             \
+            "li a0, 0\n"                          \
+            :                                     \
+            :                                     \
+            : "a0"                                \
+        );
+
+    #define CALL_GL_API_INTERNAL_DO_RETURN \
+        asm volatile(                      \
+            "ret\n"                        \
+            :                              \
+            :                              \
+            :                              \
+        );
 
 #endif
 
-    #define CALL_GL_API_RETURN(_api, ...)                                \
-        gl_hooks_t::gl_t const * const _c = &getGlThreadSpecific()->gl;  \
-        return _c->_api(__VA_ARGS__)
+#define CALL_GL_API(_api, ...) \
+    CALL_GL_API_INTERNAL_CALL(_api, __VA_ARGS__) \
+    CALL_GL_API_INTERNAL_DO_RETURN
 
-#endif
-
+#define CALL_GL_API_RETURN(_api, ...) \
+    CALL_GL_API_INTERNAL_CALL(_api, __VA_ARGS__) \
+    CALL_GL_API_INTERNAL_SET_RETURN_VALUE \
+    CALL_GL_API_INTERNAL_DO_RETURN
 
 extern "C" {
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 #include "gl2_api.in"
 #include "gl2ext_api.in"
+#pragma GCC diagnostic warning "-Wunused-parameter"
 }
 
 #undef API_ENTRY
 #undef CALL_GL_API
+#undef CALL_GL_API_INTERNAL_CALL
+#undef CALL_GL_API_INTERNAL_SET_RETURN_VALUE
+#undef CALL_GL_API_INTERNAL_DO_RETURN
 #undef CALL_GL_API_RETURN
 
-
 /*
- * These GL calls are special because they need to EGL to retrieve some
- * informations before they can execute.
+ * glGetString() and glGetStringi() are special because we expose some
+ * extensions in the wrapper. Also, wrapping glGetXXX() is required because
+ * the value returned for GL_NUM_EXTENSIONS may have been altered by the
+ * injection of the additional extensions.
  */
 
-extern "C" void __glEGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image);
-extern "C" void __glEGLImageTargetRenderbufferStorageOES(GLenum target, GLeglImageOES image);
-
-
-void glEGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image)
-{
-    GLeglImageOES implImage = 
-        (GLeglImageOES)egl_get_image_for_current_context((EGLImageKHR)image);
-    __glEGLImageTargetTexture2DOES(target, implImage);
+extern "C" {
+    const GLubyte * __glGetString(GLenum name);
+    const GLubyte * __glGetStringi(GLenum name, GLuint index);
+    void __glGetBooleanv(GLenum pname, GLboolean * data);
+    void __glGetFloatv(GLenum pname, GLfloat * data);
+    void __glGetIntegerv(GLenum pname, GLint * data);
+    void __glGetInteger64v(GLenum pname, GLint64 * data);
 }
 
-void glEGLImageTargetRenderbufferStorageOES(GLenum target, GLeglImageOES image)
-{
-    GLeglImageOES implImage = 
-        (GLeglImageOES)egl_get_image_for_current_context((EGLImageKHR)image);
-    __glEGLImageTargetRenderbufferStorageOES(target, implImage);
+const GLubyte * glGetString(GLenum name) {
+    egl_connection_t* const cnx = egl_get_connection();
+    return cnx->platform.glGetString(name);
 }
 
+const GLubyte * glGetStringi(GLenum name, GLuint index) {
+    egl_connection_t* const cnx = egl_get_connection();
+    return cnx->platform.glGetStringi(name, index);
+}
+
+void glGetBooleanv(GLenum pname, GLboolean * data) {
+    egl_connection_t* const cnx = egl_get_connection();
+    return cnx->platform.glGetBooleanv(pname, data);
+}
+
+void glGetFloatv(GLenum pname, GLfloat * data) {
+    egl_connection_t* const cnx = egl_get_connection();
+    return cnx->platform.glGetFloatv(pname, data);
+}
+
+void glGetIntegerv(GLenum pname, GLint * data) {
+    egl_connection_t* const cnx = egl_get_connection();
+    return cnx->platform.glGetIntegerv(pname, data);
+}
+
+void glGetInteger64v(GLenum pname, GLint64 * data) {
+    egl_connection_t* const cnx = egl_get_connection();
+    return cnx->platform.glGetInteger64v(pname, data);
+}

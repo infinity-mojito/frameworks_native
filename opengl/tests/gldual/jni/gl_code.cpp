@@ -1,8 +1,13 @@
 // OpenGL ES 2.0 code
 
-#include <nativehelper/jni.h>
+#include <jni.h>
 #define LOG_TAG "GL2JNI gl_code.cpp"
-#include <utils/Log.h>
+#include <android/log.h>
+
+#define ALOG(priority, tag, ...) ((void)__android_log_print(ANDROID_##priority, tag, __VA_ARGS__))
+
+#define ALOGI(...) ALOG(LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define ALOGE(...) ALOG(LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -14,13 +19,13 @@
 
 static void printGLString(const char *name, GLenum s) {
     const char *v = (const char *) glGetString(s);
-    LOGI("GL %s = %s\n", name, v);
+    ALOGI("GL %s = %s\n", name, v);
 }
 
 static void checkGlError(const char* op) {
     for (GLint error = glGetError(); error; error
             = glGetError()) {
-        LOGI("after %s() glError (0x%x)\n", op, error);
+        ALOGI("after %s() glError (0x%x)\n", op, error);
     }
 }
 
@@ -48,7 +53,7 @@ GLuint loadShader(GLenum shaderType, const char* pSource) {
                 char* buf = (char*) malloc(infoLen);
                 if (buf) {
                     glGetShaderInfoLog(shader, infoLen, NULL, buf);
-                    LOGE("Could not compile shader %d:\n%s\n",
+                    ALOGE("Could not compile shader %d:\n%s\n",
                             shaderType, buf);
                     free(buf);
                 }
@@ -87,7 +92,7 @@ GLuint createProgram(const char* pVertexSource, const char* pFragmentSource) {
                 char* buf = (char*) malloc(bufLength);
                 if (buf) {
                     glGetProgramInfoLog(program, bufLength, NULL, buf);
-                    LOGE("Could not link program:\n%s\n", buf);
+                    ALOGE("Could not link program:\n%s\n", buf);
                     free(buf);
                 }
             }
@@ -107,15 +112,15 @@ bool setupGraphics(int w, int h) {
     printGLString("Renderer", GL_RENDERER);
     printGLString("Extensions", GL_EXTENSIONS);
 
-    LOGI("setupGraphics(%d, %d)", w, h);
+    ALOGI("setupGraphics(%d, %d)", w, h);
     gProgram = createProgram(gVertexShader, gFragmentShader);
     if (!gProgram) {
-        LOGE("Could not create program.");
+        ALOGE("Could not create program.");
         return false;
     }
     gvPositionHandle = glGetAttribLocation(gProgram, "vPosition");
     checkGlError("glGetAttribLocation");
-    LOGI("glGetAttribLocation(\"vPosition\") = %d\n",
+    ALOGI("glGetAttribLocation(\"vPosition\") = %d\n",
             gvPositionHandle);
 
     glViewport(0, 0, w, h);
@@ -153,12 +158,12 @@ extern "C" {
     JNIEXPORT void JNICALL Java_com_android_gldual_GLDualLib_step(JNIEnv * env, jobject obj);
 };
 
-JNIEXPORT void JNICALL Java_com_android_gldual_GLDualLib_init(JNIEnv * env, jobject obj, jint width, jint height)
+JNIEXPORT void JNICALL Java_com_android_gldual_GLDualLib_init(JNIEnv * /*env*/, jobject /*obj*/, jint width, jint height)
 {
     setupGraphics(width, height);
 }
 
-JNIEXPORT void JNICALL Java_com_android_gldual_GLDualLib_step(JNIEnv * env, jobject obj)
+JNIEXPORT void JNICALL Java_com_android_gldual_GLDualLib_step(JNIEnv * /*env*/, jobject /*obj*/)
 {
     renderFrame();
 }

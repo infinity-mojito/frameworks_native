@@ -1,0 +1,17 @@
+{
+  "presubmit": [
+    {
+      "name": "libvibratorservice_test"
+    }
+  ],
+  "postsubmit": [
+    {
+      "name": "libvibratorservice_test"
+    }
+  ],
+  "imports": [
+    {
+      "path": "cts/tests/vibrator"
+    }
+  ]
+}

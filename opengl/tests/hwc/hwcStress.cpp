@@ -78,6 +78,8 @@
  * a different color from the rest of the rectangle.
  */
 
+#define LOG_TAG "hwcStressTest"
+
 #include <algorithm>
 #include <assert.h>
 #include <cerrno>
@@ -101,18 +103,15 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
-#include <ui/FramebufferNativeWindow.h>
 #include <ui/GraphicBuffer.h>
-#include <ui/EGLUtils.h>
 
-#define LOG_TAG "hwcStressTest"
 #include <utils/Log.h>
 #include <testUtil.h>
 
 #include <hardware/hwcomposer.h>
 
 #include <glTestLib.h>
-#include <hwc/hwcTestLib.h>
+#include "hwcTestLib.h"
 
 using namespace std;
 using namespace android;
@@ -163,7 +162,7 @@ bool eFlag, sFlag, pFlag;
 #define CMD_STOP_FRAMEWORK   "stop 2>&1"
 #define CMD_START_FRAMEWORK  "start 2>&1"
 
-#define NUMA(a) (sizeof(a) / sizeof(a [0]))
+#define NUMA(a) (sizeof(a) / sizeof((a)[0]))
 #define MEMCLR(addr, size) do { \
         memset((addr), 0, (size)); \
     } while (0)
@@ -193,7 +192,7 @@ const vector<unsigned int> vecTransformFlags(transformFlags,
 // File scope globals
 static const int texUsage = GraphicBuffer::USAGE_HW_TEXTURE |
         GraphicBuffer::USAGE_SW_WRITE_RARELY;
-static hwc_composer_device_t *hwcDevice;
+static hwc_composer_device_1_t *hwcDevice;
 static EGLDisplay dpy;
 static EGLSurface surface;
 static EGLint width, height;
@@ -410,7 +409,7 @@ main(int argc, char *argv[])
         // generated for this pass.
         srand48(pass);
 
-        hwc_layer_list_t *list;
+        hwc_display_contents_1_t *list;
         list = hwcTestCreateLayerList(testRandMod(frames.size()) + 1);
         if (list == NULL) {
             testPrintE("hwcTestCreateLayerList failed");
@@ -429,7 +428,7 @@ main(int argc, char *argv[])
         for (unsigned int n1 = 0; n1 < list->numHwLayers; n1++) {
             unsigned int idx = testRandMod(selectedFrames[n1].size());
             sp<GraphicBuffer> gBuf = selectedFrames[n1][idx];
-            hwc_layer_t *layer = &list->hwLayers[n1];
+            hwc_layer_1_t *layer = &list->hwLayers[n1];
             layer->handle = gBuf->handle;
 
             layer->blending = blendingOps[testRandMod(NUMA(blendingOps))];
@@ -479,7 +478,7 @@ main(int argc, char *argv[])
 
         // Perform prepare operation
         if (verbose) { testPrintI("Prepare:"); hwcTestDisplayList(list); }
-        hwcDevice->prepare(hwcDevice, list);
+        hwcDevice->prepare(hwcDevice, 1, &list);
         if (verbose) {
             testPrintI("Post Prepare:");
             hwcTestDisplayListPrepareModifiable(list);
@@ -492,13 +491,15 @@ main(int argc, char *argv[])
         if (verbose) {testPrintI("Set:"); }
         for (unsigned int n1 = 0; n1 < numSet; n1++) {
             if (verbose) { hwcTestDisplayListHandles(list); }
-            hwcDevice->set(hwcDevice, dpy, surface, list);
+            list->dpy = dpy;
+            list->sur = surface;
+            hwcDevice->set(hwcDevice, 1, &list);
 
             // Prandomly select a new set of handles
             for (unsigned int n1 = 0; n1 < list->numHwLayers; n1++) {
                 unsigned int idx = testRandMod(selectedFrames[n1].size());
                 sp<GraphicBuffer> gBuf = selectedFrames[n1][idx];
-                hwc_layer_t *layer = &list->hwLayers[n1];
+                hwc_layer_1_t *layer = &list->hwLayers[n1];
                 layer->handle = (native_handle_t *) gBuf->handle;
             }
 
@@ -573,8 +574,8 @@ void initFrames(unsigned int seed)
         // mod the wMod/hMod value must be equal to 0.
         size_t w = (width * maxSizeRatio) * testRandFract();
         size_t h = (height * maxSizeRatio) * testRandFract();
-        w = max(1u, w);
-        h = max(1u, h);
+        w = max(size_t(1u), w);
+        h = max(size_t(1u), h);
         if ((w % formatPtr->wMod) != 0) {
             w += formatPtr->wMod - (w % formatPtr->wMod);
         }

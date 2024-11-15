@@ -17,37 +17,55 @@
 // All static variables go here, to control initialization and
 // destruction order in the library.
 
-#include <private/binder/Static.h>
+#include "Static.h"
 
+#include "BufferedTextOutput.h"
 #include <binder/IPCThreadState.h>
 #include <utils/Log.h>
 
 namespace android {
 
-// ------------ ProcessState.cpp
+// ------------ Text output streams
 
-Mutex gProcessMutex;
-sp<ProcessState> gProcess;
+Vector<int32_t> gTextBuffers;
 
-class LibUtilsIPCtStatics
+class LogTextOutput : public BufferedTextOutput
 {
 public:
-    LibUtilsIPCtStatics()
+    LogTextOutput() : BufferedTextOutput(MULTITHREADED) { }
+    virtual ~LogTextOutput() { }
+
+protected:
+    virtual status_t writeLines(const struct iovec& vec, size_t N)
     {
-    }
-    
-    ~LibUtilsIPCtStatics()
-    {
-        IPCThreadState::shutdown();
+        //android_writevLog(&vec, N);       <-- this is now a no-op
+        if (N != 1) ALOGI("WARNING: writeLines N=%zu\n", N);
+        ALOGI("%.*s", (int)vec.iov_len, (const char*) vec.iov_base);
+        return NO_ERROR;
     }
 };
 
-static LibUtilsIPCtStatics gIPCStatics;
+class FdTextOutput : public BufferedTextOutput
+{
+public:
+    explicit FdTextOutput(int fd) : BufferedTextOutput(MULTITHREADED), mFD(fd) { }
+    virtual ~FdTextOutput() { }
 
-// ------------ ServiceManager.cpp
+protected:
+    virtual status_t writeLines(const struct iovec& vec, size_t N)
+    {
+        ssize_t ret = writev(mFD, &vec, N);
+        if (ret == -1) return -errno;
+        if (static_cast<size_t>(ret) != N) return UNKNOWN_ERROR;
+        return NO_ERROR;
+    }
 
-Mutex gDefaultServiceManagerLock;
-sp<IServiceManager> gDefaultServiceManager;
-sp<IPermissionController> gPermissionController;
+private:
+    int mFD;
+};
+
+TextOutput& alog(*new LogTextOutput());
+TextOutput& aout(*new FdTextOutput(STDOUT_FILENO));
+TextOutput& aerr(*new FdTextOutput(STDERR_FILENO));
 
 }   // namespace android

@@ -28,6 +28,7 @@ public class CFunc {
 
     boolean hasPointerArg = false;
     boolean hasTypedPointerArg = false;
+    boolean hasEGLHandleArg = false;
 
     public CFunc(String original) {
         this.original = original;
@@ -63,6 +64,9 @@ public class CFunc {
         if (argType.isTypedPointer()) {
             hasTypedPointerArg = true;
         }
+        if (argType.isEGLHandle()) {
+            hasEGLHandleArg = true;
+        }
     }
 
     public int getNumArgs() {
@@ -93,6 +97,10 @@ public class CFunc {
 
     public boolean hasTypedPointerArg() {
         return hasTypedPointerArg;
+    }
+
+    public boolean hasEGLHandleArg() {
+        return hasEGLHandleArg;
     }
 
     @Override
@@ -133,7 +141,10 @@ public class CFunc {
             String tok = tokens[i++];
 
             if (tok.equals("(")) {
-                continue;
+                tok = tokens[i++];
+                if (tok.equals("void")) {
+                    break;
+                }
             }
             if (tok.equals(")")) {
                 break;
@@ -149,10 +160,6 @@ public class CFunc {
                 argTypeName = tokens[i++];
             }
             argType.setBaseType(argTypeName);
-
-            if (argTypeName.equals("void")) {
-                break;
-            }
 
             argName = tokens[i++];
             if (argName.startsWith("*")) {

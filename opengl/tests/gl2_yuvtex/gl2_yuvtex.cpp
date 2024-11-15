@@ -27,9 +27,9 @@
 
 #include <utils/Timers.h>
 
-#include <ui/FramebufferNativeWindow.h>
+#include <WindowSurface.h>
 #include <ui/GraphicBuffer.h>
-#include <ui/EGLUtils.h>
+#include <EGLUtils.h>
 
 using namespace android;
 
@@ -186,20 +186,20 @@ const int yuvTexUsage = GraphicBuffer::USAGE_HW_TEXTURE |
         GraphicBuffer::USAGE_SW_WRITE_RARELY;
 const int yuvTexFormat = HAL_PIXEL_FORMAT_YV12;
 const int yuvTexOffsetY = 0;
-const int yuvTexStrideY = (yuvTexWidth + 0xf) & ~0xf;
-const int yuvTexOffsetV = yuvTexStrideY * yuvTexHeight;
-const int yuvTexStrideV = (yuvTexStrideY/2 + 0xf) & ~0xf; 
-const int yuvTexOffsetU = yuvTexOffsetV + yuvTexStrideV * yuvTexHeight/2;
-const int yuvTexStrideU = yuvTexStrideV;
 const bool yuvTexSameUV = false;
 static sp<GraphicBuffer> yuvTexBuffer;
 static GLuint yuvTex;
 
-bool setupYuvTexSurface(EGLDisplay dpy, EGLContext context) {
+bool setupYuvTexSurface(EGLDisplay dpy, EGLContext /*context*/) {
     int blockWidth = yuvTexWidth > 16 ? yuvTexWidth / 16 : 1;
     int blockHeight = yuvTexHeight > 16 ? yuvTexHeight / 16 : 1;
     yuvTexBuffer = new GraphicBuffer(yuvTexWidth, yuvTexHeight, yuvTexFormat,
             yuvTexUsage);
+    int yuvTexStrideY = yuvTexBuffer->getStride();
+    int yuvTexOffsetV = yuvTexStrideY * yuvTexHeight;
+    int yuvTexStrideV = (yuvTexStrideY/2 + 0xf) & ~0xf;
+    int yuvTexOffsetU = yuvTexOffsetV + yuvTexStrideV * yuvTexHeight/2;
+    int yuvTexStrideU = yuvTexStrideV;
     char* buf = NULL;
     status_t err = yuvTexBuffer->lock(GRALLOC_USAGE_SW_WRITE_OFTEN, (void**)(&buf));
     if (err != 0) {
@@ -331,7 +331,7 @@ void printEGLConfiguration(EGLDisplay dpy, EGLConfig config) {
     printf("\n");
 }
 
-int main(int argc, char** argv) {
+int main(int /*argc*/, char** /*argv*/) {
     EGLBoolean returnValue;
     EGLConfig myConfig = {0};
 
@@ -364,7 +364,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    EGLNativeWindowType window = android_createDisplaySurface();
+    WindowSurface windowSurface;
+    EGLNativeWindowType window = windowSurface.getSurface();
     returnValue = EGLUtils::selectConfigForNativeWindow(dpy, s_configAttribs, window, &myConfig);
     if (returnValue) {
         printf("EGLUtils::selectConfigForNativeWindow() returned %d", returnValue);
@@ -398,7 +399,6 @@ int main(int argc, char** argv) {
     checkEglError("eglQuerySurface");
     eglQuerySurface(dpy, surface, EGL_HEIGHT, &h);
     checkEglError("eglQuerySurface");
-    GLint dim = w < h ? w : h;
 
     fprintf(stderr, "Window dimensions: %d x %d\n", w, h);
 

@@ -26,7 +26,7 @@ static uint32_t gHeight = 0;
 static void checkGlError(const char* op) {
     for (GLint error = glGetError(); error; error
             = glGetError()) {
-        LOGE("after %s() glError (0x%x)\n", op, error);
+        ALOGE("after %s() glError (0x%x)\n", op, error);
     }
 }
 
@@ -44,7 +44,7 @@ GLuint loadShader(GLenum shaderType, const char* pSource) {
                 char* buf = (char*) malloc(infoLen);
                 if (buf) {
                     glGetShaderInfoLog(shader, infoLen, NULL, buf);
-                    LOGE("Could not compile shader %d:\n%s\n", shaderType, buf);
+                    ALOGE("Could not compile shader %d:\n%s\n", shaderType, buf);
                     free(buf);
                 }
                 glDeleteShader(shader);
@@ -94,7 +94,7 @@ GLuint createProgram(const char* pVertexSource, const char* pFragmentSource) {
                 char* buf = (char*) malloc(bufLength);
                 if (buf) {
                     glGetProgramInfoLog(program, bufLength, NULL, buf);
-                    LOGE("Could not link program:\n%s\n", buf);
+                    ALOGE("Could not link program:\n%s\n", buf);
                     free(buf);
                 }
             }
@@ -132,7 +132,7 @@ static void endTimer(int count) {
     } else {
         printf("%s, %f, %f\n", gCurrentTestName, mpps, dc60);
     }
-    LOGI("%s, %f, %f\r\n", gCurrentTestName, mpps, dc60);
+    ALOGI("%s, %f, %f\r\n", gCurrentTestName, mpps, dc60);
 }
 
 
@@ -189,12 +189,12 @@ static void setupVA() {
 }
 
 static void randUniform(int pgm, const char *var) {
-    int loc = glGetUniformLocation(pgm, var);
+    GLint loc = glGetUniformLocation(pgm, var);
     if (loc >= 0) {
-        float x = ((float)rand()) / RAND_MAX;
-        float y = ((float)rand()) / RAND_MAX;
-        float z = ((float)rand()) / RAND_MAX;
-        float w = ((float)rand()) / RAND_MAX;
+        float x = ((float)rand()) / (float)RAND_MAX;
+        float y = ((float)rand()) / (float)RAND_MAX;
+        float z = ((float)rand()) / (float)RAND_MAX;
+        float w = ((float)rand()) / (float)RAND_MAX;
         glUniform4f(loc, x, y, z, w);
     }
 }
@@ -211,7 +211,7 @@ static void doLoop(bool warmup, int pgm, uint32_t passCount) {
     startTimer();
     glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT);
     for (uint32_t ct=0; ct < passCount; ct++) {
-        int loc = glGetUniformLocation(pgm, "u_texOff");
+        GLint loc = glGetUniformLocation(pgm, "u_texOff");
         glUniform2f(loc, ((float)ct) / passCount, ((float)ct) / 2.f / passCount);
 
         randUniform(pgm, "u_color");
@@ -271,7 +271,7 @@ static void doSingleTest(uint32_t pgmNum, int tex) {
         printf("error running test\n");
         return;
     }
-    int loc = glGetUniformLocation(pgm, "u_tex0");
+    GLint loc = glGetUniformLocation(pgm, "u_tex0");
     if (loc >= 0) glUniform1i(loc, 0);
     loc = glGetUniformLocation(pgm, "u_tex1");
     if (loc >= 0) glUniform1i(loc, 1);

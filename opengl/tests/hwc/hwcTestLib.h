@@ -27,9 +27,7 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
-#include <ui/FramebufferNativeWindow.h>
 #include <ui/GraphicBuffer.h>
-#include <ui/EGLUtils.h>
 
 #include <utils/Log.h>
 #include <testUtil.h>
@@ -47,8 +45,6 @@ const struct hwcTestGraphicFormat {
     {HAL_PIXEL_FORMAT_RGB_888,   "RGB888",   1, 1},
     {HAL_PIXEL_FORMAT_RGB_565,   "RGB565",   1, 1},
     {HAL_PIXEL_FORMAT_BGRA_8888, "BGRA8888", 1, 1},
-    {HAL_PIXEL_FORMAT_RGBA_5551, "RGBA5551", 1, 1},
-    {HAL_PIXEL_FORMAT_RGBA_4444, "RGBA4444", 1, 1},
     {HAL_PIXEL_FORMAT_YV12,      "YV12",     2, 2},
 };
 
@@ -62,7 +58,7 @@ class ColorFract {
     float c2(void) const { return _c2; }
     float c3(void) const { return _c3; }
 
-    operator std::string();
+    operator std::string(); // NOLINT(google-explicit-constructor)
 
   private:
     float _c1;
@@ -75,7 +71,7 @@ class ColorFract {
 class ColorRGB {
   public:
     ColorRGB(): _r(0.0), _g(0.0), _b(0.0) {};
-    ColorRGB(float f): _r(f), _g(f), _b(f) {}; // Gray
+    ColorRGB(float f): _r(f), _g(f), _b(f) {}; // Gray, NOLINT(google-explicit-constructor)
     ColorRGB(float r, float g, float b): _r(r), _g(g), _b(b) {};
     float r(void) const { return _r; }
     float g(void) const { return _g; }
@@ -97,8 +93,8 @@ class HwcTestDim {
     void setWidth(uint32_t w) { _w = w; }
     void setHeight(uint32_t h) { _h = h; }
 
-    operator std::string();
-    operator hwc_rect() const;
+    operator std::string(); // NOLINT(google-explicit-constructor)
+    operator hwc_rect() const; // NOLINT(google-explicit-constructor)
 
   private:
     uint32_t _w;
@@ -108,17 +104,17 @@ class HwcTestDim {
 // Function Prototypes
 void hwcTestInitDisplay(bool verbose, EGLDisplay *dpy, EGLSurface *surface,
     EGLint *width, EGLint *height);
-void hwcTestOpenHwc(hwc_composer_device_t **hwcDevicePtr);
+void hwcTestOpenHwc(hwc_composer_device_1_t **hwcDevicePtr);
 const struct hwcTestGraphicFormat *hwcTestGraphicFormatLookup(const char *desc);
 const struct hwcTestGraphicFormat *hwcTestGraphicFormatLookup(uint32_t id);
 const char *hwcTestGraphicFormat2str(uint32_t format);
 std::string hwcTestRect2str(const struct hwc_rect& rect);
 
-hwc_layer_list_t *hwcTestCreateLayerList(size_t numLayers);
-void hwcTestFreeLayerList(hwc_layer_list_t *list);
-void hwcTestDisplayList(hwc_layer_list_t *list);
-void hwcTestDisplayListPrepareModifiable(hwc_layer_list_t *list);
-void hwcTestDisplayListHandles(hwc_layer_list_t *list);
+hwc_display_contents_1_t *hwcTestCreateLayerList(size_t numLayers);
+void hwcTestFreeLayerList(hwc_display_contents_1_t *list);
+void hwcTestDisplayList(hwc_display_contents_1_t *list);
+void hwcTestDisplayListPrepareModifiable(hwc_display_contents_1_t *list);
+void hwcTestDisplayListHandles(hwc_display_contents_1_t *list);
 
 uint32_t hwcTestColor2Pixel(uint32_t format, ColorFract color, float alpha);
 void hwcTestColorConvert(uint32_t fromFormat, uint32_t toFormat,

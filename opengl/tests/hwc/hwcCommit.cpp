@@ -70,6 +70,8 @@
  *   made and reported for each of the known graphic format.
  */
 
+#define LOG_TAG "hwcCommitTest"
+
 #include <algorithm>
 #include <assert.h>
 #include <cerrno>
@@ -96,18 +98,15 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
-#include <ui/FramebufferNativeWindow.h>
 #include <ui/GraphicBuffer.h>
-#include <ui/EGLUtils.h>
 
-#define LOG_TAG "hwcCommitTest"
 #include <utils/Log.h>
 #include <testUtil.h>
 
 #include <hardware/hwcomposer.h>
 
 #include <glTestLib.h>
-#include <hwc/hwcTestLib.h>
+#include "hwcTestLib.h"
 
 using namespace std;
 using namespace android;
@@ -122,8 +121,6 @@ const uint32_t   defaultBlend = HWC_BLENDING_NONE;
 const ColorFract defaultColor(0.5, 0.5, 0.5);
 const float      defaultAlpha = 1.0; // Opaque
 const HwcTestDim defaultSourceDim(1, 1);
-const struct hwc_rect defaultSourceCrop = {0, 0, 1, 1};
-const struct hwc_rect defaultDisplayFrame = {0, 0, 100, 100};
 
 // Global Constants
 const uint32_t printFieldWidth = 2;
@@ -159,12 +156,12 @@ const struct blendType {
 #define CMD_START_FRAMEWORK  "start 2>&1"
 
 // Macros
-#define NUMA(a) (sizeof(a) / sizeof(a [0])) // Num elements in an array
+#define NUMA(a) (sizeof(a) / sizeof((a)[0])) // Num elements in an array
 
 // Local types
 class Rectangle {
 public:
-    Rectangle(uint32_t graphicFormat = defaultFormat,
+    explicit Rectangle(uint32_t graphicFormat = defaultFormat,
               HwcTestDim dfDim = HwcTestDim(1, 1),
               HwcTestDim sDim = HwcTestDim(1, 1));
     void setSourceDim(HwcTestDim dim);
@@ -186,7 +183,7 @@ public:
     uint32_t lower(void) { return _l; }
     uint32_t upper(void) { return _u; }
 
-    operator string();
+    operator string(); // NOLINT(google-explicit-constructor)
 
 private:
     uint32_t _l; // lower
@@ -219,7 +216,9 @@ public:
     static void double2Rational(double f, Range nRange, Range dRange,
                                Rational& lower, Rational& upper);
         
+    // NOLINTNEXTLINE(google-explicit-constructor)
     operator string() const;
+    // NOLINTNEXTLINE(google-explicit-constructor)
     operator double() const { return (double) _n / (double) _d; }
 
 
@@ -231,7 +230,7 @@ private:
 // Globals
 static const int texUsage = GraphicBuffer::USAGE_HW_TEXTURE |
         GraphicBuffer::USAGE_SW_WRITE_RARELY;
-static hwc_composer_device_t *hwcDevice;
+static hwc_composer_device_1_t *hwcDevice;
 static EGLDisplay dpy;
 static EGLSurface surface;
 static EGLint width, height;
@@ -340,7 +339,6 @@ int
 main(int argc, char *argv[])
 {
     int     rv, opt;
-    char   *chptr;
     bool    error;
     string  str;
     char cmd[MAXCMD];
@@ -1398,7 +1396,7 @@ void Rational::double2Rational(double f, Range nRange, Range dRange,
 // Given a list of rectangles, determine how many HWC will commit to render
 uint32_t numOverlays(list<Rectangle>& rectList)
 {
-    hwc_layer_list_t *hwcList;
+    hwc_display_contents_1_t *hwcList;
     list<sp<GraphicBuffer> > buffers;
 
     hwcList = hwcTestCreateLayerList(rectList.size());
@@ -1407,7 +1405,7 @@ uint32_t numOverlays(list<Rectangle>& rectList)
         exit(30);
     }
 
-    hwc_layer_t *layer = &hwcList->hwLayers[0];
+    hwc_layer_1_t *layer = &hwcList->hwLayers[0];
     for (std::list<Rectangle>::iterator it = rectList.begin();
          it != rectList.end(); ++it, ++layer) {
         // Allocate the texture for the source frame
@@ -1431,7 +1429,7 @@ uint32_t numOverlays(list<Rectangle>& rectList)
 
     // Perform prepare operation
     if (verbose) { testPrintI("Prepare:"); hwcTestDisplayList(hwcList); }
-    hwcDevice->prepare(hwcDevice, hwcList);
+    hwcDevice->prepare(hwcDevice, 1, &hwcList);
     if (verbose) {
         testPrintI("Post Prepare:");
         hwcTestDisplayListPrepareModifiable(hwcList);

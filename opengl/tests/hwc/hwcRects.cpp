@@ -80,6 +80,8 @@
  *   a list of attributes and the format of their expected value.
  */
 
+#define LOG_TAG "hwcRectsTest"
+
 #include <algorithm>
 #include <assert.h>
 #include <cerrno>
@@ -104,18 +106,14 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
-#include <ui/FramebufferNativeWindow.h>
 #include <ui/GraphicBuffer.h>
-#include <ui/EGLUtils.h>
-
-#define LOG_TAG "hwcRectsTest"
 #include <utils/Log.h>
 #include <testUtil.h>
 
 #include <hardware/hwcomposer.h>
 
 #include <glTestLib.h>
-#include <hwc/hwcTestLib.h>
+#include "hwcTestLib.h"
 
 using namespace std;
 using namespace android;
@@ -139,7 +137,7 @@ const struct hwc_rect defaultDisplayFrame = {0, 0, 100, 100};
 #define CMD_START_FRAMEWORK  "start 2>&1"
 
 // Macros
-#define NUMA(a) (sizeof(a) / sizeof(a [0])) // Num elements in an array
+#define NUMA(a) (sizeof(a) / sizeof((a)[0])) // Num elements in an array
 
 // Local types
 class Rectangle {
@@ -166,13 +164,13 @@ public:
 list<Rectangle> rectangle;
 static const int texUsage = GraphicBuffer::USAGE_HW_TEXTURE |
         GraphicBuffer::USAGE_SW_WRITE_RARELY;
-static hwc_composer_device_t *hwcDevice;
+static hwc_composer_device_1_t *hwcDevice;
 static EGLDisplay dpy;
 static EGLSurface surface;
 static EGLint width, height;
 
 // Function prototypes
-static Rectangle parseRect(string rectStr);
+static Rectangle parseRect(const string& rectStr);
 void init(void);
 void printSyntax(const char *cmd);
 
@@ -206,7 +204,6 @@ main(int argc, char *argv[])
 {
     int     rv, opt;
     char   *chptr;
-    bool    error;
     string  str;
     char cmd[MAXCMD];
 
@@ -308,14 +305,14 @@ main(int argc, char *argv[])
     }
 
     // Create list of frames
-    hwc_layer_list_t *list;
+    hwc_display_contents_1_t *list;
     list = hwcTestCreateLayerList(rectangle.size());
     if (list == NULL) {
         testPrintE("hwcTestCreateLayerList failed");
         exit(5);
     }
 
-    hwc_layer_t *layer = &list->hwLayers[0];
+    hwc_layer_1_t *layer = &list->hwLayers[0];
     for (std::list<Rectangle>::iterator it = rectangle.begin();
          it != rectangle.end(); ++it, ++layer) {
         layer->handle = it->texture->handle;
@@ -330,7 +327,7 @@ main(int argc, char *argv[])
 
     // Perform prepare operation
     if (verbose) { testPrintI("Prepare:"); hwcTestDisplayList(list); }
-    hwcDevice->prepare(hwcDevice, list);
+    hwcDevice->prepare(hwcDevice, 1, &list);
     if (verbose) {
         testPrintI("Post Prepare:");
         hwcTestDisplayListPrepareModifiable(list);
@@ -342,7 +339,9 @@ main(int argc, char *argv[])
     // Perform the set operation(s)
     if (verbose) {testPrintI("Set:"); }
     if (verbose) { hwcTestDisplayListHandles(list); }
-    hwcDevice->set(hwcDevice, dpy, surface, list);
+    list->dpy = dpy;
+    list->sur = surface;
+    hwcDevice->set(hwcDevice, 1, &list);
 
     testDelay(endDelay);
 
@@ -359,7 +358,7 @@ main(int argc, char *argv[])
 
 // Parse string description of rectangle and add it to list of rectangles
 // to be rendered.
-static Rectangle parseRect(string rectStr)
+static Rectangle parseRect(const string& rectStr)
 {
     int rv;
     string str;
@@ -367,7 +366,6 @@ static Rectangle parseRect(string rectStr)
     istringstream in(rectStr);
     const struct hwcTestGraphicFormat *format;
     Rectangle rect;
-    struct hwc_rect hwcRect;
 
     // Graphic Format
     in >> str;

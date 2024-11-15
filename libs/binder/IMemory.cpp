@@ -16,21 +16,24 @@
 
 #define LOG_TAG "IMemory"
 
+#include <atomic>
+#include <stdatomic.h>
+
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <binder/IMemory.h>
-#include <utils/KeyedVector.h>
-#include <utils/threads.h>
-#include <utils/Atomic.h>
 #include <binder/Parcel.h>
-#include <utils/CallStack.h>
+#include <log/log.h>
+
+#include <utils/Mutex.h>
+
+#include <map>
 
 #define VERBOSE   0
 
@@ -42,11 +45,11 @@ class HeapCache : public IBinder::DeathRecipient
 public:
     HeapCache();
     virtual ~HeapCache();
-    
+
     virtual void binderDied(const wp<IBinder>& who);
 
-    sp<IMemoryHeap> find_heap(const sp<IBinder>& binder); 
-    void free_heap(const sp<IBinder>& binder); 
+    sp<IMemoryHeap> find_heap(const sp<IBinder>& binder);
+    void free_heap(const sp<IBinder>& binder);
     sp<IMemoryHeap> get_heap(const sp<IBinder>& binder);
     void dump_heaps();
 
@@ -55,15 +58,18 @@ private:
     struct heap_info_t {
         sp<IMemoryHeap> heap;
         int32_t         count;
+        // Note that this cannot be meaningfully copied.
     };
 
-    void free_heap(const wp<IBinder>& binder); 
+    void free_heap(const wp<IBinder>& binder);
 
-    Mutex mHeapCacheLock;
-    KeyedVector< wp<IBinder>, heap_info_t > mHeapCache;
+    Mutex mHeapCacheLock;  // Protects entire vector below.
+    std::map<wp<IBinder>, heap_info_t> mHeapCache;
+    // We do not use the copy-on-write capabilities of KeyedVector.
+    // TODO: Reimplemement based on standard C++ container?
 };
 
-static sp<HeapCache> gHeapCache = new HeapCache();
+static sp<HeapCache> gHeapCache = sp<HeapCache>::make();
 
 /******************************************************************************/
 
@@ -74,18 +80,19 @@ enum {
 class BpMemoryHeap : public BpInterface<IMemoryHeap>
 {
 public:
-    BpMemoryHeap(const sp<IBinder>& impl);
+    explicit BpMemoryHeap(const sp<IBinder>& impl);
     virtual ~BpMemoryHeap();
 
-    virtual int getHeapID() const;
-    virtual void* getBase() const;
-    virtual size_t getSize() const;
-    virtual uint32_t getFlags() const;
+    int getHeapID() const override;
+    void* getBase() const override;
+    size_t getSize() const override;
+    uint32_t getFlags() const override;
+    off_t getOffset() const override;
 
 private:
     friend class IMemory;
     friend class HeapCache;
-    
+
     // for debugging in this module
     static inline sp<IMemoryHeap> find_heap(const sp<IBinder>& binder) {
         return gHeapCache->find_heap(binder);
@@ -97,16 +104,17 @@ private:
         return gHeapCache->get_heap(binder);
     }
     static inline void dump_heaps() {
-        gHeapCache->dump_heaps();       
+        gHeapCache->dump_heaps();
     }
 
     void assertMapped() const;
     void assertReallyMapped() const;
 
-    mutable volatile int32_t mHeapId;
+    mutable std::atomic<int32_t> mHeapId;
     mutable void*       mBase;
     mutable size_t      mSize;
     mutable uint32_t    mFlags;
+    mutable off_t       mOffset;
     mutable bool        mRealHeap;
     mutable Mutex       mLock;
 };
@@ -120,10 +128,11 @@ enum {
 class BpMemory : public BpInterface<IMemory>
 {
 public:
-    BpMemory(const sp<IBinder>& impl);
+    explicit BpMemory(const sp<IBinder>& impl);
     virtual ~BpMemory();
-    virtual sp<IMemoryHeap> getMemory(ssize_t* offset=0, size_t* size=0) const;
-    
+    // NOLINTNEXTLINE(google-default-arguments)
+    virtual sp<IMemoryHeap> getMemory(ssize_t* offset=nullptr, size_t* size=nullptr) const;
+
 private:
     mutable sp<IMemoryHeap> mHeap;
     mutable ssize_t mOffset;
@@ -137,22 +146,24 @@ void* IMemory::fastPointer(const sp<IBinder>& binder, ssize_t offset) const
     sp<IMemoryHeap> realHeap = BpMemoryHeap::get_heap(binder);
     void* const base = realHeap->base();
     if (base == MAP_FAILED)
-        return 0;
+        return nullptr;
     return static_cast<char*>(base) + offset;
 }
 
-void* IMemory::pointer() const {
+void* IMemory::unsecurePointer() const {
     ssize_t offset;
     sp<IMemoryHeap> heap = getMemory(&offset);
-    void* const base = heap!=0 ? heap->base() : MAP_FAILED;
+    void* const base = heap!=nullptr ? heap->base() : MAP_FAILED;
     if (base == MAP_FAILED)
-        return 0;
+        return nullptr;
     return static_cast<char*>(base) + offset;
 }
+
+void* IMemory::pointer() const { return unsecurePointer(); }
 
 size_t IMemory::size() const {
     size_t size;
-    getMemory(NULL, &size);
+    getMemory(nullptr, &size);
     return size;
 }
 
@@ -173,39 +184,55 @@ BpMemory::~BpMemory()
 {
 }
 
+// NOLINTNEXTLINE(google-default-arguments)
 sp<IMemoryHeap> BpMemory::getMemory(ssize_t* offset, size_t* size) const
 {
-    if (mHeap == 0) {
+    if (mHeap == nullptr) {
         Parcel data, reply;
         data.writeInterfaceToken(IMemory::getInterfaceDescriptor());
         if (remote()->transact(GET_MEMORY, data, &reply) == NO_ERROR) {
             sp<IBinder> heap = reply.readStrongBinder();
-            ssize_t o = reply.readInt32();
-            size_t s = reply.readInt32();
-            if (heap != 0) {
+            if (heap != nullptr) {
                 mHeap = interface_cast<IMemoryHeap>(heap);
-                if (mHeap != 0) {
-                    mOffset = o;
-                    mSize = s;
+                if (mHeap != nullptr) {
+                    const int64_t offset64 = reply.readInt64();
+                    const uint64_t size64 = reply.readUint64();
+                    const ssize_t o = (ssize_t)offset64;
+                    const size_t s = (size_t)size64;
+                    size_t heapSize = mHeap->getSize();
+                    if (s == size64 && o == offset64 // ILP32 bounds check
+                            && s <= heapSize
+                            && o >= 0
+                            && (static_cast<size_t>(o) <= heapSize - s)) {
+                        mOffset = o;
+                        mSize = s;
+                    } else {
+                        // Hm.
+                        android_errorWriteWithInfoLog(0x534e4554,
+                            "26877992", -1, nullptr, 0);
+                        mOffset = 0;
+                        mSize = 0;
+                    }
                 }
             }
         }
     }
     if (offset) *offset = mOffset;
     if (size) *size = mSize;
-    return mHeap;
+    return (mSize > 0) ? mHeap : nullptr;
 }
 
 // ---------------------------------------------------------------------------
 
-IMPLEMENT_META_INTERFACE(Memory, "android.utils.IMemory");
+IMPLEMENT_META_INTERFACE(Memory, "android.utils.IMemory")
 
 BnMemory::BnMemory() {
 }
 
-BnMemory::~BnMemory() { 
+BnMemory::~BnMemory() {
 }
 
+// NOLINTNEXTLINE(google-default-arguments)
 status_t BnMemory::onTransact(
     uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags)
 {
@@ -214,9 +241,9 @@ status_t BnMemory::onTransact(
             CHECK_INTERFACE(IMemory, data, reply);
             ssize_t offset;
             size_t size;
-            reply->writeStrongBinder( getMemory(&offset, &size)->asBinder() );
-            reply->writeInt32(offset);
-            reply->writeInt32(size);
+            reply->writeStrongBinder( IInterface::asBinder(getMemory(&offset, &size)) );
+            reply->writeInt64(offset);
+            reply->writeUint64(size);
             return NO_ERROR;
         } break;
         default:
@@ -229,31 +256,29 @@ status_t BnMemory::onTransact(
 
 BpMemoryHeap::BpMemoryHeap(const sp<IBinder>& impl)
     : BpInterface<IMemoryHeap>(impl),
-        mHeapId(-1), mBase(MAP_FAILED), mSize(0), mFlags(0), mRealHeap(false)
+        mHeapId(-1), mBase(MAP_FAILED), mSize(0), mFlags(0), mOffset(0), mRealHeap(false)
 {
 }
 
 BpMemoryHeap::~BpMemoryHeap() {
-    if (mHeapId != -1) {
-        close(mHeapId);
+    int32_t heapId = mHeapId.load(memory_order_relaxed);
+    if (heapId != -1) {
+        close(heapId);
         if (mRealHeap) {
             // by construction we're the last one
             if (mBase != MAP_FAILED) {
-                sp<IBinder> binder = const_cast<BpMemoryHeap*>(this)->asBinder();
+                sp<IBinder> binder = IInterface::asBinder(this);
 
                 if (VERBOSE) {
-                    LOGD("UNMAPPING binder=%p, heap=%p, size=%d, fd=%d", 
-                            binder.get(), this, mSize, mHeapId);
-                    CallStack stack;
-                    stack.update();
-                    stack.dump("callstack");
+                    ALOGD("UNMAPPING binder=%p, heap=%p, size=%zu, fd=%d",
+                            binder.get(), this, mSize, heapId);
                 }
 
                 munmap(mBase, mSize);
             }
         } else {
             // remove from list only if it was mapped before
-            sp<IBinder> binder = const_cast<BpMemoryHeap*>(this)->asBinder();
+            sp<IBinder> binder = IInterface::asBinder(this);
             free_heap(binder);
         }
     }
@@ -261,16 +286,21 @@ BpMemoryHeap::~BpMemoryHeap() {
 
 void BpMemoryHeap::assertMapped() const
 {
-    if (mHeapId == -1) {
-        sp<IBinder> binder(const_cast<BpMemoryHeap*>(this)->asBinder());
-        sp<BpMemoryHeap> heap(static_cast<BpMemoryHeap*>(find_heap(binder).get()));
+    int32_t heapId = mHeapId.load(memory_order_acquire);
+    if (heapId == -1) {
+        sp<IBinder> binder(IInterface::asBinder(const_cast<BpMemoryHeap*>(this)));
+        sp<BpMemoryHeap> heap = sp<BpMemoryHeap>::cast(find_heap(binder));
         heap->assertReallyMapped();
         if (heap->mBase != MAP_FAILED) {
             Mutex::Autolock _l(mLock);
-            if (mHeapId == -1) {
+            if (mHeapId.load(memory_order_relaxed) == -1) {
                 mBase   = heap->mBase;
                 mSize   = heap->mSize;
-                android_atomic_write( dup( heap->mHeapId ), &mHeapId );
+                mOffset = heap->mOffset;
+                int fd = fcntl(heap->mHeapId.load(memory_order_relaxed), F_DUPFD_CLOEXEC, 0);
+                ALOGE_IF(fd==-1, "cannot dup fd=%d",
+                        heap->mHeapId.load(memory_order_relaxed));
+                mHeapId.store(fd, memory_order_release);
             }
         } else {
             // something went wrong
@@ -281,43 +311,51 @@ void BpMemoryHeap::assertMapped() const
 
 void BpMemoryHeap::assertReallyMapped() const
 {
-    if (mHeapId == -1) {
+    int32_t heapId = mHeapId.load(memory_order_acquire);
+    if (heapId == -1) {
 
         // remote call without mLock held, worse case scenario, we end up
         // calling transact() from multiple threads, but that's not a problem,
         // only mmap below must be in the critical section.
-        
+
         Parcel data, reply;
         data.writeInterfaceToken(IMemoryHeap::getInterfaceDescriptor());
         status_t err = remote()->transact(HEAP_ID, data, &reply);
         int parcel_fd = reply.readFileDescriptor();
-        ssize_t size = reply.readInt32();
-        uint32_t flags = reply.readInt32();
-
-        LOGE_IF(err, "binder=%p transaction failed fd=%d, size=%ld, err=%d (%s)",
-                asBinder().get(), parcel_fd, size, err, strerror(-err));
-
-        int fd = dup( parcel_fd );
-        LOGE_IF(fd==-1, "cannot dup fd=%d, size=%ld, err=%d (%s)",
-                parcel_fd, size, err, strerror(errno));
-
-        int access = PROT_READ;
-        if (!(flags & READ_ONLY)) {
-            access |= PROT_WRITE;
+        const uint64_t size64 = reply.readUint64();
+        const int64_t offset64 = reply.readInt64();
+        const uint32_t flags = reply.readUint32();
+        const size_t size = (size_t)size64;
+        const off_t offset = (off_t)offset64;
+        if (err != NO_ERROR || // failed transaction
+                size != size64 || offset != offset64) { // ILP32 size check
+            ALOGE("binder=%p transaction failed fd=%d, size=%zu, err=%d (%s)",
+                    IInterface::asBinder(this).get(),
+                    parcel_fd, size, err, strerror(-err));
+            return;
         }
 
         Mutex::Autolock _l(mLock);
-        if (mHeapId == -1) {
+        if (mHeapId.load(memory_order_relaxed) == -1) {
+            int fd = fcntl(parcel_fd, F_DUPFD_CLOEXEC, 0);
+            ALOGE_IF(fd == -1, "cannot dup fd=%d, size=%zu, err=%d (%s)",
+                    parcel_fd, size, err, strerror(errno));
+
+            int access = PROT_READ;
+            if (!(flags & READ_ONLY)) {
+                access |= PROT_WRITE;
+            }
             mRealHeap = true;
-            mBase = mmap(0, size, access, MAP_SHARED, fd, 0);
+            mBase = mmap(nullptr, size, access, MAP_SHARED, fd, offset);
             if (mBase == MAP_FAILED) {
-                LOGE("cannot map BpMemoryHeap (binder=%p), size=%ld, fd=%d (%s)",
-                        asBinder().get(), size, fd, strerror(errno));
+                ALOGE("cannot map BpMemoryHeap (binder=%p), size=%zu, fd=%d (%s)",
+                        IInterface::asBinder(this).get(), size, fd, strerror(errno));
                 close(fd);
             } else {
                 mSize = size;
                 mFlags = flags;
-                android_atomic_write(fd, &mHeapId);
+                mOffset = offset;
+                mHeapId.store(fd, memory_order_release);
             }
         }
     }
@@ -325,7 +363,8 @@ void BpMemoryHeap::assertReallyMapped() const
 
 int BpMemoryHeap::getHeapID() const {
     assertMapped();
-    return mHeapId;
+    // We either stored mHeapId ourselves, or loaded it with acquire semantics.
+    return mHeapId.load(memory_order_relaxed);
 }
 
 void* BpMemoryHeap::getBase() const {
@@ -343,16 +382,22 @@ uint32_t BpMemoryHeap::getFlags() const {
     return mFlags;
 }
 
+off_t BpMemoryHeap::getOffset() const {
+    assertMapped();
+    return mOffset;
+}
+
 // ---------------------------------------------------------------------------
 
-IMPLEMENT_META_INTERFACE(MemoryHeap, "android.utils.IMemoryHeap");
+IMPLEMENT_META_INTERFACE(MemoryHeap, "android.utils.IMemoryHeap")
 
-BnMemoryHeap::BnMemoryHeap() { 
+BnMemoryHeap::BnMemoryHeap() {
 }
 
-BnMemoryHeap::~BnMemoryHeap() { 
+BnMemoryHeap::~BnMemoryHeap() {
 }
 
+// NOLINTNEXTLINE(google-default-arguments)
 status_t BnMemoryHeap::onTransact(
         uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags)
 {
@@ -360,8 +405,9 @@ status_t BnMemoryHeap::onTransact(
        case HEAP_ID: {
             CHECK_INTERFACE(IMemoryHeap, data, reply);
             reply->writeFileDescriptor(getHeapID());
-            reply->writeInt32(getSize());
-            reply->writeInt32(getFlags());
+            reply->writeUint64(getSize());
+            reply->writeInt64(getOffset());
+            reply->writeUint32(getFlags());
             return NO_ERROR;
         } break;
         default:
@@ -382,31 +428,32 @@ HeapCache::~HeapCache()
 
 void HeapCache::binderDied(const wp<IBinder>& binder)
 {
-    //LOGD("binderDied binder=%p", binder.unsafe_get());
-    free_heap(binder); 
+    //ALOGD("binderDied binder=%p", binder.unsafe_get());
+    free_heap(binder);
 }
 
-sp<IMemoryHeap> HeapCache::find_heap(const sp<IBinder>& binder) 
+sp<IMemoryHeap> HeapCache::find_heap(const sp<IBinder>& binder)
 {
     Mutex::Autolock _l(mHeapCacheLock);
-    ssize_t i = mHeapCache.indexOfKey(binder);
-    if (i>=0) {
-        heap_info_t& info = mHeapCache.editValueAt(i);
-        LOGD_IF(VERBOSE,
-                "found binder=%p, heap=%p, size=%d, fd=%d, count=%d", 
+    auto i = mHeapCache.find(binder);
+    if (i != mHeapCache.end()) {
+        heap_info_t& info = i->second;
+        ALOGD_IF(VERBOSE,
+                "found binder=%p, heap=%p, size=%zu, fd=%d, count=%d",
                 binder.get(), info.heap.get(),
                 static_cast<BpMemoryHeap*>(info.heap.get())->mSize,
-                static_cast<BpMemoryHeap*>(info.heap.get())->mHeapId,
+                static_cast<BpMemoryHeap*>(info.heap.get())
+                    ->mHeapId.load(memory_order_relaxed),
                 info.count);
-        android_atomic_inc(&info.count);
+        ++info.count;
         return info.heap;
     } else {
         heap_info_t info;
         info.heap = interface_cast<IMemoryHeap>(binder);
         info.count = 1;
-        //LOGD("adding binder=%p, heap=%p, count=%d",
+        //ALOGD("adding binder=%p, heap=%p, count=%d",
         //      binder.get(), info.heap.get(), info.count);
-        mHeapCache.add(binder, info);
+        mHeapCache.insert({binder, info});
         return info.heap;
     }
 }
@@ -415,27 +462,27 @@ void HeapCache::free_heap(const sp<IBinder>& binder)  {
     free_heap( wp<IBinder>(binder) );
 }
 
-void HeapCache::free_heap(const wp<IBinder>& binder) 
+void HeapCache::free_heap(const wp<IBinder>& binder)
 {
     sp<IMemoryHeap> rel;
     {
         Mutex::Autolock _l(mHeapCacheLock);
-        ssize_t i = mHeapCache.indexOfKey(binder);
-        if (i>=0) {
-            heap_info_t& info(mHeapCache.editValueAt(i));
-            int32_t c = android_atomic_dec(&info.count);
-            if (c == 1) {
-                LOGD_IF(VERBOSE,
-                        "removing binder=%p, heap=%p, size=%d, fd=%d, count=%d", 
+        auto i = mHeapCache.find(binder);
+        if (i != mHeapCache.end()) {
+            heap_info_t& info = i->second;
+            if (--info.count == 0) {
+                ALOGD_IF(VERBOSE,
+                        "removing binder=%p, heap=%p, size=%zu, fd=%d, count=%d",
                         binder.unsafe_get(), info.heap.get(),
                         static_cast<BpMemoryHeap*>(info.heap.get())->mSize,
-                        static_cast<BpMemoryHeap*>(info.heap.get())->mHeapId,
+                        static_cast<BpMemoryHeap*>(info.heap.get())
+                            ->mHeapId.load(memory_order_relaxed),
                         info.count);
-                rel = mHeapCache.valueAt(i).heap;
-                mHeapCache.removeItemsAt(i);
+                rel = i->second.heap;
+                mHeapCache.erase(i);
             }
         } else {
-            LOGE("free_heap binder=%p not found!!!", binder.unsafe_get());
+            ALOGE("free_heap binder=%p not found!!!", binder.unsafe_get());
         }
     }
 }
@@ -444,26 +491,26 @@ sp<IMemoryHeap> HeapCache::get_heap(const sp<IBinder>& binder)
 {
     sp<IMemoryHeap> realHeap;
     Mutex::Autolock _l(mHeapCacheLock);
-    ssize_t i = mHeapCache.indexOfKey(binder);
-    if (i>=0)   realHeap = mHeapCache.valueAt(i).heap;
-    else        realHeap = interface_cast<IMemoryHeap>(binder);
+    auto i = mHeapCache.find(binder);
+    if (i != mHeapCache.end())
+        realHeap = i->second.heap;
+    else
+        realHeap = interface_cast<IMemoryHeap>(binder);
     return realHeap;
 }
 
-void HeapCache::dump_heaps() 
+void HeapCache::dump_heaps()
 {
     Mutex::Autolock _l(mHeapCacheLock);
-    int c = mHeapCache.size();
-    for (int i=0 ; i<c ; i++) {
-        const heap_info_t& info = mHeapCache.valueAt(i);
+    for (const auto& i : mHeapCache) {
+        const heap_info_t& info = i.second;
         BpMemoryHeap const* h(static_cast<BpMemoryHeap const *>(info.heap.get()));
-        LOGD("hey=%p, heap=%p, count=%d, (fd=%d, base=%p, size=%d)",
-                mHeapCache.keyAt(i).unsafe_get(),
-                info.heap.get(), info.count, 
-                h->mHeapId, h->mBase, h->mSize);
+        ALOGD("hey=%p, heap=%p, count=%d, (fd=%d, base=%p, size=%zu)", i.first.unsafe_get(),
+              info.heap.get(), info.count, h->mHeapId.load(memory_order_relaxed), h->mBase,
+              h->mSize);
     }
 }
 
 
 // ---------------------------------------------------------------------------
-}; // namespace android
+} // namespace android

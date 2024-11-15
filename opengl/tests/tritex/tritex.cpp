@@ -8,8 +8,8 @@
 #include <GLES/gl.h>
 #include <GLES/glext.h>
 
-#include <ui/FramebufferNativeWindow.h>
-#include <ui/EGLUtils.h>
+#include <WindowSurface.h>
+#include <EGLUtils.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +25,7 @@ GLuint texture;
 #define FIXED_ONE 0x10000
 #define ITERATIONS 50
 
-int init_gl_surface(void);
+int init_gl_surface(const WindowSurface&);
 void free_gl_surface(void);
 void init_scene(void);
 void render(int quads);
@@ -93,12 +93,10 @@ static void gluLookAt(float eyeX, float eyeY, float eyeZ,
 
 int main(int argc, char **argv)
 {
-    int q;
-    int start, end;
-
     printf("Initializing EGL...\n");
 
-    if(!init_gl_surface())
+    WindowSurface windowSurface;
+    if(!init_gl_surface(windowSurface))
     {
         printf("GL initialisation failed - exiting\n");
         return 0;
@@ -117,9 +115,8 @@ int main(int argc, char **argv)
     return 0;
 }
 
-int init_gl_surface(void)
+int init_gl_surface(const WindowSurface& windowSurface)
 {
-    EGLint numConfigs = 1;
     EGLConfig myConfig = {0};
     EGLint attrib[] =
     {
@@ -140,7 +137,7 @@ int init_gl_surface(void)
         return 0;
     }
 
-    EGLNativeWindowType window = android_createDisplaySurface();
+    EGLNativeWindowType window = windowSurface.getSurface();
     EGLUtils::selectConfigForNativeWindow(eglDisplay, attrib, window, &myConfig);
 
     if ( (eglSurface = eglCreateWindowSurface(eglDisplay, myConfig,

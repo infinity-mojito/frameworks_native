@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#define LOG_TAG "IInterface"
 #include <binder/IInterface.h>
 
 namespace android {
@@ -27,16 +28,21 @@ IInterface::IInterface()
 IInterface::~IInterface() {
 }
 
-sp<IBinder> IInterface::asBinder()
+// static
+sp<IBinder> IInterface::asBinder(const IInterface* iface)
 {
-    return this ? onAsBinder() : NULL;
+    if (iface == nullptr) return nullptr;
+    return sp<IBinder>::fromExisting(const_cast<IInterface*>(iface)->onAsBinder());
 }
 
-sp<const IBinder> IInterface::asBinder() const
+// static
+sp<IBinder> IInterface::asBinder(const sp<IInterface>& iface)
 {
-    return this ? const_cast<IInterface*>(this)->onAsBinder() : NULL;
+    if (iface == nullptr) return nullptr;
+    return sp<IBinder>::fromExisting(iface->onAsBinder());
 }
+
 
 // ---------------------------------------------------------------------------
 
-}; // namespace android
+} // namespace android

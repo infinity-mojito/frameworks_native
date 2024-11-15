@@ -26,19 +26,18 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
-#include <ui/EGLUtils.h>
+#include "EGLUtils.h"
 
 #include <utils/Log.h>
 #include <testUtil.h>
 
-using namespace std;
 using namespace android;
 
 void glTestPrintGLString(const char *name, GLenum s)
 {
     const char *v = (const char *) glGetString(s);
 
-    if (v == NULL) {
+    if (v == nullptr) {
         testPrintI("GL %s unknown", name);
     } else {
         testPrintI("GL %s = %s", name, v);

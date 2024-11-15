@@ -22,12 +22,12 @@
 #include <GLES/gl.h>
 #include <GLES/glext.h>
 
-#include <ui/FramebufferNativeWindow.h>
-#include <ui/EGLUtils.h>
+#include <WindowSurface.h>
+#include <EGLUtils.h>
 
 using namespace android;
 
-int main(int argc, char** argv)
+int main(int /*argc*/, char** /*argv*/)
 {
     EGLint configAttribs[] = {
          EGL_DEPTH_SIZE, 0,
@@ -42,7 +42,8 @@ int main(int argc, char** argv)
      EGLint w, h;
      EGLDisplay dpy;
 
-     EGLNativeWindowType window = android_createDisplaySurface();
+     WindowSurface windowSurface;
+     EGLNativeWindowType window = windowSurface.getSurface();
      
      dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
      eglInitialize(dpy, &majorVersion, &minorVersion);
@@ -86,12 +87,6 @@ int main(int argc, char** argv)
              0x0000, 0x5555, 0x0000, 0x5555, 
              0xAAAA, 0xFFFF, 0xAAAA, 0xFFFF  };
 
-     uint16_t t5551[]  = { 
-             0x0000, 0xFFFF, 0x0000, 0xFFFF, 
-             0xFFFF, 0x0000, 0xFFFF, 0x0000,
-             0x0000, 0xFFFF, 0x0000, 0xFFFF, 
-             0xFFFF, 0x0000, 0xFFFF, 0x0000  };
-
      uint32_t t32[]  = { 
              0xFF000000, 0xFF0000FF, 0xFF00FF00, 0xFFFF0000, 
              0xFF00FF00, 0xFFFF0000, 0xFF000000, 0xFF0000FF, 
@@ -114,5 +109,7 @@ int main(int argc, char** argv)
      glDrawTexiOES(dim/2, dim/2, 0, dim/2, dim/2);
 
      eglSwapBuffers(dpy, surface);
+
+     sleep(2);      // so you have a chance to admire it
      return 0;
 }

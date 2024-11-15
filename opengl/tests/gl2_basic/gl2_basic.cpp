@@ -26,10 +26,13 @@
 
 #include <utils/Timers.h>
 
-#include <ui/FramebufferNativeWindow.h>
-#include <ui/EGLUtils.h>
+#include <WindowSurface.h>
+#include <EGLUtils.h>
 
 using namespace android;
+extern "C" EGLAPI const char* eglQueryStringImplementationANDROID(EGLDisplay dpy, EGLint name);
+
+#define METADATA_SCALE(x) (static_cast<EGLint>(x * EGL_METADATA_SCALING_EXT))
 
 static void printGLString(const char *name, GLenum s) {
     // fprintf(stderr, "printGLString %s, %d\n", name, s);
@@ -42,6 +45,12 @@ static void printGLString(const char *name, GLenum s) {
     // else
     //    fprintf(stderr, "GL %s = (null) 0x%08x\n", name, (unsigned int) v);
     fprintf(stderr, "GL %s = %s\n", name, v);
+}
+
+static void printEGLString(EGLDisplay dpy, const char *name, GLenum s) {
+    const char *v = (const char *) eglQueryString(dpy, s);
+    const char* va = (const char*)eglQueryStringImplementationANDROID(dpy, s);
+    fprintf(stderr, "GL %s = %s\nImplementationANDROID: %s\n", name, v, va);
 }
 
 static void checkEglError(const char* op, EGLBoolean returnVal = EGL_TRUE) {
@@ -258,7 +267,40 @@ int printEGLConfigurations(EGLDisplay dpy) {
     return true;
 }
 
-int main(int argc, char** argv) {
+void setSurfaceMetadata(EGLDisplay dpy, EGLSurface surface) {
+    static EGLBoolean toggle = GL_FALSE;
+    if (EGLUtils::hasEglExtension(dpy, "EGL_EXT_surface_SMPTE2086_metadata")) {
+        eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_DISPLAY_PRIMARY_RX_EXT, METADATA_SCALE(0.640));
+        eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_DISPLAY_PRIMARY_RY_EXT, METADATA_SCALE(0.330));
+        eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_DISPLAY_PRIMARY_GX_EXT, METADATA_SCALE(0.290));
+        eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_DISPLAY_PRIMARY_GY_EXT, METADATA_SCALE(0.600));
+        eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_DISPLAY_PRIMARY_BX_EXT, METADATA_SCALE(0.150));
+        eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_DISPLAY_PRIMARY_BY_EXT, METADATA_SCALE(0.060));
+        eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_WHITE_POINT_X_EXT, METADATA_SCALE(0.3127));
+        eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_WHITE_POINT_Y_EXT, METADATA_SCALE(0.3290));
+        if (toggle) {
+            eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_MAX_LUMINANCE_EXT, METADATA_SCALE(350));
+        } else {
+            eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_MAX_LUMINANCE_EXT, METADATA_SCALE(300));
+        }
+        eglSurfaceAttrib(dpy, surface, EGL_SMPTE2086_MIN_LUMINANCE_EXT, METADATA_SCALE(0.7));
+    }
+
+    if (EGLUtils::hasEglExtension(dpy, "EGL_EXT_surface_CTA861_3_metadata")) {
+        if (toggle) {
+            eglSurfaceAttrib(dpy, surface, EGL_CTA861_3_MAX_CONTENT_LIGHT_LEVEL_EXT,
+                             METADATA_SCALE(300));
+        } else {
+            eglSurfaceAttrib(dpy, surface, EGL_CTA861_3_MAX_CONTENT_LIGHT_LEVEL_EXT,
+                             METADATA_SCALE(325));
+        }
+        eglSurfaceAttrib(dpy, surface, EGL_CTA861_3_MAX_FRAME_AVERAGE_LEVEL_EXT,
+                         METADATA_SCALE(75));
+    }
+    toggle = !toggle;
+}
+
+int main(int /*argc*/, char** /*argv*/) {
     EGLBoolean returnValue;
     EGLConfig myConfig = {0};
 
@@ -298,7 +340,8 @@ int main(int argc, char** argv) {
 
     checkEglError("printEGLConfigurations");
 
-    EGLNativeWindowType window = android_createDisplaySurface();
+    WindowSurface windowSurface;
+    EGLNativeWindowType window = windowSurface.getSurface();
     returnValue = EGLUtils::selectConfigForNativeWindow(dpy, s_configAttribs, window, &myConfig);
     if (returnValue) {
         printf("EGLUtils::selectConfigForNativeWindow() returned %d", returnValue);
@@ -310,10 +353,11 @@ int main(int argc, char** argv) {
     printf("Chose this configuration:\n");
     printEGLConfiguration(dpy, myConfig);
 
-    surface = eglCreateWindowSurface(dpy, myConfig, window, NULL);
+    EGLint winAttribs[] = {EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_SRGB_KHR, EGL_NONE};
+    surface = eglCreateWindowSurface(dpy, myConfig, window, winAttribs);
     checkEglError("eglCreateWindowSurface");
     if (surface == EGL_NO_SURFACE) {
-        printf("gelCreateWindowSurface failed.\n");
+        printf("eglCreateWindowSurface failed.\n");
         return 0;
     }
 
@@ -332,7 +376,6 @@ int main(int argc, char** argv) {
     checkEglError("eglQuerySurface");
     eglQuerySurface(dpy, surface, EGL_HEIGHT, &h);
     checkEglError("eglQuerySurface");
-    GLint dim = w < h ? w : h;
 
     fprintf(stderr, "Window dimensions: %d x %d\n", w, h);
 
@@ -340,6 +383,7 @@ int main(int argc, char** argv) {
     printGLString("Vendor", GL_VENDOR);
     printGLString("Renderer", GL_RENDERER);
     printGLString("Extensions", GL_EXTENSIONS);
+    printEGLString(dpy, "EGL Extensions", EGL_EXTENSIONS);
 
     if(!setupGraphics(w, h)) {
         fprintf(stderr, "Could not set up graphics.\n");
@@ -348,6 +392,7 @@ int main(int argc, char** argv) {
 
     for (;;) {
         renderFrame();
+        setSurfaceMetadata(dpy, surface);
         eglSwapBuffers(dpy, surface);
         checkEglError("eglSwapBuffers");
     }

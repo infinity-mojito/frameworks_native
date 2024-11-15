@@ -20,20 +20,22 @@
  * Utility library functions for use by the Hardware Composer test cases
  */
 
+#include <arpa/inet.h> // For ntohl() and htonl()
+
+#include <cmath>
 #include <sstream>
 #include <string>
 
-#include <arpa/inet.h> // For ntohl() and htonl()
+#include "hwcTestLib.h"
 
-#include <hwc/hwcTestLib.h>
+#include "EGLUtils.h"
 
 // Defines
-#define NUMA(a) (sizeof(a) / sizeof(a [0]))
+#define NUMA(a) (sizeof(a) / sizeof((a)[0]))
 
 // Function Prototypes
 static void printGLString(const char *name, GLenum s);
 static void checkEglError(const char* op, EGLBoolean returnVal = EGL_TRUE);
-static void checkGlError(const char* op);
 static void printEGLConfiguration(EGLDisplay dpy, EGLConfig config);
 
 using namespace std;
@@ -48,8 +50,6 @@ void hwcTestInitDisplay(bool verbose, EGLDisplay *dpy, EGLSurface *surface,
     EGLint *width, EGLint *height)
 {
     static EGLContext context;
-
-    int rv;
 
     EGLBoolean returnValue;
     EGLConfig myConfig = {0};
@@ -78,7 +78,11 @@ void hwcTestInitDisplay(bool verbose, EGLDisplay *dpy, EGLSurface *surface,
         exit(71);
     }
 
-    EGLNativeWindowType window = android_createDisplaySurface();
+    // The tests want to stop the framework and play with the hardware
+    // composer, which means it doesn't make sense to use WindowSurface
+    // here.  android_createDisplaySurface() is going away, so just
+    // politely fail here.
+    EGLNativeWindowType window = NULL; //android_createDisplaySurface();
     if (window == NULL) {
         testPrintE("android_createDisplaySurface failed");
         exit(72);
@@ -132,7 +136,7 @@ void hwcTestInitDisplay(bool verbose, EGLDisplay *dpy, EGLSurface *surface,
 }
 
 // Open Hardware Composer Device
-void hwcTestOpenHwc(hwc_composer_device_t **hwcDevicePtr)
+void hwcTestOpenHwc(hwc_composer_device_1_t **hwcDevicePtr)
 {
     int rv;
     hw_module_t const *hwcModule;
@@ -143,7 +147,7 @@ void hwcTestOpenHwc(hwc_composer_device_t **hwcDevicePtr)
         perror(NULL);
         exit(77);
     }
-    if ((rv = hwc_open(hwcModule, hwcDevicePtr)) != 0) {
+    if ((rv = hwc_open_1(hwcModule, hwcDevicePtr)) != 0) {
         testPrintE("hwc_open failed, rv: %i", rv);
         errno = -rv;
         perror(NULL);
@@ -397,12 +401,12 @@ const char *hwcTestGraphicFormat2str(uint32_t format)
  * Dynamically creates layer list with numLayers worth
  * of hwLayers entries.
  */
-hwc_layer_list_t *hwcTestCreateLayerList(size_t numLayers)
+hwc_display_contents_1_t *hwcTestCreateLayerList(size_t numLayers)
 {
-    hwc_layer_list_t *list;
+    hwc_display_contents_1_t *list;
 
-    size_t size = sizeof(hwc_layer_list) + numLayers * sizeof(hwc_layer_t);
-    if ((list = (hwc_layer_list_t *) calloc(1, size)) == NULL) {
+    size_t size = sizeof(hwc_display_contents_1_t) + numLayers * sizeof(hwc_layer_1_t);
+    if ((list = (hwc_display_contents_1_t *) calloc(1, size)) == NULL) {
         return NULL;
     }
     list->flags = HWC_GEOMETRY_CHANGED;
@@ -415,13 +419,13 @@ hwc_layer_list_t *hwcTestCreateLayerList(size_t numLayers)
  * hwcTestFreeLayerList
  * Frees memory previous allocated via hwcTestCreateLayerList().
  */
-void hwcTestFreeLayerList(hwc_layer_list_t *list)
+void hwcTestFreeLayerList(hwc_display_contents_1_t *list)
 {
     free(list);
 }
 
 // Display the settings of the layer list pointed to by list
-void hwcTestDisplayList(hwc_layer_list_t *list)
+void hwcTestDisplayList(hwc_display_contents_1_t *list)
 {
     testPrintI("  flags: %#x%s", list->flags,
                (list->flags & HWC_GEOMETRY_CHANGED) ? " GEOMETRY_CHANGED" : "");
@@ -492,7 +496,7 @@ void hwcTestDisplayList(hwc_layer_list_t *list)
  * Displays the portions of a list that are meant to be modified by
  * a prepare call.
  */
-void hwcTestDisplayListPrepareModifiable(hwc_layer_list_t *list)
+void hwcTestDisplayListPrepareModifiable(hwc_display_contents_1_t *list)
 {
     uint32_t numOverlays = 0;
     for (unsigned int layer = 0; layer < list->numHwLayers; layer++) {
@@ -520,7 +524,7 @@ void hwcTestDisplayListPrepareModifiable(hwc_layer_list_t *list)
  *
  * Displays the handles of all the graphic buffers in the list.
  */
-void hwcTestDisplayListHandles(hwc_layer_list_t *list)
+void hwcTestDisplayListHandles(hwc_display_contents_1_t *list)
 {
     const unsigned int maxLayersPerLine = 6;
 
@@ -558,8 +562,6 @@ uint32_t hwcTestColor2Pixel(uint32_t format, ColorFract color, float alpha)
         {HAL_PIXEL_FORMAT_RGB_888,   false, 3,  0, 8,  8, 8, 16, 8,  0, 0},
         {HAL_PIXEL_FORMAT_RGB_565,   true,  2,  0, 5,  5, 6, 11, 5,  0, 0},
         {HAL_PIXEL_FORMAT_BGRA_8888, false, 4, 16, 8,  8, 8,  0, 8, 24, 8},
-        {HAL_PIXEL_FORMAT_RGBA_5551, true , 2,  0, 5,  5, 5, 10, 5, 15, 1},
-        {HAL_PIXEL_FORMAT_RGBA_4444, false, 2, 12, 4,  0, 4,  4, 4,  8, 4},
         {HAL_PIXEL_FORMAT_YV12,      true,  3, 16, 8,  8, 8,  0, 8,  0, 0},  
     };
 
@@ -612,8 +614,6 @@ void hwcTestSetPixel(GraphicBuffer *gBuf, unsigned char *buf,
         {HAL_PIXEL_FORMAT_RGB_888,    3},
         {HAL_PIXEL_FORMAT_RGB_565,    2},
         {HAL_PIXEL_FORMAT_BGRA_8888,  4},
-        {HAL_PIXEL_FORMAT_RGBA_5551,  2},
-        {HAL_PIXEL_FORMAT_RGBA_4444,  2},
     };
 
     if (gBuf->getPixelFormat() == HAL_PIXEL_FORMAT_YV12) {
@@ -666,7 +666,6 @@ void hwcTestFillColor(GraphicBuffer *gBuf, ColorFract color, float alpha)
 
     for (unsigned int x = 0; x < gBuf->getStride(); x++) {
         for (unsigned int y = 0; y < gBuf->getHeight(); y++) {
-            uint32_t val = pixel;
             hwcTestSetPixel(gBuf, buf, x, y, (x < gBuf->getWidth())
                             ? pixel : testRand());
         }
@@ -811,10 +810,6 @@ void hwcTestColorConvert(uint32_t fromFormat, uint32_t toFormat,
          0, 0, 31, 31, 0, 0, 63, 63, 0, 0, 31, 31},
         {HAL_PIXEL_FORMAT_BGRA_8888, true,  false,
          0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255},
-        {HAL_PIXEL_FORMAT_RGBA_5551, true,  false,
-         0, 0, 31, 31, 0, 0, 31, 31, 0, 0, 31, 31},
-        {HAL_PIXEL_FORMAT_RGBA_4444, true,  false,
-         0, 0, 15, 15, 0, 0, 15, 15, 0, 0, 15, 15},
         {HAL_PIXEL_FORMAT_YV12,      false, true,
          0, 16, 235, 255, 0, 16, 240, 255, 0, 16, 240, 255},
     };
@@ -964,14 +959,6 @@ static void checkEglError(const char* op, EGLBoolean returnVal)
             = eglGetError()) {
         testPrintE("after %s() eglError %s (0x%x)",
                    op, EGLUtils::strerror(error), error);
-    }
-}
-
-static void checkGlError(const char* op)
-{
-    for (GLint error = glGetError(); error; error
-            = glGetError()) {
-        testPrintE("after %s() glError (0x%x)", op, error);
     }
 }
 

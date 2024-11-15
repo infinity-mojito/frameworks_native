@@ -1,17 +1,22 @@
 // OpenGL ES 2.0 code
 
-#include <nativehelper/jni.h>
+#include <jni.h>
 #define LOG_TAG "GLPerf gl_code.cpp"
-#include <utils/Log.h>
+#include <android/log.h>
+
+#define ALOG(priority, tag, ...) ((void)__android_log_print(ANDROID_##priority, tag, __VA_ARGS__))
+
+#define ALOGI(...) ALOG(LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define ALOGE(...) ALOG(LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
-#include <utils/Timers.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 
 #include "../../gl_perf/fill_common.cpp"
 
@@ -26,8 +31,6 @@ uint32_t h;
 // The stateClock starts at zero and increments by 1 every time we draw a frame. It is used to control which phase of the test we are in.
 
 int stateClock;
-const int doLoopStates = 2;
-const int doSingleTestStates = 2;
 bool done;
 
 // Saves the parameters of the test (so we can print them out when we finish the timing.)
@@ -43,7 +46,7 @@ void doTest() {
     int texSize = ((stateClock >> 1) & 0x1) + 1;
 
     if (testNum >= gFragmentTestCount) {
-       LOGI("done\n");
+       ALOGI("done\n");
        if (fOut) {
            fclose(fOut);
            fOut = NULL;
@@ -52,7 +55,7 @@ void doTest() {
        return;
     }
 
-    // LOGI("doTest %d %d %d\n", texCount, extraMath, testSubState);
+    // ALOGI("doTest %d %d %d\n", texCount, extraMath, testSubState);
 
 //        for (uint32_t num = 0; num < gFragmentTestCount; num++) {
     doSingleTest(testNum, texSize);
@@ -63,7 +66,7 @@ extern "C" {
     JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_step(JNIEnv * env, jobject obj);
 };
 
-JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_init(JNIEnv * env, jobject obj,  jint width, jint height)
+JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_init(JNIEnv * /*env*/, jobject /*obj*/,  jint width, jint height)
 {
     gWidth = width;
     gHeight = height;
@@ -74,22 +77,22 @@ JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_init(JNIEnv * env, jobj
             genTextures();
             const char* fileName = "/sdcard/glperf.csv";
             if (fOut != NULL) {
-                 LOGI("Closing partially written output.n");
+                 ALOGI("Closing partially written output.n");
                  fclose(fOut);
                  fOut = NULL;
             }
-            LOGI("Writing to: %s\n",fileName);
+            ALOGI("Writing to: %s\n",fileName);
             fOut = fopen(fileName, "w");
             if (fOut == NULL) {
-                LOGE("Could not open: %s\n", fileName);
+                ALOGE("Could not open: %s\n", fileName);
             }
 
-            LOGI("\nvarColor, texCount, modulate, extraMath, texSize, blend, Mpps, DC60\n");
+            ALOGI("\nvarColor, texCount, modulate, extraMath, texSize, blend, Mpps, DC60\n");
             if (fOut) fprintf(fOut,"varColor, texCount, modulate, extraMath, texSize, blend, Mpps, DC60\r\n");
     }
 }
 
-JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_step(JNIEnv * env, jobject obj)
+JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_step(JNIEnv * /*env*/, jobject /*obj*/)
 {
     if (! done) {
         if (stateClock > 0 && ((stateClock & 1) == 0)) {

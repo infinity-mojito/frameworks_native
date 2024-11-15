@@ -23,7 +23,6 @@
 #include <utils/Log.h>
 #include <utils/SortedVector.h>
 #include <utils/String8.h>
-#include <utils/threads.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -52,8 +51,8 @@ class LinkedList
     NODE*  mLast;
 
 public:
-                LinkedList() : mFirst(0), mLast(0) { }
-    bool        isEmpty() const { return mFirst == 0; }
+                LinkedList() : mFirst(nullptr), mLast(nullptr) { }
+    bool        isEmpty() const { return mFirst == nullptr; }
     NODE const* head() const { return mFirst; }
     NODE*       head() { return mFirst; }
     NODE const* tail() const { return mLast; }
@@ -62,7 +61,7 @@ public:
     void insertAfter(NODE* node, NODE* newNode) {
         newNode->prev = node;
         newNode->next = node->next;
-        if (node->next == 0) mLast = newNode;
+        if (node->next == nullptr) mLast = newNode;
         else                 node->next->prev = newNode;
         node->next = newNode;
     }
@@ -70,17 +69,17 @@ public:
     void insertBefore(NODE* node, NODE* newNode) {
          newNode->prev = node->prev;
          newNode->next = node;
-         if (node->prev == 0)   mFirst = newNode;
+         if (node->prev == nullptr)   mFirst = newNode;
          else                   node->prev->next = newNode;
          node->prev = newNode;
     }
 
     void insertHead(NODE* newNode) {
-        if (mFirst == 0) {
+        if (mFirst == nullptr) {
             mFirst = mLast = newNode;
-            newNode->prev = newNode->next = 0;
+            newNode->prev = newNode->next = nullptr;
         } else {
-            newNode->prev = 0;
+            newNode->prev = nullptr;
             newNode->next = mFirst;
             mFirst->prev = newNode;
             mFirst = newNode;
@@ -99,9 +98,9 @@ public:
     }
 
     NODE* remove(NODE* node) {
-        if (node->prev == 0)    mFirst = node->next;
+        if (node->prev == nullptr)    mFirst = node->next;
         else                    node->prev->next = node->next;
-        if (node->next == 0)    mLast = node->prev;
+        if (node->next == nullptr)    mLast = node->prev;
         else                    node->next->prev = node->prev;
         return node;
     }
@@ -126,7 +125,7 @@ class SimpleBestFitAllocator
         PAGE_ALIGNED = 0x00000001
     };
 public:
-    SimpleBestFitAllocator(size_t size);
+    explicit SimpleBestFitAllocator(size_t size);
     ~SimpleBestFitAllocator();
 
     size_t      allocate(size_t size, uint32_t flags = 0);
@@ -135,11 +134,13 @@ public:
     void        dump(const char* what) const;
     void        dump(String8& res, const char* what) const;
 
+    static size_t getAllocationAlignment() { return kMemoryAlign; }
+
 private:
 
     struct chunk_t {
         chunk_t(size_t start, size_t size)
-        : start(start), size(size), free(1), prev(0), next(0) {
+        : start(start), size(size), free(1), prev(nullptr), next(nullptr) {
         }
         size_t              start;
         size_t              size : 28;
@@ -154,7 +155,7 @@ private:
     void     dump_l(String8& res, const char* what) const;
 
     static const int    kMemoryAlign;
-    mutable Mutex       mLock;
+    mutable std::mutex mLock;
     LinkedList<chunk_t> mList;
     size_t              mHeapSize;
 };
@@ -180,7 +181,6 @@ Allocation::~Allocation()
         /* NOTE: it's VERY important to not free allocations of size 0 because
          * they're special as they don't have any record in the allocator
          * and could alias some real allocation (their offset is zero). */
-        mDealer->deallocate(freedOffset);
 
         // keep the size to unmap in excess
         size_t pagesize = getpagesize();
@@ -211,21 +211,24 @@ Allocation::~Allocation()
 #ifdef MADV_REMOVE
             if (size) {
                 int err = madvise(start_ptr, size, MADV_REMOVE);
-                LOGW_IF(err, "madvise(%p, %u, MADV_REMOVE) returned %s",
+                ALOGW_IF(err, "madvise(%p, %zu, MADV_REMOVE) returned %s",
                         start_ptr, size, err<0 ? strerror(errno) : "Ok");
             }
 #endif
         }
+
+        // This should be done after madvise(MADV_REMOVE), otherwise madvise()
+        // might kick out the memory region that's allocated and/or written
+        // right after the deallocation.
+        mDealer->deallocate(freedOffset);
     }
 }
 
 // ----------------------------------------------------------------------------
 
-MemoryDealer::MemoryDealer(size_t size, const char* name)
-    : mHeap(new MemoryHeapBase(size, 0, name)),
-    mAllocator(new SimpleBestFitAllocator(size))
-{    
-}
+MemoryDealer::MemoryDealer(size_t size, const char* name, uint32_t flags)
+      : mHeap(sp<MemoryHeapBase>::make(size, flags, name)),
+        mAllocator(new SimpleBestFitAllocator(size)) {}
 
 MemoryDealer::~MemoryDealer()
 {
@@ -237,7 +240,7 @@ sp<IMemory> MemoryDealer::allocate(size_t size)
     sp<IMemory> memory;
     const ssize_t offset = allocator()->allocate(size);
     if (offset >= 0) {
-        memory = new Allocation(this, heap(), offset, size);
+        memory = sp<Allocation>::make(sp<MemoryDealer>::fromExisting(this), heap(), offset, size);
     }
     return memory;
 }
@@ -260,6 +263,12 @@ SimpleBestFitAllocator* MemoryDealer::allocator() const {
     return mAllocator;
 }
 
+// static
+size_t MemoryDealer::getAllocationAlignment()
+{
+    return SimpleBestFitAllocator::getAllocationAlignment();
+}
+
 // ----------------------------------------------------------------------------
 
 // align all the memory blocks on a cache-line boundary
@@ -277,7 +286,15 @@ SimpleBestFitAllocator::SimpleBestFitAllocator(size_t size)
 SimpleBestFitAllocator::~SimpleBestFitAllocator()
 {
     while(!mList.isEmpty()) {
-        delete mList.remove(mList.head());
+        chunk_t* removed = mList.remove(mList.head());
+#ifdef __clang_analyzer__
+        // Clang static analyzer gets confused in this loop
+        // and generates a false positive warning about accessing
+        // memory that is already freed.
+        // Add an "assert" to avoid the confusion.
+        LOG_ALWAYS_FATAL_IF(mList.head() == removed);
+#endif
+        delete removed;
     }
 }
 
@@ -288,14 +305,14 @@ size_t SimpleBestFitAllocator::size() const
 
 size_t SimpleBestFitAllocator::allocate(size_t size, uint32_t flags)
 {
-    Mutex::Autolock _l(mLock);
+    std::unique_lock<std::mutex> _l(mLock);
     ssize_t offset = alloc(size, flags);
     return offset;
 }
 
 status_t SimpleBestFitAllocator::deallocate(size_t offset)
 {
-    Mutex::Autolock _l(mLock);
+    std::unique_lock<std::mutex> _l(mLock);
     chunk_t const * const freed = dealloc(offset);
     if (freed) {
         return NO_ERROR;
@@ -309,7 +326,7 @@ ssize_t SimpleBestFitAllocator::alloc(size_t size, uint32_t flags)
         return 0;
     }
     size = (size + kMemoryAlign-1) / kMemoryAlign;
-    chunk_t* free_chunk = 0;
+    chunk_t* free_chunk = nullptr;
     chunk_t* cur = mList.head();
 
     size_t pagesize = getpagesize();
@@ -344,7 +361,7 @@ ssize_t SimpleBestFitAllocator::alloc(size_t size, uint32_t flags)
                 mList.insertBefore(free_chunk, split);
             }
 
-            LOGE_IF((flags&PAGE_ALIGNED) && 
+            ALOGE_IF((flags&PAGE_ALIGNED) && 
                     ((free_chunk->start*kMemoryAlign)&(pagesize-1)),
                     "PAGE_ALIGNED requested, but page is not aligned!!!");
 
@@ -367,7 +384,7 @@ SimpleBestFitAllocator::chunk_t* SimpleBestFitAllocator::dealloc(size_t start)
     while (cur) {
         if (cur->start == start) {
             LOG_FATAL_IF(cur->free,
-                "block at offset 0x%08lX of size 0x%08lX already freed",
+                "block at offset 0x%08lX of size 0x%08X already freed",
                 cur->start*kMemoryAlign, cur->size*kMemoryAlign);
 
             // merge freed blocks together
@@ -391,19 +408,19 @@ SimpleBestFitAllocator::chunk_t* SimpleBestFitAllocator::dealloc(size_t start)
                 }
             #endif
             LOG_FATAL_IF(!freed->free,
-                "freed block at offset 0x%08lX of size 0x%08lX is not free!",
+                "freed block at offset 0x%08lX of size 0x%08X is not free!",
                 freed->start * kMemoryAlign, freed->size * kMemoryAlign);
 
             return freed;
         }
         cur = cur->next;
     }
-    return 0;
+    return nullptr;
 }
 
 void SimpleBestFitAllocator::dump(const char* what) const
 {
-    Mutex::Autolock _l(mLock);
+    std::unique_lock<std::mutex> _l(mLock);
     dump_l(what);
 }
 
@@ -411,13 +428,13 @@ void SimpleBestFitAllocator::dump_l(const char* what) const
 {
     String8 result;
     dump_l(result, what);
-    LOGD("%s", result.string());
+    ALOGD("%s", result.c_str());
 }
 
 void SimpleBestFitAllocator::dump(String8& result,
         const char* what) const
 {
-    Mutex::Autolock _l(mLock);
+    std::unique_lock<std::mutex> _l(mLock);
     dump_l(result, what);
 }
 
@@ -441,8 +458,8 @@ void SimpleBestFitAllocator::dump_l(String8& result,
         int np = ((cur->next) && cur->next->prev != cur) ? 1 : 0;
         int pn = ((cur->prev) && cur->prev->next != cur) ? 2 : 0;
 
-        snprintf(buffer, SIZE, "  %3u: %08x | 0x%08X | 0x%08X | %s %s\n",
-            i, int(cur), int(cur->start*kMemoryAlign),
+        snprintf(buffer, SIZE, "  %3u: %p | 0x%08X | 0x%08X | %s %s\n",
+            i, cur, int(cur->start*kMemoryAlign),
             int(cur->size*kMemoryAlign),
                     int(cur->free) ? "F" : "A",
                     errs[np|pn]);
@@ -461,4 +478,4 @@ void SimpleBestFitAllocator::dump_l(String8& result,
 }
 
 
-}; // namespace android
+} // namespace android

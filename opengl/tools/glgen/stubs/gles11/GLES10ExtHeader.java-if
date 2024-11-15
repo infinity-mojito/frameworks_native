@@ -1,3 +1,4 @@
+/*
 **
 ** Copyright 2009, The Android Open Source Project
 **
@@ -21,6 +22,6 @@ package android.opengl;
 public class GLES10Ext {
     native private static void _nativeClassInit();
     static {
-	    _nativeClassInit();
+        _nativeClassInit();
     }
     

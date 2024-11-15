@@ -52,8 +52,8 @@
 #include <EGL/egl.h>
 #include <GLES/gl.h>
 
-#include <ui/FramebufferNativeWindow.h>
-#include <ui/EGLUtils.h>
+#include <EGLUtils.h>
+#include <WindowSurface.h>
 
 using namespace android;
 
@@ -61,9 +61,6 @@ using namespace android;
 
 
 int gAppAlive = 1;
-
-static const char sAppName[] =
-        "San Angeles Observation OpenGL ES version example (Linux)";
 
 static int sWindowWidth = WINDOW_DEFAULT_WIDTH;
 static int sWindowHeight = WINDOW_DEFAULT_HEIGHT;
@@ -118,7 +115,7 @@ static void checkEGLErrors()
         fprintf(stderr, "EGL Error: 0x%04x\n", (int)error);
 }
 
-static int initGraphics(unsigned samples)
+static int initGraphics(EGLint samples, const WindowSurface& windowSurface)
 {
     EGLint configAttribs[] = {
             EGL_DEPTH_SIZE, 16,
@@ -132,10 +129,9 @@ static int initGraphics(unsigned samples)
     EGLContext context;
     EGLConfig config;
     EGLSurface surface;
-    EGLint w, h;
     EGLDisplay dpy;
 
-    EGLNativeWindowType window = android_createDisplaySurface();
+    EGLNativeWindowType window = windowSurface.getSurface();
 
     dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     eglInitialize(dpy, &majorVersion, &minorVersion);
@@ -193,7 +189,8 @@ int main(int argc, char *argv[])
         printf("Multisample enabled: GL_SAMPLES = %u\n", samples);
     }
 
-    if (!initGraphics(samples))
+    WindowSurface windowSurface;
+    if (!initGraphics(samples, windowSurface))
     {
         fprintf(stderr, "Graphics initialization failed.\n");
         return EXIT_FAILURE;
