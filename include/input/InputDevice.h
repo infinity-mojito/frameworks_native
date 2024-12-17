@@ -14,14 +14,18 @@
  * limitations under the License.
  */
 
-#ifndef _LIBINPUT_INPUT_DEVICE_H
-#define _LIBINPUT_INPUT_DEVICE_H
+#pragma once
 
 #include <android/sensor.h>
+#include <ftl/flags.h>
+#include <ftl/mixins.h>
 #include <input/Input.h>
 #include <input/KeyCharacterMap.h>
+#include <set>
 #include <unordered_map>
 #include <vector>
+
+#include <android/os/IInputConstants.h>
 
 namespace android {
 
@@ -55,6 +59,9 @@ struct InputDeviceIdentifier {
     // reuse values that are not associated with an input anymore.
     uint16_t nonce;
 
+    // The bluetooth address of the device, if known.
+    std::optional<std::string> bluetoothAddress;
+
     /**
      * Return InputDeviceIdentifier.name that has been adjusted as follows:
      *     - all characters besides alphanumerics, dash,
@@ -63,6 +70,20 @@ struct InputDeviceIdentifier {
      * while conforming to the filename limitations.
      */
     std::string getCanonicalName() const;
+
+    bool operator==(const InputDeviceIdentifier&) const = default;
+    bool operator!=(const InputDeviceIdentifier&) const = default;
+};
+
+/**
+ * Holds View related behaviors for an InputDevice.
+ */
+struct InputDeviceViewBehavior {
+    /**
+     * The smooth scroll behavior that applies for all source/axis, if defined by the device.
+     * Empty optional if the device has not specified the default smooth scroll behavior.
+     */
+    std::optional<bool> shouldSmoothScroll;
 };
 
 /* Types of input device sensors. Keep sync with core/java/android/hardware/Sensor.java */
@@ -94,6 +115,8 @@ enum class InputDeviceSensorAccuracy : int32_t {
     ACCURACY_LOW = 1,
     ACCURACY_MEDIUM = 2,
     ACCURACY_HIGH = 3,
+
+    ftl_last = ACCURACY_HIGH,
 };
 
 enum class InputDeviceSensorReportingMode : int32_t {
@@ -104,12 +127,19 @@ enum class InputDeviceSensorReportingMode : int32_t {
 };
 
 enum class InputDeviceLightType : int32_t {
-    MONO = 0,
+    INPUT = 0,
     PLAYER_ID = 1,
-    RGB = 2,
-    MULTI_COLOR = 3,
+    KEYBOARD_BACKLIGHT = 2,
+    KEYBOARD_MIC_MUTE = 3,
 
-    ftl_last = MULTI_COLOR
+    ftl_last = KEYBOARD_MIC_MUTE
+};
+
+enum class InputDeviceLightCapability : uint32_t {
+    /** Capability to change brightness of the light */
+    BRIGHTNESS = 0x00000001,
+    /** Capability to change color of the light */
+    RGB = 0x00000002,
 };
 
 struct InputDeviceSensorInfo {
@@ -168,18 +198,36 @@ struct InputDeviceSensorInfo {
     int32_t id;
 };
 
+struct BrightnessLevel : ftl::DefaultConstructible<BrightnessLevel, std::uint8_t>,
+                         ftl::Equatable<BrightnessLevel>,
+                         ftl::Orderable<BrightnessLevel>,
+                         ftl::Addable<BrightnessLevel> {
+    using DefaultConstructible::DefaultConstructible;
+};
+
 struct InputDeviceLightInfo {
     explicit InputDeviceLightInfo(std::string name, int32_t id, InputDeviceLightType type,
-                                  int32_t ordinal)
-          : name(name), id(id), type(type), ordinal(ordinal) {}
+                                  ftl::Flags<InputDeviceLightCapability> capabilityFlags,
+                                  int32_t ordinal,
+                                  std::set<BrightnessLevel> preferredBrightnessLevels)
+          : name(name),
+            id(id),
+            type(type),
+            capabilityFlags(capabilityFlags),
+            ordinal(ordinal),
+            preferredBrightnessLevels(std::move(preferredBrightnessLevels)) {}
     // Name string of the light.
     std::string name;
     // Light id
     int32_t id;
     // Type of the light.
     InputDeviceLightType type;
+    // Light capabilities.
+    ftl::Flags<InputDeviceLightCapability> capabilityFlags;
     // Ordinal of the light
     int32_t ordinal;
+    // Custom brightness levels for the light
+    std::set<BrightnessLevel> preferredBrightnessLevels;
 };
 
 struct InputDeviceBatteryInfo {
@@ -188,6 +236,27 @@ struct InputDeviceBatteryInfo {
     std::string name;
     // Battery id
     int32_t id;
+};
+
+struct KeyboardLayoutInfo {
+    explicit KeyboardLayoutInfo(std::string languageTag, std::string layoutType)
+          : languageTag(languageTag), layoutType(layoutType) {}
+
+    // A BCP 47 conformant language tag such as "en-US".
+    std::string languageTag;
+    // The layout type such as QWERTY or AZERTY.
+    std::string layoutType;
+
+    inline bool operator==(const KeyboardLayoutInfo& other) const {
+        return languageTag == other.languageTag && layoutType == other.layoutType;
+    }
+    inline bool operator!=(const KeyboardLayoutInfo& other) const { return !(*this == other); }
+};
+
+// The version of the Universal Stylus Initiative (USI) protocol supported by the input device.
+struct InputDeviceUsiVersion {
+    int32_t majorVersion = -1;
+    int32_t minorVersion = -1;
 };
 
 /*
@@ -210,8 +279,9 @@ public:
     };
 
     void initialize(int32_t id, int32_t generation, int32_t controllerNumber,
-            const InputDeviceIdentifier& identifier, const std::string& alias, bool isExternal,
-            bool hasMic);
+                    const InputDeviceIdentifier& identifier, const std::string& alias,
+                    bool isExternal, bool hasMic, ui::LogicalDisplayId associatedDisplayId,
+                    InputDeviceViewBehavior viewBehavior = {{}}, bool enabled = true);
 
     inline int32_t getId() const { return mId; }
     inline int32_t getControllerNumber() const { return mControllerNumber; }
@@ -237,6 +307,13 @@ public:
 
     void setKeyboardType(int32_t keyboardType);
     inline int32_t getKeyboardType() const { return mKeyboardType; }
+
+    void setKeyboardLayoutInfo(KeyboardLayoutInfo keyboardLayoutInfo);
+    inline const std::optional<KeyboardLayoutInfo>& getKeyboardLayoutInfo() const {
+        return mKeyboardLayoutInfo;
+    }
+
+    inline const InputDeviceViewBehavior& getViewBehavior() const { return mViewBehavior; }
 
     inline void setKeyCharacterMap(const std::shared_ptr<KeyCharacterMap> value) {
         mKeyCharacterMap = value;
@@ -266,6 +343,16 @@ public:
 
     std::vector<InputDeviceLightInfo> getLights();
 
+    inline void setUsiVersion(std::optional<InputDeviceUsiVersion> usiVersion) {
+        mUsiVersion = std::move(usiVersion);
+    }
+    inline std::optional<InputDeviceUsiVersion> getUsiVersion() const { return mUsiVersion; }
+
+    inline ui::LogicalDisplayId getAssociatedDisplayId() const { return mAssociatedDisplayId; }
+
+    inline void setEnabled(bool enabled) { mEnabled = enabled; }
+    inline bool isEnabled() const { return mEnabled; }
+
 private:
     int32_t mId;
     int32_t mGeneration;
@@ -274,9 +361,14 @@ private:
     std::string mAlias;
     bool mIsExternal;
     bool mHasMic;
+    std::optional<KeyboardLayoutInfo> mKeyboardLayoutInfo;
     uint32_t mSources;
     int32_t mKeyboardType;
     std::shared_ptr<KeyCharacterMap> mKeyCharacterMap;
+    std::optional<InputDeviceUsiVersion> mUsiVersion;
+    ui::LogicalDisplayId mAssociatedDisplayId{ui::LogicalDisplayId::INVALID};
+    bool mEnabled;
+
     bool mHasVibrator;
     bool mHasBattery;
     bool mHasButtonUnderPad;
@@ -288,6 +380,8 @@ private:
     std::unordered_map<int32_t, InputDeviceLightInfo> mLights;
     /* Map from battery ID to battery info */
     std::unordered_map<int32_t, InputDeviceBatteryInfo> mBatteries;
+    /** The View related behaviors for the device. */
+    InputDeviceViewBehavior mViewBehavior;
 };
 
 /* Types of input device configuration files. */
@@ -295,6 +389,7 @@ enum class InputDeviceConfigurationFileType : int32_t {
     CONFIGURATION = 0,     /* .idc file */
     KEY_LAYOUT = 1,        /* .kl file */
     KEY_CHARACTER_MAP = 2, /* .kcm file */
+    ftl_last = KEY_CHARACTER_MAP,
 };
 
 /*
@@ -325,6 +420,8 @@ extern std::string getInputDeviceConfigurationFilePathByName(
         const std::string& name, InputDeviceConfigurationFileType type);
 
 enum ReservedInputDeviceId : int32_t {
+    // Device id representing an invalid device
+    INVALID_INPUT_DEVICE_ID = android::os::IInputConstants::INVALID_INPUT_DEVICE_ID,
     // Device id of a special "virtual" keyboard that is always present.
     VIRTUAL_KEYBOARD_ID = -1,
     // Device id of the "built-in" keyboard if there is one.
@@ -334,5 +431,3 @@ enum ReservedInputDeviceId : int32_t {
 };
 
 } // namespace android
-
-#endif // _LIBINPUT_INPUT_DEVICE_H

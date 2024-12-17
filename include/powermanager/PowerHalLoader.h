@@ -17,9 +17,11 @@
 #ifndef ANDROID_POWERHALLOADER_H
 #define ANDROID_POWERHALLOADER_H
 
+#include <aidl/android/hardware/power/IPower.h>
 #include <android-base/thread_annotations.h>
 #include <android/hardware/power/1.1/IPower.h>
-#include <android/hardware/power/IPower.h>
+#include <android/hardware/power/1.2/IPower.h>
+#include <android/hardware/power/1.3/IPower.h>
 
 namespace android {
 
@@ -29,18 +31,26 @@ namespace power {
 class PowerHalLoader {
 public:
     static void unloadAll();
-    static sp<hardware::power::IPower> loadAidl();
+    static std::shared_ptr<aidl::android::hardware::power::IPower> loadAidl();
     static sp<hardware::power::V1_0::IPower> loadHidlV1_0();
     static sp<hardware::power::V1_1::IPower> loadHidlV1_1();
+    static sp<hardware::power::V1_2::IPower> loadHidlV1_2();
+    static sp<hardware::power::V1_3::IPower> loadHidlV1_3();
+    // Returns aidl interface version, or 0 if AIDL is not used
+    static int32_t getAidlVersion();
 
 private:
     static std::mutex gHalMutex;
-    static sp<hardware::power::IPower> gHalAidl GUARDED_BY(gHalMutex);
+    static std::shared_ptr<aidl::android::hardware::power::IPower> gHalAidl GUARDED_BY(gHalMutex);
     static sp<hardware::power::V1_0::IPower> gHalHidlV1_0 GUARDED_BY(gHalMutex);
     static sp<hardware::power::V1_1::IPower> gHalHidlV1_1 GUARDED_BY(gHalMutex);
+    static sp<hardware::power::V1_2::IPower> gHalHidlV1_2 GUARDED_BY(gHalMutex);
+    static sp<hardware::power::V1_3::IPower> gHalHidlV1_3 GUARDED_BY(gHalMutex);
 
     static sp<hardware::power::V1_0::IPower> loadHidlV1_0Locked()
             EXCLUSIVE_LOCKS_REQUIRED(gHalMutex);
+
+    static int32_t gAidlInterfaceVersion;
 
     PowerHalLoader() = delete;
     ~PowerHalLoader() = delete;

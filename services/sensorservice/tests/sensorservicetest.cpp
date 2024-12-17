@@ -87,8 +87,19 @@ void testInvalidSharedMem_NoCrash(SensorManager &mgr) {
     int ret = mgr.createDirectChannel(
             kMemSize, ASENSOR_DIRECT_CHANNEL_TYPE_SHARED_MEMORY, resourceHandle);
 
-    // Should print -22 (BAD_VALUE) and the device runtime shouldn't restart
+    // Should not succeed (ret != OK) and the device runtime shouldn't restart
     printf("createInvalidDirectChannel=%d\n", ret);
+
+    // Secondary test: correct channel creation & destruction (should print 0)
+    ret = mgr.createDirectChannel(kMemSize, ASENSOR_DIRECT_CHANNEL_TYPE_HARDWARE_BUFFER,
+                                  resourceHandle);
+    printf("createValidDirectChannel=%d\n", ret);
+
+    // Third test: double-destroy (should not crash)
+    mgr.destroyDirectChannel(ret);
+    AHardwareBuffer_release(hardwareBuffer);
+    printf("duplicate destroyDirectChannel...\n");
+    mgr.destroyDirectChannel(ret);
 }
 
 int main() {
@@ -105,7 +116,7 @@ int main() {
 
     Sensor const* accelerometer = mgr.getDefaultSensor(Sensor::TYPE_ACCELEROMETER);
     printf("accelerometer=%p (%s)\n",
-            accelerometer, accelerometer->getName().string());
+            accelerometer, accelerometer->getName().c_str());
 
     sStartTime = systemTime();
 
@@ -130,7 +141,7 @@ int main() {
                 printf("ALOOPER_POLL_TIMEOUT\n");
                 break;
             case ALOOPER_POLL_ERROR:
-                printf("ALOOPER_POLL_TIMEOUT\n");
+                printf("ALOOPER_POLL_ERROR\n");
                 break;
             default:
                 printf("ugh? poll returned %d\n", ret);

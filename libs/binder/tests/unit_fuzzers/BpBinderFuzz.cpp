@@ -36,7 +36,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     FuzzedDataProvider fdp(data, size);
 
     std::string addr = std::string(getenv("TMPDIR") ?: "/tmp") + "/binderRpcBenchmark";
-    (void)unlink(addr.c_str());
+    if (0 != unlink(addr.c_str()) && errno != ENOENT) {
+        LOG(WARNING) << "Could not unlink: " << strerror(errno);
+    }
 
     sp<RpcServer> server = RpcServer::make();
 
@@ -51,8 +53,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     sp<RpcSession> session = RpcSession::make();
     session->setMaxIncomingThreads(1);
     status_t status;
-    for (size_t tries = 0; tries < 5; tries++) {
-        usleep(10000);
+
+    // b/274084938 - ASAN may be slow, wait a while
+    for (size_t tries = 0; tries < 50; tries++) {
+        usleep(100000);
         status = session->setupUnixDomainClient(addr.c_str());
         if (status == OK) break;
     }

@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUT_INPUTDISPATCHER_INPUTEVENTTIMELINE_H
-#define _UI_INPUT_INPUTDISPATCHER_INPUTEVENTTIMELINE_H
+#pragma once
+
+#include "../InputDeviceMetricsSource.h"
 
 #include <binder/IBinder.h>
 #include <input/Input.h>
@@ -73,11 +74,38 @@ private:
     bool mHasGraphicsTimeline = false;
 };
 
+enum class InputEventActionType : int32_t {
+    UNKNOWN_INPUT_EVENT = 0,
+    MOTION_ACTION_DOWN = 1,
+    // Motion events for ACTION_MOVE (characterizes scrolling motion)
+    MOTION_ACTION_MOVE = 2,
+    // Motion events for ACTION_UP (when the pointer first goes up)
+    MOTION_ACTION_UP = 3,
+    // Motion events for ACTION_HOVER_MOVE (pointer position on screen changes but pointer is not
+    // down)
+    MOTION_ACTION_HOVER_MOVE = 4,
+    // Motion events for ACTION_SCROLL (moving the mouse wheel)
+    MOTION_ACTION_SCROLL = 5,
+    // Key events for both ACTION_DOWN and ACTION_UP (key press and key release)
+    KEY = 6,
+
+    ftl_first = UNKNOWN_INPUT_EVENT,
+    ftl_last = KEY,
+    // Used by latency fuzzer
+    kMaxValue = ftl_last
+
+};
+
 struct InputEventTimeline {
-    InputEventTimeline(bool isDown, nsecs_t eventTime, nsecs_t readTime);
-    const bool isDown; // True if this is an ACTION_DOWN event
+    InputEventTimeline(nsecs_t eventTime, nsecs_t readTime, uint16_t vendorId, uint16_t productId,
+                       const std::set<InputDeviceUsageSource>& sources,
+                       InputEventActionType inputEventActionType);
     const nsecs_t eventTime;
     const nsecs_t readTime;
+    const uint16_t vendorId;
+    const uint16_t productId;
+    const std::set<InputDeviceUsageSource> sources;
+    const InputEventActionType inputEventActionType;
 
     struct IBinderHash {
         std::size_t operator()(const sp<IBinder>& b) const {
@@ -104,5 +132,3 @@ public:
 
 } // namespace inputdispatcher
 } // namespace android
-
-#endif // _UI_INPUT_INPUTDISPATCHER_INPUTEVENTTIMELINE_H

@@ -52,6 +52,18 @@ cc_defaults {
             enabled: false,
         },
     },
+    fuzz_config: {
+        cc: [
+            "smoreland@google.com",
+            "waghpawan@google.com",
+        ],
+        componentid: 32456,
+        description: "The fuzzer targets the APIs of libbinder",
+        vector: "local_no_privileges_required",
+        service_privilege: "privileged",
+        users: "multi_user",
+        fuzzed_code_usage: "shipped",
+    },
 }
 
 cc_fuzz {
@@ -103,4 +115,43 @@ cc_fuzz {
     name: "binder_memoryDealerFuzz",
     defaults: ["binder_fuzz_defaults"],
     srcs: ["MemoryDealerFuzz.cpp"],
+}
+
+cc_fuzz {
+    name: "binder_recordedTransactionFileFuzz",
+    defaults: ["binder_fuzz_defaults"],
+    srcs: ["RecordedTransactionFileFuzz.cpp"],
+    corpus: [
+        "recorded_transaction_corpus/*",
+    ],
+}
+
+cc_fuzz {
+    name: "binder_recordedTransactionFuzz",
+    defaults: ["binder_fuzz_defaults"],
+    srcs: ["RecordedTransactionFuzz.cpp"],
+    target: {
+        android: {
+            shared_libs: [
+                "libcutils",
+                "libutils",
+                "libbase",
+                "libbinder",
+            ],
+            static_libs: ["libbinder_random_parcel"],
+        },
+        host: {
+            static_libs: [
+                "libcutils",
+                "liblog",
+                "libutils",
+                "libbase",
+                "libbinder",
+                "libbinder_random_parcel",
+            ],
+        },
+        darwin: {
+            enabled: false,
+        },
+    },
 }

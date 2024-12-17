@@ -14,16 +14,15 @@
  * limitations under the License.
  */
 
-#ifndef _LIBINPUT_KEY_LAYOUT_MAP_H
-#define _LIBINPUT_KEY_LAYOUT_MAP_H
+#pragma once
 
 #include <android-base/result.h>
+#include <input/InputDevice.h>
+
 #include <stdint.h>
 #include <utils/Errors.h>
 #include <utils/Tokenizer.h>
 #include <set>
-
-#include <input/InputDevice.h>
 
 namespace android {
 
@@ -73,12 +72,13 @@ public:
             int32_t* outKeyCode, uint32_t* outFlags) const;
     std::vector<int32_t> findScanCodesForKey(int32_t keyCode) const;
     std::optional<int32_t> findScanCodeForLed(int32_t ledCode) const;
+    std::vector<int32_t> findUsageCodesForKey(int32_t keyCode) const;
     std::optional<int32_t> findUsageCodeForLed(int32_t ledCode) const;
 
     std::optional<AxisInfo> mapAxis(int32_t scanCode) const;
     const std::string getLoadFileName() const;
     // Return pair of sensor type and sensor data index, for the input device abs code
-    base::Result<std::pair<InputDeviceSensorType, int32_t>> mapSensor(int32_t absCode);
+    base::Result<std::pair<InputDeviceSensorType, int32_t>> mapSensor(int32_t absCode) const;
 
     virtual ~KeyLayoutMap();
 
@@ -131,5 +131,3 @@ private:
 };
 
 } // namespace android
-
-#endif // _LIBINPUT_KEY_LAYOUT_MAP_H

@@ -18,6 +18,8 @@
 #include "UnwantedInteractionBlocker.h"
 
 #include <android-base/stringprintf.h>
+#include <com_android_input_flags.h>
+#include <ftl/enum.h>
 #include <input/PrintTools.h>
 #include <inttypes.h>
 #include <linux/input-event-codes.h>
@@ -26,6 +28,8 @@
 
 #include "ui/events/ozone/evdev/touch_filter/neural_stylus_palm_detection_filter.h"
 #include "ui/events/ozone/evdev/touch_filter/palm_model/onedevice_train_palm_detection_filter_model.h"
+
+namespace input_flags = com::android::input::flags;
 
 using android::base::StringPrintf;
 
@@ -63,6 +67,16 @@ const bool DEBUG_OUTBOUND_MOTION =
 const bool DEBUG_MODEL =
         __android_log_is_loggable(ANDROID_LOG_DEBUG, LOG_TAG "Model", ANDROID_LOG_INFO);
 
+/**
+ * When multi-device input is enabled, we shouldn't use PreferStylusOverTouchBlocker at all.
+ * However, multi-device input has the following default behaviour: hovering stylus rejects touch.
+ * Therefore, if we want to disable that behaviour (and go back to a place where stylus down
+ * blocks touch, but hovering stylus doesn't interact with touch), we should just disable the entire
+ * multi-device input feature.
+ */
+const bool ENABLE_MULTI_DEVICE_INPUT = input_flags::enable_multi_device_input() &&
+        !input_flags::disable_reject_touch_on_stylus_hover();
+
 // Category (=namespace) name for the input settings that are applied at boot time
 static const char* INPUT_NATIVE_BOOT = "input_native_boot";
 /**
@@ -98,19 +112,25 @@ static bool isPalmRejectionEnabled() {
     return false;
 }
 
-static int getLinuxToolCode(int toolType) {
-    if (toolType == AMOTION_EVENT_TOOL_TYPE_STYLUS) {
-        return BTN_TOOL_PEN;
+static int getLinuxToolCode(ToolType toolType) {
+    switch (toolType) {
+        case ToolType::STYLUS:
+            return BTN_TOOL_PEN;
+        case ToolType::ERASER:
+            return BTN_TOOL_RUBBER;
+        case ToolType::FINGER:
+            return BTN_TOOL_FINGER;
+        case ToolType::UNKNOWN:
+        case ToolType::MOUSE:
+        case ToolType::PALM:
+            break;
     }
-    if (toolType == AMOTION_EVENT_TOOL_TYPE_FINGER) {
-        return BTN_TOOL_FINGER;
-    }
-    ALOGW("Got tool type %" PRId32 ", converting to BTN_TOOL_FINGER", toolType);
+    ALOGW("Got tool type %s, converting to BTN_TOOL_FINGER", ftl::enum_string(toolType).c_str());
     return BTN_TOOL_FINGER;
 }
 
 static int32_t getActionUpForPointerId(const NotifyMotionArgs& args, int32_t pointerId) {
-    for (size_t i = 0; i < args.pointerCount; i++) {
+    for (size_t i = 0; i < args.getPointerCount(); i++) {
         if (pointerId == args.pointerProperties[i].id) {
             return AMOTION_EVENT_ACTION_POINTER_UP |
                     (i << AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
@@ -149,9 +169,10 @@ NotifyMotionArgs removePointerIds(const NotifyMotionArgs& args,
             actionMasked == AMOTION_EVENT_ACTION_POINTER_UP;
 
     NotifyMotionArgs newArgs{args};
-    newArgs.pointerCount = 0;
+    newArgs.pointerProperties.clear();
+    newArgs.pointerCoords.clear();
     int32_t newActionIndex = 0;
-    for (uint32_t i = 0; i < args.pointerCount; i++) {
+    for (uint32_t i = 0; i < args.getPointerCount(); i++) {
         const int32_t pointerId = args.pointerProperties[i].id;
         if (pointerIds.find(pointerId) != pointerIds.end()) {
             // skip this pointer
@@ -163,19 +184,18 @@ NotifyMotionArgs removePointerIds(const NotifyMotionArgs& args,
             }
             continue;
         }
-        newArgs.pointerProperties[newArgs.pointerCount].copyFrom(args.pointerProperties[i]);
-        newArgs.pointerCoords[newArgs.pointerCount].copyFrom(args.pointerCoords[i]);
+        newArgs.pointerProperties.push_back(args.pointerProperties[i]);
+        newArgs.pointerCoords.push_back(args.pointerCoords[i]);
         if (i == actionIndex) {
-            newActionIndex = newArgs.pointerCount;
+            newActionIndex = newArgs.getPointerCount() - 1;
         }
-        newArgs.pointerCount++;
     }
     // Update POINTER_DOWN or POINTER_UP actions
     if (isPointerUpOrDownAction && newArgs.action != ACTION_UNKNOWN) {
         newArgs.action =
                 actionMasked | (newActionIndex << AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
         // Convert POINTER_DOWN and POINTER_UP to DOWN and UP if there's only 1 pointer remaining
-        if (newArgs.pointerCount == 1) {
+        if (newArgs.getPointerCount() == 1) {
             if (actionMasked == AMOTION_EVENT_ACTION_POINTER_DOWN) {
                 newArgs.action = AMOTION_EVENT_ACTION_DOWN;
             } else if (actionMasked == AMOTION_EVENT_ACTION_POINTER_UP) {
@@ -194,13 +214,14 @@ NotifyMotionArgs removePointerIds(const NotifyMotionArgs& args,
  */
 static std::optional<NotifyMotionArgs> removeStylusPointerIds(const NotifyMotionArgs& args) {
     std::set<int32_t> stylusPointerIds;
-    for (uint32_t i = 0; i < args.pointerCount; i++) {
-        if (args.pointerProperties[i].toolType == AMOTION_EVENT_TOOL_TYPE_STYLUS) {
+    for (uint32_t i = 0; i < args.getPointerCount(); i++) {
+        if (isStylusToolType(args.pointerProperties[i].toolType)) {
             stylusPointerIds.insert(args.pointerProperties[i].id);
         }
     }
     NotifyMotionArgs withoutStylusPointers = removePointerIds(args, stylusPointerIds);
-    if (withoutStylusPointers.pointerCount == 0 || withoutStylusPointers.action == ACTION_UNKNOWN) {
+    if (withoutStylusPointers.getPointerCount() == 0 ||
+        withoutStylusPointers.action == ACTION_UNKNOWN) {
         return std::nullopt;
     }
     return withoutStylusPointers;
@@ -265,7 +286,7 @@ std::optional<AndroidPalmFilterDeviceInfo> createPalmFilterDeviceInfo(
 std::vector<NotifyMotionArgs> cancelSuppressedPointers(
         const NotifyMotionArgs& args, const std::set<int32_t>& oldSuppressedPointerIds,
         const std::set<int32_t>& newSuppressedPointerIds) {
-    LOG_ALWAYS_FATAL_IF(args.pointerCount == 0, "0 pointers in %s", args.dump().c_str());
+    LOG_ALWAYS_FATAL_IF(args.getPointerCount() == 0, "0 pointers in %s", args.dump().c_str());
 
     // First, let's remove the old suppressed pointers. They've already been canceled previously.
     NotifyMotionArgs oldArgs = removePointerIds(args, oldSuppressedPointerIds);
@@ -277,7 +298,7 @@ std::vector<NotifyMotionArgs> cancelSuppressedPointers(
     const int32_t actionMasked = MotionEvent::getActionMasked(args.action);
     // We will iteratively remove pointers from 'removedArgs'.
     NotifyMotionArgs removedArgs{oldArgs};
-    for (uint32_t i = 0; i < oldArgs.pointerCount; i++) {
+    for (uint32_t i = 0; i < oldArgs.getPointerCount(); i++) {
         const int32_t pointerId = oldArgs.pointerProperties[i].id;
         if (newSuppressedPointerIds.find(pointerId) == newSuppressedPointerIds.end()) {
             // This is a pointer that should not be canceled. Move on.
@@ -289,7 +310,7 @@ std::vector<NotifyMotionArgs> cancelSuppressedPointers(
             continue;
         }
 
-        if (removedArgs.pointerCount == 1) {
+        if (removedArgs.getPointerCount() == 1) {
             // We are about to remove the last pointer, which means there will be no more gesture
             // remaining. This is identical to canceling all pointers, so just send a single CANCEL
             // event, without any of the preceding POINTER_UP with FLAG_CANCELED events.
@@ -307,7 +328,7 @@ std::vector<NotifyMotionArgs> cancelSuppressedPointers(
     }
 
     // Now 'removedArgs' contains only pointers that are valid.
-    if (removedArgs.pointerCount <= 0 || removedArgs.action == ACTION_UNKNOWN) {
+    if (removedArgs.getPointerCount() <= 0 || removedArgs.action == ACTION_UNKNOWN) {
         return out;
     }
     out.push_back(removedArgs);
@@ -321,25 +342,23 @@ UnwantedInteractionBlocker::UnwantedInteractionBlocker(InputListenerInterface& l
                                                        bool enablePalmRejection)
       : mQueuedListener(listener), mEnablePalmRejection(enablePalmRejection) {}
 
-void UnwantedInteractionBlocker::notifyConfigurationChanged(
-        const NotifyConfigurationChangedArgs* args) {
-    mQueuedListener.notifyConfigurationChanged(args);
-    mQueuedListener.flush();
-}
-
-void UnwantedInteractionBlocker::notifyKey(const NotifyKeyArgs* args) {
+void UnwantedInteractionBlocker::notifyKey(const NotifyKeyArgs& args) {
     mQueuedListener.notifyKey(args);
     mQueuedListener.flush();
 }
 
-void UnwantedInteractionBlocker::notifyMotion(const NotifyMotionArgs* args) {
-    ALOGD_IF(DEBUG_INBOUND_MOTION, "%s: %s", __func__, args->dump().c_str());
+void UnwantedInteractionBlocker::notifyMotion(const NotifyMotionArgs& args) {
+    ALOGD_IF(DEBUG_INBOUND_MOTION, "%s: %s", __func__, args.dump().c_str());
     { // acquire lock
         std::scoped_lock lock(mLock);
-        const std::vector<NotifyMotionArgs> processedArgs =
-                mPreferStylusOverTouchBlocker.processMotion(*args);
-        for (const NotifyMotionArgs& loopArgs : processedArgs) {
-            notifyMotionLocked(&loopArgs);
+        if (ENABLE_MULTI_DEVICE_INPUT) {
+            notifyMotionLocked(args);
+        } else {
+            const std::vector<NotifyMotionArgs> processedArgs =
+                    mPreferStylusOverTouchBlocker.processMotion(args);
+            for (const NotifyMotionArgs& loopArgs : processedArgs) {
+                notifyMotionLocked(loopArgs);
+            }
         }
     } // release lock
 
@@ -349,61 +368,68 @@ void UnwantedInteractionBlocker::notifyMotion(const NotifyMotionArgs* args) {
 
 void UnwantedInteractionBlocker::enqueueOutboundMotionLocked(const NotifyMotionArgs& args) {
     ALOGD_IF(DEBUG_OUTBOUND_MOTION, "%s: %s", __func__, args.dump().c_str());
-    mQueuedListener.notifyMotion(&args);
+    mQueuedListener.notifyMotion(args);
 }
 
-void UnwantedInteractionBlocker::notifyMotionLocked(const NotifyMotionArgs* args) {
-    auto it = mPalmRejectors.find(args->deviceId);
-    const bool sendToPalmRejector = it != mPalmRejectors.end() && isFromTouchscreen(args->source);
+void UnwantedInteractionBlocker::notifyMotionLocked(const NotifyMotionArgs& args) {
+    auto it = mPalmRejectors.find(args.deviceId);
+    const bool sendToPalmRejector = it != mPalmRejectors.end() && isFromTouchscreen(args.source);
     if (!sendToPalmRejector) {
-        enqueueOutboundMotionLocked(*args);
+        enqueueOutboundMotionLocked(args);
         return;
     }
 
-    std::vector<NotifyMotionArgs> processedArgs = it->second.processMotion(*args);
+    std::vector<NotifyMotionArgs> processedArgs = it->second.processMotion(args);
     for (const NotifyMotionArgs& loopArgs : processedArgs) {
         enqueueOutboundMotionLocked(loopArgs);
     }
 }
 
-void UnwantedInteractionBlocker::notifySwitch(const NotifySwitchArgs* args) {
+void UnwantedInteractionBlocker::notifySwitch(const NotifySwitchArgs& args) {
     mQueuedListener.notifySwitch(args);
     mQueuedListener.flush();
 }
 
-void UnwantedInteractionBlocker::notifySensor(const NotifySensorArgs* args) {
+void UnwantedInteractionBlocker::notifySensor(const NotifySensorArgs& args) {
     mQueuedListener.notifySensor(args);
     mQueuedListener.flush();
 }
 
-void UnwantedInteractionBlocker::notifyVibratorState(const NotifyVibratorStateArgs* args) {
+void UnwantedInteractionBlocker::notifyVibratorState(const NotifyVibratorStateArgs& args) {
     mQueuedListener.notifyVibratorState(args);
     mQueuedListener.flush();
 }
-void UnwantedInteractionBlocker::notifyDeviceReset(const NotifyDeviceResetArgs* args) {
+void UnwantedInteractionBlocker::notifyDeviceReset(const NotifyDeviceResetArgs& args) {
     { // acquire lock
         std::scoped_lock lock(mLock);
-        auto it = mPalmRejectors.find(args->deviceId);
+        auto it = mPalmRejectors.find(args.deviceId);
         if (it != mPalmRejectors.end()) {
             AndroidPalmFilterDeviceInfo info = it->second.getPalmFilterDeviceInfo();
             // Re-create the object instead of resetting it
             mPalmRejectors.erase(it);
-            mPalmRejectors.emplace(args->deviceId, info);
+            mPalmRejectors.emplace(args.deviceId, info);
         }
         mQueuedListener.notifyDeviceReset(args);
-        mPreferStylusOverTouchBlocker.notifyDeviceReset(*args);
+        mPreferStylusOverTouchBlocker.notifyDeviceReset(args);
     } // release lock
     // Send events to the next stage without holding the lock
     mQueuedListener.flush();
 }
 
 void UnwantedInteractionBlocker::notifyPointerCaptureChanged(
-        const NotifyPointerCaptureChangedArgs* args) {
+        const NotifyPointerCaptureChangedArgs& args) {
     mQueuedListener.notifyPointerCaptureChanged(args);
     mQueuedListener.flush();
 }
 
 void UnwantedInteractionBlocker::notifyInputDevicesChanged(
+        const NotifyInputDevicesChangedArgs& args) {
+    onInputDevicesChanged(args.inputDeviceInfos);
+    mQueuedListener.notify(args);
+    mQueuedListener.flush();
+}
+
+void UnwantedInteractionBlocker::onInputDevicesChanged(
         const std::vector<InputDeviceInfo>& inputDevices) {
     std::scoped_lock lock(mLock);
     if (!mEnablePalmRejection) {
@@ -459,7 +485,7 @@ void UnwantedInteractionBlocker::monitor() {
 UnwantedInteractionBlocker::~UnwantedInteractionBlocker() {}
 
 void SlotState::update(const NotifyMotionArgs& args) {
-    for (size_t i = 0; i < args.pointerCount; i++) {
+    for (size_t i = 0; i < args.getPointerCount(); i++) {
         const int32_t pointerId = args.pointerProperties[i].id;
         const int32_t resolvedAction = resolveActionForPointer(i, args.action);
         processPointerId(pointerId, resolvedAction);
@@ -557,7 +583,7 @@ std::vector<::ui::InProgressTouchEvdev> getTouches(const NotifyMotionArgs& args,
                                                    const SlotState& newSlotState) {
     std::vector<::ui::InProgressTouchEvdev> touches;
 
-    for (size_t i = 0; i < args.pointerCount; i++) {
+    for (size_t i = 0; i < args.getPointerCount(); i++) {
         const int32_t pointerId = args.pointerProperties[i].id;
         touches.emplace_back(::ui::InProgressTouchEvdev());
         touches.back().major = args.pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_TOUCH_MAJOR);
@@ -646,7 +672,7 @@ std::set<int32_t> PalmRejector::detectPalmPointers(const NotifyMotionArgs& args)
 
     // Now that we know which slots should be suppressed, let's convert those to pointer id's.
     std::set<int32_t> newSuppressedIds;
-    for (size_t i = 0; i < args.pointerCount; i++) {
+    for (size_t i = 0; i < args.getPointerCount(); i++) {
         const int32_t pointerId = args.pointerProperties[i].id;
         std::optional<size_t> slot = oldSlotState.getSlotForPointerId(pointerId);
         if (!slot) {

@@ -27,14 +27,13 @@ public:
     TimeStats();
     ~TimeStats() override;
 
-    MOCK_METHOD2(onPullAtom, bool(const int, std::string*));
+    MOCK_METHOD2(onPullAtom, bool(const int, std::vector<uint8_t>*));
     MOCK_METHOD3(parseArgs, void(bool, const Vector<String16>&, std::string&));
     MOCK_METHOD0(isEnabled, bool());
     MOCK_METHOD0(miniDump, std::string());
     MOCK_METHOD0(incrementTotalFrames, void());
     MOCK_METHOD0(incrementMissedFrames, void());
     MOCK_METHOD0(incrementRefreshRateSwitches, void());
-    MOCK_METHOD1(recordDisplayEventConnectionCount, void(int32_t));
     MOCK_METHOD2(recordFrameDuration, void(nsecs_t, nsecs_t));
     MOCK_METHOD2(recordRenderEngineDuration, void(nsecs_t, nsecs_t));
     MOCK_METHOD2(recordRenderEngineDuration, void(nsecs_t, const std::shared_ptr<FenceTime>&));

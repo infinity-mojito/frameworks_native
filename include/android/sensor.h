@@ -29,6 +29,8 @@
 #ifndef ANDROID_SENSOR_H
 #define ANDROID_SENSOR_H
 
+#include <sys/cdefs.h>
+
 /******************************************************************
  *
  * IMPORTANT NOTICE:
@@ -52,11 +54,13 @@
 #include <math.h>
 #include <stdint.h>
 
+// This file may also be built on glibc or on Windows/MacOS libc's, so no-op
+// and deprecated definitions are provided.
 #if !defined(__INTRODUCED_IN)
 #define __INTRODUCED_IN(__api_level) /* nothing */
 #endif
 #if !defined(__DEPRECATED_IN)
-#define __DEPRECATED_IN(__api_level) __attribute__((__deprecated__))
+#define __DEPRECATED_IN(__api_level, msg) __attribute__((__deprecated__(msg)))
 #endif
 
 #ifdef __cplusplus
@@ -606,10 +610,14 @@ typedef struct AHeadingEvent {
  * sensors_event_t
  */
 typedef struct ASensorEvent {
-    int32_t version; /* sizeof(struct ASensorEvent) */
-    int32_t sensor;  /** The sensor that generates this event */
-    int32_t type;    /** Sensor type for the event, such as {@link ASENSOR_TYPE_ACCELEROMETER} */
-    int32_t reserved0; /** do not use */
+    /* sizeof(struct ASensorEvent) */
+    int32_t version;
+    /** The sensor that generates this event */
+    int32_t sensor;
+    /** Sensor type for the event, such as {@link ASENSOR_TYPE_ACCELEROMETER} */
+    int32_t type;
+    /** do not use */
+    int32_t reserved0;
     /**
      * The time in nanoseconds at which the event happened, and its behavior
      * is identical to <a href="/reference/android/hardware/SensorEvent#timestamp">
@@ -649,7 +657,7 @@ typedef struct ASensorEvent {
     uint32_t flags;
     int32_t reserved1[3];
 } ASensorEvent;
-// LINT.ThenChange (hardware/libhardware/include/hardware/sensors.h)
+// LINT.ThenChange(hardware/libhardware/include/hardware/sensors.h)
 
 struct ASensorManager;
 /**
@@ -740,7 +748,8 @@ typedef ASensorRef const* ASensorList;
  *     ASensorManager* sensorManager = ASensorManager_getInstance();
  *
  */
-ASensorManager* ASensorManager_getInstance() __DEPRECATED_IN(26);
+ASensorManager* ASensorManager_getInstance()
+        __DEPRECATED_IN(26, "Use ASensorManager_getInstanceForPackage instead");
 
 /**
  * Get a reference to the sensor manager. ASensorManager is a singleton

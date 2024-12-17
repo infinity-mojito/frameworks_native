@@ -16,8 +16,8 @@
 
 #define LOG_TAG "VibratorHalWrapper"
 
+#include <aidl/android/hardware/vibrator/IVibrator.h>
 #include <android/hardware/vibrator/1.3/IVibrator.h>
-#include <android/hardware/vibrator/IVibrator.h>
 #include <hardware/vibrator.h>
 #include <cmath>
 
@@ -26,12 +26,15 @@
 #include <vibratorservice/VibratorCallbackScheduler.h>
 #include <vibratorservice/VibratorHalWrapper.h>
 
-using android::hardware::vibrator::Braking;
-using android::hardware::vibrator::CompositeEffect;
-using android::hardware::vibrator::CompositePrimitive;
-using android::hardware::vibrator::Effect;
-using android::hardware::vibrator::EffectStrength;
-using android::hardware::vibrator::PrimitivePwle;
+using aidl::android::hardware::vibrator::Braking;
+using aidl::android::hardware::vibrator::CompositeEffect;
+using aidl::android::hardware::vibrator::CompositePrimitive;
+using aidl::android::hardware::vibrator::Effect;
+using aidl::android::hardware::vibrator::EffectStrength;
+using aidl::android::hardware::vibrator::PrimitivePwle;
+using aidl::android::hardware::vibrator::PwleV2OutputMapEntry;
+using aidl::android::hardware::vibrator::PwleV2Primitive;
+using aidl::android::hardware::vibrator::VendorEffect;
 
 using std::chrono::milliseconds;
 
@@ -39,7 +42,7 @@ namespace V1_0 = android::hardware::vibrator::V1_0;
 namespace V1_1 = android::hardware::vibrator::V1_1;
 namespace V1_2 = android::hardware::vibrator::V1_2;
 namespace V1_3 = android::hardware::vibrator::V1_3;
-namespace Aidl = android::hardware::vibrator;
+namespace Aidl = aidl::android::hardware::vibrator;
 
 namespace android {
 
@@ -52,75 +55,6 @@ bool isStaticCastValid(Effect effect) {
     T castEffect = static_cast<T>(effect);
     auto iter = hardware::hidl_enum_range<T>();
     return castEffect >= *iter.begin() && castEffect <= *std::prev(iter.end());
-}
-
-// -------------------------------------------------------------------------------------------------
-
-const constexpr char* STATUS_T_ERROR_MESSAGE_PREFIX = "status_t = ";
-const constexpr char* STATUS_V_1_0_ERROR_MESSAGE_PREFIX =
-        "android::hardware::vibrator::V1_0::Status = ";
-
-template <typename T>
-HalResult<T> HalResult<T>::fromStatus(V1_0::Status status, T data) {
-    switch (status) {
-        case V1_0::Status::OK:
-            return HalResult<T>::ok(data);
-        case V1_0::Status::UNSUPPORTED_OPERATION:
-            return HalResult<T>::unsupported();
-        default:
-            return HalResult<T>::failed(STATUS_V_1_0_ERROR_MESSAGE_PREFIX + toString(status));
-    }
-}
-
-template <typename T>
-template <typename R>
-HalResult<T> HalResult<T>::fromReturn(hardware::Return<R>& ret, T data) {
-    return ret.isOk() ? HalResult<T>::ok(data) : HalResult<T>::failed(ret.description());
-}
-
-template <typename T>
-template <typename R>
-HalResult<T> HalResult<T>::fromReturn(hardware::Return<R>& ret, V1_0::Status status, T data) {
-    return ret.isOk() ? HalResult<T>::fromStatus(status, data)
-                      : HalResult<T>::failed(ret.description());
-}
-
-// -------------------------------------------------------------------------------------------------
-
-HalResult<void> HalResult<void>::fromStatus(status_t status) {
-    if (status == android::OK) {
-        return HalResult<void>::ok();
-    }
-    return HalResult<void>::failed(STATUS_T_ERROR_MESSAGE_PREFIX + statusToString(status));
-}
-
-HalResult<void> HalResult<void>::fromStatus(binder::Status status) {
-    if (status.exceptionCode() == binder::Status::EX_UNSUPPORTED_OPERATION ||
-        status.transactionError() == android::UNKNOWN_TRANSACTION) {
-        // UNKNOWN_TRANSACTION means the HAL implementation is an older version, so this is
-        // the same as the operation being unsupported by this HAL. Should not retry.
-        return HalResult<void>::unsupported();
-    }
-    if (status.isOk()) {
-        return HalResult<void>::ok();
-    }
-    return HalResult<void>::failed(std::string(status.toString8().c_str()));
-}
-
-HalResult<void> HalResult<void>::fromStatus(V1_0::Status status) {
-    switch (status) {
-        case V1_0::Status::OK:
-            return HalResult<void>::ok();
-        case V1_0::Status::UNSUPPORTED_OPERATION:
-            return HalResult<void>::unsupported();
-        default:
-            return HalResult<void>::failed(STATUS_V_1_0_ERROR_MESSAGE_PREFIX + toString(status));
-    }
-}
-
-template <typename R>
-HalResult<void> HalResult<void>::fromReturn(hardware::Return<R>& ret) {
-    return ret.isOk() ? HalResult<void>::ok() : HalResult<void>::failed(ret.description());
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -162,7 +96,23 @@ Info HalWrapper::getInfo() {
     if (mInfoCache.mMaxAmplitudes.isFailed()) {
         mInfoCache.mMaxAmplitudes = getMaxAmplitudesInternal();
     }
+    if (mInfoCache.mMaxEnvelopeEffectSize.isFailed()) {
+        mInfoCache.mMaxEnvelopeEffectSize = getMaxEnvelopeEffectSizeInternal();
+    }
+    if (mInfoCache.mMinEnvelopeEffectControlPointDuration.isFailed()) {
+        mInfoCache.mMinEnvelopeEffectControlPointDuration =
+                getMinEnvelopeEffectControlPointDurationInternal();
+    }
+    if (mInfoCache.mMaxEnvelopeEffectControlPointDuration.isFailed()) {
+        mInfoCache.mMaxEnvelopeEffectControlPointDuration =
+                getMaxEnvelopeEffectControlPointDurationInternal();
+    }
     return mInfoCache.get();
+}
+
+HalResult<void> HalWrapper::performVendorEffect(const VendorEffect&, const std::function<void()>&) {
+    ALOGV("Skipped performVendorEffect because it's not available in Vibrator HAL");
+    return HalResult<void>::unsupported();
 }
 
 HalResult<milliseconds> HalWrapper::performComposedEffect(const std::vector<CompositeEffect>&,
@@ -174,6 +124,12 @@ HalResult<milliseconds> HalWrapper::performComposedEffect(const std::vector<Comp
 HalResult<void> HalWrapper::performPwleEffect(const std::vector<PrimitivePwle>&,
                                               const std::function<void()>&) {
     ALOGV("Skipped performPwleEffect because it's not available in Vibrator HAL");
+    return HalResult<void>::unsupported();
+}
+
+HalResult<void> HalWrapper::composePwleV2(const std::vector<PwleV2Primitive>&,
+                                          const std::function<void()>&) {
+    ALOGV("Skipped composePwleV2 because it's not available in Vibrator HAL");
     return HalResult<void>::unsupported();
 }
 
@@ -265,11 +221,28 @@ HalResult<std::vector<float>> HalWrapper::getMaxAmplitudesInternal() {
     ALOGV("Skipped getMaxAmplitudes because it's not available in Vibrator HAL");
     return HalResult<std::vector<float>>::unsupported();
 }
+HalResult<int32_t> HalWrapper::getMaxEnvelopeEffectSizeInternal() {
+    ALOGV("Skipped getMaxEnvelopeEffectSizeInternal because it's not available "
+          "in Vibrator HAL");
+    return HalResult<int32_t>::unsupported();
+}
+
+HalResult<milliseconds> HalWrapper::getMinEnvelopeEffectControlPointDurationInternal() {
+    ALOGV("Skipped getMinEnvelopeEffectControlPointDurationInternal because it's not "
+          "available in Vibrator HAL");
+    return HalResult<milliseconds>::unsupported();
+}
+
+HalResult<milliseconds> HalWrapper::getMaxEnvelopeEffectControlPointDurationInternal() {
+    ALOGV("Skipped getMaxEnvelopeEffectControlPointDurationInternal because it's not "
+          "available in Vibrator HAL");
+    return HalResult<milliseconds>::unsupported();
+}
 
 // -------------------------------------------------------------------------------------------------
 
 HalResult<void> AidlHalWrapper::ping() {
-    return HalResult<void>::fromStatus(IInterface::asBinder(getHal())->pingBinder());
+    return HalResultFactory::fromStatus(AIBinder_ping(getHal()->asBinder().get()));
 }
 
 void AidlHalWrapper::tryReconnect() {
@@ -277,7 +250,7 @@ void AidlHalWrapper::tryReconnect() {
     if (!result.isOk()) {
         return;
     }
-    sp<Aidl::IVibrator> newHandle = result.value();
+    std::shared_ptr<Aidl::IVibrator> newHandle = result.value();
     if (newHandle) {
         std::lock_guard<std::mutex> lock(mHandleMutex);
         mHandle = std::move(newHandle);
@@ -289,9 +262,10 @@ HalResult<void> AidlHalWrapper::on(milliseconds timeout,
     HalResult<Capabilities> capabilities = getCapabilities();
     bool supportsCallback = capabilities.isOk() &&
             static_cast<int32_t>(capabilities.value() & Capabilities::ON_CALLBACK);
-    auto cb = supportsCallback ? new HalCallbackWrapper(completionCallback) : nullptr;
+    auto cb = supportsCallback ? ndk::SharedRefBase::make<HalCallbackWrapper>(completionCallback)
+                               : nullptr;
 
-    auto ret = HalResult<void>::fromStatus(getHal()->on(timeout.count(), cb));
+    auto ret = HalResultFactory::fromStatus(getHal()->on(timeout.count(), cb));
     if (!supportsCallback && ret.isOk()) {
         mCallbackScheduler->schedule(completionCallback, timeout);
     }
@@ -300,23 +274,23 @@ HalResult<void> AidlHalWrapper::on(milliseconds timeout,
 }
 
 HalResult<void> AidlHalWrapper::off() {
-    return HalResult<void>::fromStatus(getHal()->off());
+    return HalResultFactory::fromStatus(getHal()->off());
 }
 
 HalResult<void> AidlHalWrapper::setAmplitude(float amplitude) {
-    return HalResult<void>::fromStatus(getHal()->setAmplitude(amplitude));
+    return HalResultFactory::fromStatus(getHal()->setAmplitude(amplitude));
 }
 
 HalResult<void> AidlHalWrapper::setExternalControl(bool enabled) {
-    return HalResult<void>::fromStatus(getHal()->setExternalControl(enabled));
+    return HalResultFactory::fromStatus(getHal()->setExternalControl(enabled));
 }
 
 HalResult<void> AidlHalWrapper::alwaysOnEnable(int32_t id, Effect effect, EffectStrength strength) {
-    return HalResult<void>::fromStatus(getHal()->alwaysOnEnable(id, effect, strength));
+    return HalResultFactory::fromStatus(getHal()->alwaysOnEnable(id, effect, strength));
 }
 
 HalResult<void> AidlHalWrapper::alwaysOnDisable(int32_t id) {
-    return HalResult<void>::fromStatus(getHal()->alwaysOnDisable(id));
+    return HalResultFactory::fromStatus(getHal()->alwaysOnDisable(id));
 }
 
 HalResult<milliseconds> AidlHalWrapper::performEffect(
@@ -324,13 +298,14 @@ HalResult<milliseconds> AidlHalWrapper::performEffect(
     HalResult<Capabilities> capabilities = getCapabilities();
     bool supportsCallback = capabilities.isOk() &&
             static_cast<int32_t>(capabilities.value() & Capabilities::PERFORM_CALLBACK);
-    auto cb = supportsCallback ? new HalCallbackWrapper(completionCallback) : nullptr;
+    auto cb = supportsCallback ? ndk::SharedRefBase::make<HalCallbackWrapper>(completionCallback)
+                               : nullptr;
 
     int32_t lengthMs;
-    auto result = getHal()->perform(effect, strength, cb, &lengthMs);
+    auto status = getHal()->perform(effect, strength, cb, &lengthMs);
     milliseconds length = milliseconds(lengthMs);
 
-    auto ret = HalResult<milliseconds>::fromStatus(result, length);
+    auto ret = HalResultFactory::fromStatus<milliseconds>(std::move(status), length);
     if (!supportsCallback && ret.isOk()) {
         mCallbackScheduler->schedule(completionCallback, length);
     }
@@ -338,11 +313,18 @@ HalResult<milliseconds> AidlHalWrapper::performEffect(
     return ret;
 }
 
+HalResult<void> AidlHalWrapper::performVendorEffect(
+        const VendorEffect& effect, const std::function<void()>& completionCallback) {
+    // This method should always support callbacks, so no need to double check.
+    auto cb = ndk::SharedRefBase::make<HalCallbackWrapper>(completionCallback);
+    return HalResultFactory::fromStatus(getHal()->performVendorEffect(effect, cb));
+}
+
 HalResult<milliseconds> AidlHalWrapper::performComposedEffect(
         const std::vector<CompositeEffect>& primitives,
         const std::function<void()>& completionCallback) {
     // This method should always support callbacks, so no need to double check.
-    auto cb = new HalCallbackWrapper(completionCallback);
+    auto cb = ndk::SharedRefBase::make<HalCallbackWrapper>(completionCallback);
 
     auto durations = getPrimitiveDurations().valueOr({});
     milliseconds duration(0);
@@ -357,44 +339,53 @@ HalResult<milliseconds> AidlHalWrapper::performComposedEffect(
         duration += milliseconds(effect.delayMs);
     }
 
-    return HalResult<milliseconds>::fromStatus(getHal()->compose(primitives, cb), duration);
+    return HalResultFactory::fromStatus<milliseconds>(getHal()->compose(primitives, cb), duration);
 }
 
 HalResult<void> AidlHalWrapper::performPwleEffect(const std::vector<PrimitivePwle>& primitives,
                                                   const std::function<void()>& completionCallback) {
     // This method should always support callbacks, so no need to double check.
-    auto cb = new HalCallbackWrapper(completionCallback);
-    return HalResult<void>::fromStatus(getHal()->composePwle(primitives, cb));
+    auto cb = ndk::SharedRefBase::make<HalCallbackWrapper>(completionCallback);
+    return HalResultFactory::fromStatus(getHal()->composePwle(primitives, cb));
+}
+
+HalResult<void> AidlHalWrapper::composePwleV2(const std::vector<PwleV2Primitive>& composite,
+                                              const std::function<void()>& completionCallback) {
+    // This method should always support callbacks, so no need to double check.
+    auto cb = ndk::SharedRefBase::make<HalCallbackWrapper>(completionCallback);
+    return HalResultFactory::fromStatus(getHal()->composePwleV2(composite, cb));
 }
 
 HalResult<Capabilities> AidlHalWrapper::getCapabilitiesInternal() {
-    int32_t capabilities = 0;
-    auto result = getHal()->getCapabilities(&capabilities);
-    return HalResult<Capabilities>::fromStatus(result, static_cast<Capabilities>(capabilities));
+    int32_t cap = 0;
+    auto status = getHal()->getCapabilities(&cap);
+    auto capabilities = static_cast<Capabilities>(cap);
+    return HalResultFactory::fromStatus<Capabilities>(std::move(status), capabilities);
 }
 
 HalResult<std::vector<Effect>> AidlHalWrapper::getSupportedEffectsInternal() {
     std::vector<Effect> supportedEffects;
-    auto result = getHal()->getSupportedEffects(&supportedEffects);
-    return HalResult<std::vector<Effect>>::fromStatus(result, supportedEffects);
+    auto status = getHal()->getSupportedEffects(&supportedEffects);
+    return HalResultFactory::fromStatus<std::vector<Effect>>(std::move(status), supportedEffects);
 }
 
 HalResult<std::vector<Braking>> AidlHalWrapper::getSupportedBrakingInternal() {
     std::vector<Braking> supportedBraking;
-    auto result = getHal()->getSupportedBraking(&supportedBraking);
-    return HalResult<std::vector<Braking>>::fromStatus(result, supportedBraking);
+    auto status = getHal()->getSupportedBraking(&supportedBraking);
+    return HalResultFactory::fromStatus<std::vector<Braking>>(std::move(status), supportedBraking);
 }
 
 HalResult<std::vector<CompositePrimitive>> AidlHalWrapper::getSupportedPrimitivesInternal() {
     std::vector<CompositePrimitive> supportedPrimitives;
-    auto result = getHal()->getSupportedPrimitives(&supportedPrimitives);
-    return HalResult<std::vector<CompositePrimitive>>::fromStatus(result, supportedPrimitives);
+    auto status = getHal()->getSupportedPrimitives(&supportedPrimitives);
+    return HalResultFactory::fromStatus<std::vector<CompositePrimitive>>(std::move(status),
+                                                                         supportedPrimitives);
 }
 
 HalResult<std::vector<milliseconds>> AidlHalWrapper::getPrimitiveDurationsInternal(
         const std::vector<CompositePrimitive>& supportedPrimitives) {
     std::vector<milliseconds> durations;
-    constexpr auto primitiveRange = enum_range<CompositePrimitive>();
+    constexpr auto primitiveRange = ndk::enum_range<CompositePrimitive>();
     constexpr auto primitiveCount = std::distance(primitiveRange.begin(), primitiveRange.end());
     durations.resize(primitiveCount);
 
@@ -407,8 +398,8 @@ HalResult<std::vector<milliseconds>> AidlHalWrapper::getPrimitiveDurationsIntern
             continue;
         }
         int32_t duration = 0;
-        auto result = getHal()->getPrimitiveDuration(primitive, &duration);
-        auto halResult = HalResult<int32_t>::fromStatus(result, duration);
+        auto status = getHal()->getPrimitiveDuration(primitive, &duration);
+        auto halResult = HalResultFactory::fromStatus<int32_t>(std::move(status), duration);
         if (halResult.isUnsupported()) {
             // Should not happen, supported primitives should always support requesting duration.
             ALOGE("Supported primitive %zu returned unsupported for getPrimitiveDuration",
@@ -416,7 +407,7 @@ HalResult<std::vector<milliseconds>> AidlHalWrapper::getPrimitiveDurationsIntern
         }
         if (halResult.isFailed()) {
             // Fail entire request if one request has failed.
-            return HalResult<std::vector<milliseconds>>::failed(result.toString8().c_str());
+            return HalResult<std::vector<milliseconds>>::failed(halResult.errorMessage());
         }
         durations[primitiveIdx] = milliseconds(duration);
     }
@@ -426,59 +417,77 @@ HalResult<std::vector<milliseconds>> AidlHalWrapper::getPrimitiveDurationsIntern
 
 HalResult<milliseconds> AidlHalWrapper::getPrimitiveDelayMaxInternal() {
     int32_t delay = 0;
-    auto result = getHal()->getCompositionDelayMax(&delay);
-    return HalResult<milliseconds>::fromStatus(result, milliseconds(delay));
+    auto status = getHal()->getCompositionDelayMax(&delay);
+    return HalResultFactory::fromStatus<milliseconds>(std::move(status), milliseconds(delay));
 }
 
 HalResult<milliseconds> AidlHalWrapper::getPrimitiveDurationMaxInternal() {
     int32_t delay = 0;
-    auto result = getHal()->getPwlePrimitiveDurationMax(&delay);
-    return HalResult<milliseconds>::fromStatus(result, milliseconds(delay));
+    auto status = getHal()->getPwlePrimitiveDurationMax(&delay);
+    return HalResultFactory::fromStatus<milliseconds>(std::move(status), milliseconds(delay));
 }
 
 HalResult<int32_t> AidlHalWrapper::getCompositionSizeMaxInternal() {
     int32_t size = 0;
-    auto result = getHal()->getCompositionSizeMax(&size);
-    return HalResult<int32_t>::fromStatus(result, size);
+    auto status = getHal()->getCompositionSizeMax(&size);
+    return HalResultFactory::fromStatus<int32_t>(std::move(status), size);
 }
 
 HalResult<int32_t> AidlHalWrapper::getPwleSizeMaxInternal() {
     int32_t size = 0;
-    auto result = getHal()->getPwleCompositionSizeMax(&size);
-    return HalResult<int32_t>::fromStatus(result, size);
+    auto status = getHal()->getPwleCompositionSizeMax(&size);
+    return HalResultFactory::fromStatus<int32_t>(std::move(status), size);
 }
 
 HalResult<float> AidlHalWrapper::getMinFrequencyInternal() {
     float minFrequency = 0;
-    auto result = getHal()->getFrequencyMinimum(&minFrequency);
-    return HalResult<float>::fromStatus(result, minFrequency);
+    auto status = getHal()->getFrequencyMinimum(&minFrequency);
+    return HalResultFactory::fromStatus<float>(std::move(status), minFrequency);
 }
 
 HalResult<float> AidlHalWrapper::getResonantFrequencyInternal() {
     float f0 = 0;
-    auto result = getHal()->getResonantFrequency(&f0);
-    return HalResult<float>::fromStatus(result, f0);
+    auto status = getHal()->getResonantFrequency(&f0);
+    return HalResultFactory::fromStatus<float>(std::move(status), f0);
 }
 
 HalResult<float> AidlHalWrapper::getFrequencyResolutionInternal() {
     float frequencyResolution = 0;
-    auto result = getHal()->getFrequencyResolution(&frequencyResolution);
-    return HalResult<float>::fromStatus(result, frequencyResolution);
+    auto status = getHal()->getFrequencyResolution(&frequencyResolution);
+    return HalResultFactory::fromStatus<float>(std::move(status), frequencyResolution);
 }
 
 HalResult<float> AidlHalWrapper::getQFactorInternal() {
     float qFactor = 0;
-    auto result = getHal()->getQFactor(&qFactor);
-    return HalResult<float>::fromStatus(result, qFactor);
+    auto status = getHal()->getQFactor(&qFactor);
+    return HalResultFactory::fromStatus<float>(std::move(status), qFactor);
 }
 
 HalResult<std::vector<float>> AidlHalWrapper::getMaxAmplitudesInternal() {
     std::vector<float> amplitudes;
-    auto result = getHal()->getBandwidthAmplitudeMap(&amplitudes);
-    return HalResult<std::vector<float>>::fromStatus(result, amplitudes);
+    auto status = getHal()->getBandwidthAmplitudeMap(&amplitudes);
+    return HalResultFactory::fromStatus<std::vector<float>>(std::move(status), amplitudes);
 }
 
-sp<Aidl::IVibrator> AidlHalWrapper::getHal() {
+HalResult<int32_t> AidlHalWrapper::getMaxEnvelopeEffectSizeInternal() {
+    int32_t size = 0;
+    auto status = getHal()->getPwleV2CompositionSizeMax(&size);
+    return HalResultFactory::fromStatus<int32_t>(std::move(status), size);
+}
+
+HalResult<milliseconds> AidlHalWrapper::getMinEnvelopeEffectControlPointDurationInternal() {
+    int32_t durationMs = 0;
+    auto status = getHal()->getPwleV2PrimitiveDurationMinMillis(&durationMs);
+    return HalResultFactory::fromStatus<milliseconds>(std::move(status), milliseconds(durationMs));
+}
+
+HalResult<milliseconds> AidlHalWrapper::getMaxEnvelopeEffectControlPointDurationInternal() {
+    int32_t durationMs = 0;
+    auto status = getHal()->getPwleV2PrimitiveDurationMaxMillis(&durationMs);
+    return HalResultFactory::fromStatus<milliseconds>(std::move(status), milliseconds(durationMs));
+}
+
+std::shared_ptr<Aidl::IVibrator> AidlHalWrapper::getHal() {
     std::lock_guard<std::mutex> lock(mHandleMutex);
     return mHandle;
 }
@@ -487,8 +496,7 @@ sp<Aidl::IVibrator> AidlHalWrapper::getHal() {
 
 template <typename I>
 HalResult<void> HidlHalWrapper<I>::ping() {
-    auto result = getHal()->ping();
-    return HalResult<void>::fromReturn(result);
+    return HalResultFactory::fromReturn(getHal()->ping());
 }
 
 template <typename I>
@@ -503,8 +511,8 @@ void HidlHalWrapper<I>::tryReconnect() {
 template <typename I>
 HalResult<void> HidlHalWrapper<I>::on(milliseconds timeout,
                                       const std::function<void()>& completionCallback) {
-    auto result = getHal()->on(timeout.count());
-    auto ret = HalResult<void>::fromStatus(result.withDefault(V1_0::Status::UNKNOWN_ERROR));
+    auto status = getHal()->on(timeout.count());
+    auto ret = HalResultFactory::fromStatus(status.withDefault(V1_0::Status::UNKNOWN_ERROR));
     if (ret.isOk()) {
         mCallbackScheduler->schedule(completionCallback, timeout);
     }
@@ -513,15 +521,15 @@ HalResult<void> HidlHalWrapper<I>::on(milliseconds timeout,
 
 template <typename I>
 HalResult<void> HidlHalWrapper<I>::off() {
-    auto result = getHal()->off();
-    return HalResult<void>::fromStatus(result.withDefault(V1_0::Status::UNKNOWN_ERROR));
+    auto status = getHal()->off();
+    return HalResultFactory::fromStatus(status.withDefault(V1_0::Status::UNKNOWN_ERROR));
 }
 
 template <typename I>
 HalResult<void> HidlHalWrapper<I>::setAmplitude(float amplitude) {
     uint8_t amp = static_cast<uint8_t>(amplitude * std::numeric_limits<uint8_t>::max());
-    auto result = getHal()->setAmplitude(amp);
-    return HalResult<void>::fromStatus(result.withDefault(V1_0::Status::UNKNOWN_ERROR));
+    auto status = getHal()->setAmplitude(amp);
+    return HalResultFactory::fromStatus(status.withDefault(V1_0::Status::UNKNOWN_ERROR));
 }
 
 template <typename I>
@@ -547,7 +555,7 @@ HalResult<Capabilities> HidlHalWrapper<I>::getCapabilitiesInternal() {
     hardware::Return<bool> result = getHal()->supportsAmplitudeControl();
     Capabilities capabilities =
             result.withDefault(false) ? Capabilities::AMPLITUDE_CONTROL : Capabilities::NONE;
-    return HalResult<Capabilities>::fromReturn(result, capabilities);
+    return HalResultFactory::fromReturn<Capabilities>(std::move(result), capabilities);
 }
 
 template <typename I>
@@ -566,7 +574,7 @@ HalResult<milliseconds> HidlHalWrapper<I>::performInternal(
     auto result = std::invoke(performFn, handle, effect, effectStrength, effectCallback);
     milliseconds length = milliseconds(lengthMs);
 
-    auto ret = HalResult<milliseconds>::fromReturn(result, status, length);
+    auto ret = HalResultFactory::fromReturn<milliseconds>(std::move(result), status, length);
     if (ret.isOk()) {
         mCallbackScheduler->schedule(completionCallback, length);
     }
@@ -638,7 +646,7 @@ HalResult<milliseconds> HidlHalWrapperV1_2::performEffect(
 
 HalResult<void> HidlHalWrapperV1_3::setExternalControl(bool enabled) {
     auto result = getHal()->setExternalControl(static_cast<uint32_t>(enabled));
-    return HalResult<void>::fromStatus(result.withDefault(V1_0::Status::UNKNOWN_ERROR));
+    return HalResultFactory::fromStatus(result.withDefault(V1_0::Status::UNKNOWN_ERROR));
 }
 
 HalResult<milliseconds> HidlHalWrapperV1_3::performEffect(
@@ -671,7 +679,7 @@ HalResult<Capabilities> HidlHalWrapperV1_3::getCapabilitiesInternal() {
     sp<V1_3::IVibrator> hal = getHal();
     auto amplitudeResult = hal->supportsAmplitudeControl();
     if (!amplitudeResult.isOk()) {
-        return HalResult<Capabilities>::fromReturn(amplitudeResult, capabilities);
+        return HalResultFactory::fromReturn<Capabilities>(std::move(amplitudeResult), capabilities);
     }
 
     auto externalControlResult = hal->supportsExternalControl();
@@ -686,7 +694,8 @@ HalResult<Capabilities> HidlHalWrapperV1_3::getCapabilitiesInternal() {
         }
     }
 
-    return HalResult<Capabilities>::fromReturn(externalControlResult, capabilities);
+    return HalResultFactory::fromReturn<Capabilities>(std::move(externalControlResult),
+                                                      capabilities);
 }
 
 // -------------------------------------------------------------------------------------------------

@@ -28,11 +28,8 @@ InputState::InputState(const IdGenerator& idGenerator) : mIdGenerator(idGenerato
 
 InputState::~InputState() {}
 
-bool InputState::isNeutral() const {
-    return mKeyMementos.empty() && mMotionMementos.empty();
-}
-
-bool InputState::isHovering(int32_t deviceId, uint32_t source, int32_t displayId) const {
+bool InputState::isHovering(DeviceId deviceId, uint32_t source,
+                            ui::LogicalDisplayId displayId) const {
     for (const MotionMemento& memento : mMotionMementos) {
         if (memento.deviceId == deviceId && memento.source == source &&
             memento.displayId == displayId && memento.hovering) {
@@ -42,17 +39,12 @@ bool InputState::isHovering(int32_t deviceId, uint32_t source, int32_t displayId
     return false;
 }
 
-bool InputState::trackKey(const KeyEntry& entry, int32_t action, int32_t flags) {
-    switch (action) {
+bool InputState::trackKey(const KeyEntry& entry, int32_t flags) {
+    switch (entry.action) {
         case AKEY_EVENT_ACTION_UP: {
             if (entry.flags & AKEY_EVENT_FLAG_FALLBACK) {
-                for (size_t i = 0; i < mFallbackKeys.size();) {
-                    if (mFallbackKeys.valueAt(i) == entry.keyCode) {
-                        mFallbackKeys.removeItemsAt(i);
-                    } else {
-                        i += 1;
-                    }
-                }
+                std::erase_if(mFallbackKeys,
+                              [&entry](const auto& item) { return item.second == entry.keyCode; });
             }
             ssize_t index = findKeyMemento(entry);
             if (index >= 0) {
@@ -92,30 +84,48 @@ bool InputState::trackKey(const KeyEntry& entry, int32_t action, int32_t flags) 
     }
 }
 
-bool InputState::trackMotion(const MotionEntry& entry, int32_t action, int32_t flags) {
-    int32_t actionMasked = action & AMOTION_EVENT_ACTION_MASK;
+/**
+ * Return:
+ *  true if the incoming event was correctly tracked,
+ *  false if the incoming event should be dropped.
+ */
+bool InputState::trackMotion(const MotionEntry& entry, int32_t flags) {
+    // Don't track non-pointer events
+    if (!isFromSource(entry.source, AINPUT_SOURCE_CLASS_POINTER)) {
+        // This is a focus-dispatched event; we don't track its state.
+        return true;
+    }
+
+    if (!input_flags::enable_multi_device_same_window_stream()) {
+        if (!mMotionMementos.empty()) {
+            const MotionMemento& lastMemento = mMotionMementos.back();
+            if (isStylusEvent(lastMemento.source, lastMemento.pointerProperties) &&
+                !isStylusEvent(entry.source, entry.pointerProperties)) {
+                // We already have a stylus stream, and the new event is not from stylus.
+                return false;
+            }
+        }
+    }
+
+    int32_t actionMasked = entry.action & AMOTION_EVENT_ACTION_MASK;
     switch (actionMasked) {
         case AMOTION_EVENT_ACTION_UP:
         case AMOTION_EVENT_ACTION_CANCEL: {
-            ssize_t index = findMotionMemento(entry, false /*hovering*/);
+            ssize_t index = findMotionMemento(entry, /*hovering=*/false);
             if (index >= 0) {
                 mMotionMementos.erase(mMotionMementos.begin() + index);
                 return true;
             }
-            if (DEBUG_OUTBOUND_EVENT_DETAILS) {
-                ALOGD("Dropping inconsistent motion up or cancel event: deviceId=%d, source=%08x, "
-                      "displayId=%" PRId32 ", actionMasked=%d",
-                      entry.deviceId, entry.source, entry.displayId, actionMasked);
-            }
+
             return false;
         }
 
         case AMOTION_EVENT_ACTION_DOWN: {
-            ssize_t index = findMotionMemento(entry, false /*hovering*/);
+            ssize_t index = findMotionMemento(entry, /*hovering=*/false);
             if (index >= 0) {
                 mMotionMementos.erase(mMotionMementos.begin() + index);
             }
-            addMotionMemento(entry, flags, false /*hovering*/);
+            addMotionMemento(entry, flags, /*hovering=*/false);
             return true;
         }
 
@@ -129,7 +139,7 @@ bool InputState::trackMotion(const MotionEntry& entry, int32_t action, int32_t f
                 return true;
             }
 
-            ssize_t index = findMotionMemento(entry, false /*hovering*/);
+            ssize_t index = findMotionMemento(entry, /*hovering=*/false);
 
             if (entry.source & AINPUT_SOURCE_CLASS_JOYSTICK) {
                 // Joysticks can send MOVE events without a corresponding DOWN or UP. Since all
@@ -145,7 +155,7 @@ bool InputState::trackMotion(const MotionEntry& entry, int32_t action, int32_t f
                         memento.setPointers(entry);
                     }
                 } else if (!entry.pointerCoords[0].isEmpty()) {
-                    addMotionMemento(entry, flags, false /*hovering*/);
+                    addMotionMemento(entry, flags, /*hovering=*/false);
                 }
 
                 // Joysticks and trackballs can send MOVE events without corresponding DOWN or UP.
@@ -159,41 +169,43 @@ bool InputState::trackMotion(const MotionEntry& entry, int32_t action, int32_t f
                     return true;
                 }
             }
-            if (DEBUG_OUTBOUND_EVENT_DETAILS) {
-                ALOGD("Dropping inconsistent motion pointer up/down or move event: "
-                      "deviceId=%d, source=%08x, displayId=%" PRId32 ", actionMasked=%d",
-                      entry.deviceId, entry.source, entry.displayId, actionMasked);
-            }
+
             return false;
         }
 
         case AMOTION_EVENT_ACTION_HOVER_EXIT: {
-            ssize_t index = findMotionMemento(entry, true /*hovering*/);
+            ssize_t index = findMotionMemento(entry, /*hovering=*/true);
             if (index >= 0) {
                 mMotionMementos.erase(mMotionMementos.begin() + index);
                 return true;
             }
-            if (DEBUG_OUTBOUND_EVENT_DETAILS) {
-                ALOGD("Dropping inconsistent motion hover exit event: deviceId=%d, source=%08x, "
-                      "displayId=%" PRId32,
-                      entry.deviceId, entry.source, entry.displayId);
-            }
+
             return false;
         }
 
         case AMOTION_EVENT_ACTION_HOVER_ENTER:
         case AMOTION_EVENT_ACTION_HOVER_MOVE: {
-            ssize_t index = findMotionMemento(entry, true /*hovering*/);
+            ssize_t index = findMotionMemento(entry, /*hovering=*/true);
             if (index >= 0) {
                 mMotionMementos.erase(mMotionMementos.begin() + index);
             }
-            addMotionMemento(entry, flags, true /*hovering*/);
+            addMotionMemento(entry, flags, /*hovering=*/true);
             return true;
         }
 
         default:
             return true;
     }
+}
+
+std::optional<std::pair<std::vector<PointerProperties>, std::vector<PointerCoords>>>
+InputState::getPointersOfLastEvent(const MotionEntry& entry, bool hovering) const {
+    ssize_t index = findMotionMemento(entry, hovering);
+    if (index == -1) {
+        return std::nullopt;
+    }
+    return std::make_pair(mMotionMementos[index].pointerProperties,
+                          mMotionMementos[index].pointerCoords);
 }
 
 ssize_t InputState::findKeyMemento(const KeyEntry& entry) const {
@@ -251,22 +263,150 @@ void InputState::addMotionMemento(const MotionEntry& entry, int32_t flags, bool 
 }
 
 void InputState::MotionMemento::setPointers(const MotionEntry& entry) {
-    pointerCount = entry.pointerCount;
-    for (uint32_t i = 0; i < entry.pointerCount; i++) {
-        pointerProperties[i].copyFrom(entry.pointerProperties[i]);
-        pointerCoords[i].copyFrom(entry.pointerCoords[i]);
+    pointerProperties.clear();
+    pointerCoords.clear();
+
+    for (uint32_t i = 0; i < entry.getPointerCount(); i++) {
+        if (MotionEvent::getActionMasked(entry.action) == AMOTION_EVENT_ACTION_POINTER_UP) {
+            // In POINTER_UP events, the pointer is leaving. Since the action is not stored,
+            // this departing pointer should not be recorded.
+            const uint8_t actionIndex = MotionEvent::getActionIndex(entry.action);
+            if (i == actionIndex) {
+                continue;
+            }
+        }
+        pointerProperties.push_back(entry.pointerProperties[i]);
+        pointerCoords.push_back(entry.pointerCoords[i]);
     }
 }
 
 void InputState::MotionMemento::mergePointerStateTo(MotionMemento& other) const {
-    for (uint32_t i = 0; i < pointerCount; i++) {
+    for (uint32_t i = 0; i < getPointerCount(); i++) {
         if (other.firstNewPointerIdx < 0) {
-            other.firstNewPointerIdx = other.pointerCount;
+            other.firstNewPointerIdx = other.getPointerCount();
         }
-        other.pointerProperties[other.pointerCount].copyFrom(pointerProperties[i]);
-        other.pointerCoords[other.pointerCount].copyFrom(pointerCoords[i]);
-        other.pointerCount++;
+        other.pointerProperties.push_back(pointerProperties[i]);
+        other.pointerCoords.push_back(pointerCoords[i]);
     }
+}
+
+size_t InputState::MotionMemento::getPointerCount() const {
+    return pointerProperties.size();
+}
+
+bool InputState::shouldCancelPreviousStream(const MotionEntry& motionEntry) const {
+    if (!isFromSource(motionEntry.source, AINPUT_SOURCE_CLASS_POINTER)) {
+        // This is a focus-dispatched event that should not affect the previous stream.
+        return false;
+    }
+
+    // New MotionEntry pointer event is coming in.
+
+    // If this is a new gesture, and it's from a different device, then, in general, we will cancel
+    // the current gesture.
+    // However, because stylus should be preferred over touch, we need to treat some cases in a
+    // special way.
+    if (mMotionMementos.empty()) {
+        // There is no ongoing pointer gesture, so there is nothing to cancel
+        return false;
+    }
+
+    const MotionMemento& lastMemento = mMotionMementos.back();
+    const int32_t actionMasked = MotionEvent::getActionMasked(motionEntry.action);
+
+    // For compatibility, only one input device can be active at a time in the same window.
+    if (lastMemento.deviceId == motionEntry.deviceId) {
+        // In general, the same device should produce self-consistent streams so nothing needs to
+        // be canceled. But there is one exception:
+        // Sometimes ACTION_DOWN is received without a corresponding HOVER_EXIT. To account for
+        // that, cancel the previous hovering stream
+        if (actionMasked == AMOTION_EVENT_ACTION_DOWN && lastMemento.hovering) {
+            return true;
+        }
+
+        // If the stream changes its source, just cancel the current gesture to be safe. It's
+        // possible that the app isn't handling source changes properly
+        if (motionEntry.source != lastMemento.source) {
+            LOG(INFO) << "Canceling stream: last source was "
+                      << inputEventSourceToString(lastMemento.source) << " and new event is "
+                      << motionEntry;
+            return true;
+        }
+
+        // If the injection is happening into two different displays, the same injected device id
+        // could be going into both. And at this time, if mirroring is active, the same connection
+        // would receive different events from each display. Since the TouchStates are per-display,
+        // it's unlikely that those two streams would be consistent with each other. Therefore,
+        // cancel the previous gesture if the display id changes.
+        if (motionEntry.displayId != lastMemento.displayId) {
+            LOG(INFO) << "Canceling stream: last displayId was " << lastMemento.displayId
+                      << " and new event is " << motionEntry;
+            return true;
+        }
+
+        return false;
+    }
+
+    if (!input_flags::enable_multi_device_same_window_stream()) {
+        if (isStylusEvent(lastMemento.source, lastMemento.pointerProperties)) {
+            // A stylus is already active.
+            if (isStylusEvent(motionEntry.source, motionEntry.pointerProperties) &&
+                actionMasked == AMOTION_EVENT_ACTION_DOWN) {
+                // If this new event is from a different device, then cancel the old
+                // stylus and allow the new stylus to take over, but only if it's going down.
+                // Otherwise, they will start to race each other.
+                return true;
+            }
+
+            // Keep the current stylus gesture.
+            return false;
+        }
+
+        // Cancel the current gesture if this is a start of a new gesture from a new device.
+        if (actionMasked == AMOTION_EVENT_ACTION_DOWN ||
+            actionMasked == AMOTION_EVENT_ACTION_HOVER_ENTER) {
+            return true;
+        }
+    }
+    // By default, don't cancel any events.
+    return false;
+}
+
+std::unique_ptr<EventEntry> InputState::cancelConflictingInputStream(
+        const MotionEntry& motionEntry) {
+    if (!shouldCancelPreviousStream(motionEntry)) {
+        return {};
+    }
+
+    const MotionMemento& memento = mMotionMementos.back();
+
+    // Cancel the last device stream
+    std::unique_ptr<MotionEntry> cancelEntry =
+            createCancelEntryForMemento(memento, motionEntry.eventTime);
+
+    if (!trackMotion(*cancelEntry, cancelEntry->flags)) {
+        LOG(FATAL) << "Generated inconsistent cancel event!";
+    }
+    return cancelEntry;
+}
+
+std::unique_ptr<MotionEntry> InputState::createCancelEntryForMemento(const MotionMemento& memento,
+                                                                     nsecs_t eventTime) const {
+    const int32_t action =
+            memento.hovering ? AMOTION_EVENT_ACTION_HOVER_EXIT : AMOTION_EVENT_ACTION_CANCEL;
+    int32_t flags = memento.flags;
+    if (action == AMOTION_EVENT_ACTION_CANCEL) {
+        flags |= AMOTION_EVENT_FLAG_CANCELED;
+    }
+    return std::make_unique<MotionEntry>(mIdGenerator.nextId(), /*injectionState=*/nullptr,
+                                         eventTime, memento.deviceId, memento.source,
+                                         memento.displayId, memento.policyFlags, action,
+                                         /*actionButton=*/0, flags, AMETA_NONE,
+                                         /*buttonState=*/0, MotionClassification::NONE,
+                                         AMOTION_EVENT_EDGE_FLAG_NONE, memento.xPrecision,
+                                         memento.yPrecision, memento.xCursorPosition,
+                                         memento.yCursorPosition, memento.downTime,
+                                         memento.pointerProperties, memento.pointerCoords);
 }
 
 std::vector<std::unique_ptr<EventEntry>> InputState::synthesizeCancelationEvents(
@@ -275,30 +415,27 @@ std::vector<std::unique_ptr<EventEntry>> InputState::synthesizeCancelationEvents
     for (KeyMemento& memento : mKeyMementos) {
         if (shouldCancelKey(memento, options)) {
             events.push_back(
-                    std::make_unique<KeyEntry>(mIdGenerator.nextId(), currentTime, memento.deviceId,
-                                               memento.source, memento.displayId,
-                                               memento.policyFlags, AKEY_EVENT_ACTION_UP,
+                    std::make_unique<KeyEntry>(mIdGenerator.nextId(), /*injectionState=*/nullptr,
+                                               currentTime, memento.deviceId, memento.source,
+                                               memento.displayId, memento.policyFlags,
+                                               AKEY_EVENT_ACTION_UP,
                                                memento.flags | AKEY_EVENT_FLAG_CANCELED,
                                                memento.keyCode, memento.scanCode, memento.metaState,
-                                               0 /*repeatCount*/, memento.downTime));
+                                               /*repeatCount=*/0, memento.downTime));
         }
     }
 
     for (const MotionMemento& memento : mMotionMementos) {
         if (shouldCancelMotion(memento, options)) {
-            const int32_t action = memento.hovering ? AMOTION_EVENT_ACTION_HOVER_EXIT
-                                                    : AMOTION_EVENT_ACTION_CANCEL;
-            events.push_back(
-                    std::make_unique<MotionEntry>(mIdGenerator.nextId(), currentTime,
-                                                  memento.deviceId, memento.source,
-                                                  memento.displayId, memento.policyFlags, action,
-                                                  0 /*actionButton*/, memento.flags, AMETA_NONE,
-                                                  0 /*buttonState*/, MotionClassification::NONE,
-                                                  AMOTION_EVENT_EDGE_FLAG_NONE, memento.xPrecision,
-                                                  memento.yPrecision, memento.xCursorPosition,
-                                                  memento.yCursorPosition, memento.downTime,
-                                                  memento.pointerCount, memento.pointerProperties,
-                                                  memento.pointerCoords));
+            if (options.pointerIds == std::nullopt) {
+                events.push_back(createCancelEntryForMemento(memento, currentTime));
+            } else {
+                std::vector<std::unique_ptr<MotionEntry>> pointerCancelEvents =
+                        synthesizeCancelationEventsForPointers(memento, options.pointerIds.value(),
+                                                               currentTime);
+                events.insert(events.end(), std::make_move_iterator(pointerCancelEvents.begin()),
+                              std::make_move_iterator(pointerCancelEvents.end()));
+            }
         }
     }
     return events;
@@ -308,7 +445,7 @@ std::vector<std::unique_ptr<EventEntry>> InputState::synthesizePointerDownEvents
         nsecs_t currentTime) {
     std::vector<std::unique_ptr<EventEntry>> events;
     for (MotionMemento& memento : mMotionMementos) {
-        if (!(memento.source & AINPUT_SOURCE_CLASS_POINTER)) {
+        if (!isFromSource(memento.source, AINPUT_SOURCE_CLASS_POINTER)) {
             continue;
         }
 
@@ -316,24 +453,22 @@ std::vector<std::unique_ptr<EventEntry>> InputState::synthesizePointerDownEvents
             continue;
         }
 
-        uint32_t pointerCount = 0;
-        PointerProperties pointerProperties[MAX_POINTERS];
-        PointerCoords pointerCoords[MAX_POINTERS];
+        std::vector<PointerProperties> pointerProperties;
+        std::vector<PointerCoords> pointerCoords;
 
         // We will deliver all pointers the target already knows about
         for (uint32_t i = 0; i < static_cast<uint32_t>(memento.firstNewPointerIdx); i++) {
-            pointerProperties[i].copyFrom(memento.pointerProperties[i]);
-            pointerCoords[i].copyFrom(memento.pointerCoords[i]);
-            pointerCount++;
+            pointerProperties.push_back(memento.pointerProperties[i]);
+            pointerCoords.push_back(memento.pointerCoords[i]);
         }
 
         // We will send explicit events for all pointers the target doesn't know about
         for (uint32_t i = static_cast<uint32_t>(memento.firstNewPointerIdx);
-                i < memento.pointerCount; i++) {
+             i < memento.getPointerCount(); i++) {
+            pointerProperties.push_back(memento.pointerProperties[i]);
+            pointerCoords.push_back(memento.pointerCoords[i]);
 
-            pointerProperties[i].copyFrom(memento.pointerProperties[i]);
-            pointerCoords[i].copyFrom(memento.pointerCoords[i]);
-            pointerCount++;
+            const size_t pointerCount = pointerProperties.size();
 
             // Down only if the first pointer, pointer down otherwise
             const int32_t action = (pointerCount <= 1)
@@ -342,20 +477,76 @@ std::vector<std::unique_ptr<EventEntry>> InputState::synthesizePointerDownEvents
                             | (i << AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
 
             events.push_back(
-                    std::make_unique<MotionEntry>(mIdGenerator.nextId(), currentTime,
-                                                  memento.deviceId, memento.source,
+                    std::make_unique<MotionEntry>(mIdGenerator.nextId(), /*injectionState=*/nullptr,
+                                                  currentTime, memento.deviceId, memento.source,
                                                   memento.displayId, memento.policyFlags, action,
-                                                  0 /*actionButton*/, memento.flags, AMETA_NONE,
-                                                  0 /*buttonState*/, MotionClassification::NONE,
+                                                  /*actionButton=*/0, memento.flags, AMETA_NONE,
+                                                  /*buttonState=*/0, MotionClassification::NONE,
                                                   AMOTION_EVENT_EDGE_FLAG_NONE, memento.xPrecision,
                                                   memento.yPrecision, memento.xCursorPosition,
                                                   memento.yCursorPosition, memento.downTime,
-                                                  pointerCount, pointerProperties, pointerCoords));
+                                                  pointerProperties, pointerCoords));
         }
 
         memento.firstNewPointerIdx = INVALID_POINTER_INDEX;
     }
 
+    return events;
+}
+
+std::vector<std::unique_ptr<MotionEntry>> InputState::synthesizeCancelationEventsForPointers(
+        const MotionMemento& memento, std::bitset<MAX_POINTER_ID + 1> pointerIds,
+        nsecs_t currentTime) {
+    std::vector<std::unique_ptr<MotionEntry>> events;
+    std::vector<uint32_t> canceledPointerIndices;
+
+    for (uint32_t pointerIdx = 0; pointerIdx < memento.getPointerCount(); pointerIdx++) {
+        uint32_t pointerId = uint32_t(memento.pointerProperties[pointerIdx].id);
+        if (pointerIds.test(pointerId)) {
+            canceledPointerIndices.push_back(pointerIdx);
+        }
+    }
+
+    if (canceledPointerIndices.size() == memento.getPointerCount()) {
+        // We are cancelling all pointers.
+        events.emplace_back(createCancelEntryForMemento(memento, currentTime));
+        return events;
+    }
+
+    // If we aren't canceling all pointers, we need to generate ACTION_POINTER_UP with
+    // FLAG_CANCELED for each of the canceled pointers. For each event, we must remove the
+    // previously canceled pointers from PointerProperties and PointerCoords, and update
+    // pointerCount appropriately. For convenience, sort the canceled pointer indices in
+    // descending order so that we can just slide the remaining pointers to the beginning of
+    // the array when a pointer is canceled.
+    std::sort(canceledPointerIndices.begin(), canceledPointerIndices.end(),
+              std::greater<uint32_t>());
+
+    std::vector<PointerProperties> pointerProperties = memento.pointerProperties;
+    std::vector<PointerCoords> pointerCoords = memento.pointerCoords;
+    for (const uint32_t pointerIdx : canceledPointerIndices) {
+        if (pointerProperties.size() <= 1) {
+            LOG(FATAL) << "Unexpected code path for canceling all pointers!";
+        }
+        const int32_t action = AMOTION_EVENT_ACTION_POINTER_UP |
+                (pointerIdx << AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+        events.push_back(
+                std::make_unique<MotionEntry>(mIdGenerator.nextId(), /*injectionState=*/nullptr,
+                                              currentTime, memento.deviceId, memento.source,
+                                              memento.displayId, memento.policyFlags, action,
+                                              /*actionButton=*/0,
+                                              memento.flags | AMOTION_EVENT_FLAG_CANCELED,
+                                              AMETA_NONE, /*buttonState=*/0,
+                                              MotionClassification::NONE,
+                                              AMOTION_EVENT_EDGE_FLAG_NONE, memento.xPrecision,
+                                              memento.yPrecision, memento.xCursorPosition,
+                                              memento.yCursorPosition, memento.downTime,
+                                              pointerProperties, pointerCoords));
+
+        // Cleanup pointer information
+        pointerProperties.erase(pointerProperties.begin() + pointerIdx);
+        pointerCoords.erase(pointerCoords.begin() + pointerIdx);
+    }
     return events;
 }
 
@@ -370,7 +561,7 @@ void InputState::mergePointerStateTo(InputState& other) {
         MotionMemento& memento = mMotionMementos[i];
         // Since we support split pointers we need to merge touch events
         // from the same source + device + screen.
-        if (memento.source & AINPUT_SOURCE_CLASS_POINTER) {
+        if (isFromSource(memento.source, AINPUT_SOURCE_CLASS_POINTER)) {
             bool merged = false;
             for (size_t j = 0; j < other.mMotionMementos.size(); j++) {
                 MotionMemento& otherMemento = other.mMotionMementos[j];
@@ -390,22 +581,20 @@ void InputState::mergePointerStateTo(InputState& other) {
     }
 }
 
-int32_t InputState::getFallbackKey(int32_t originalKeyCode) {
-    ssize_t index = mFallbackKeys.indexOfKey(originalKeyCode);
-    return index >= 0 ? mFallbackKeys.valueAt(index) : -1;
+std::optional<int32_t> InputState::getFallbackKey(int32_t originalKeyCode) {
+    auto it = mFallbackKeys.find(originalKeyCode);
+    if (it == mFallbackKeys.end()) {
+        return {};
+    }
+    return it->second;
 }
 
 void InputState::setFallbackKey(int32_t originalKeyCode, int32_t fallbackKeyCode) {
-    ssize_t index = mFallbackKeys.indexOfKey(originalKeyCode);
-    if (index >= 0) {
-        mFallbackKeys.replaceValueAt(index, fallbackKeyCode);
-    } else {
-        mFallbackKeys.add(originalKeyCode, fallbackKeyCode);
-    }
+    mFallbackKeys.insert_or_assign(originalKeyCode, fallbackKeyCode);
 }
 
 void InputState::removeFallbackKey(int32_t originalKeyCode) {
-    mFallbackKeys.removeItem(originalKeyCode);
+    mFallbackKeys.erase(originalKeyCode);
 }
 
 bool InputState::shouldCancelKey(const KeyMemento& memento, const CancelationOptions& options) {
@@ -422,10 +611,10 @@ bool InputState::shouldCancelKey(const KeyMemento& memento, const CancelationOpt
     }
 
     switch (options.mode) {
-        case CancelationOptions::CANCEL_ALL_EVENTS:
-        case CancelationOptions::CANCEL_NON_POINTER_EVENTS:
+        case CancelationOptions::Mode::CANCEL_ALL_EVENTS:
+        case CancelationOptions::Mode::CANCEL_NON_POINTER_EVENTS:
             return true;
-        case CancelationOptions::CANCEL_FALLBACK_EVENTS:
+        case CancelationOptions::Mode::CANCEL_FALLBACK_EVENTS:
             return memento.flags & AKEY_EVENT_FLAG_FALLBACK;
         default:
             return false;
@@ -443,15 +632,29 @@ bool InputState::shouldCancelMotion(const MotionMemento& memento,
     }
 
     switch (options.mode) {
-        case CancelationOptions::CANCEL_ALL_EVENTS:
+        case CancelationOptions::Mode::CANCEL_ALL_EVENTS:
             return true;
-        case CancelationOptions::CANCEL_POINTER_EVENTS:
+        case CancelationOptions::Mode::CANCEL_POINTER_EVENTS:
             return memento.source & AINPUT_SOURCE_CLASS_POINTER;
-        case CancelationOptions::CANCEL_NON_POINTER_EVENTS:
+        case CancelationOptions::Mode::CANCEL_NON_POINTER_EVENTS:
             return !(memento.source & AINPUT_SOURCE_CLASS_POINTER);
+        case CancelationOptions::Mode::CANCEL_HOVER_EVENTS:
+            return memento.hovering;
         default:
             return false;
     }
+}
+
+std::ostream& operator<<(std::ostream& out, const InputState& state) {
+    if (!state.mMotionMementos.empty()) {
+        out << "mMotionMementos: ";
+        for (const InputState::MotionMemento& memento : state.mMotionMementos) {
+            out << "{deviceId=" << memento.deviceId
+                << ", hovering=" << std::to_string(memento.hovering)
+                << ", downTime=" << memento.downTime << "}, ";
+        }
+    }
+    return out;
 }
 
 } // namespace android::inputdispatcher

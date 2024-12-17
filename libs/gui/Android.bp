@@ -18,6 +18,32 @@ package {
     // to get the below license kinds:
     //   SPDX-license-identifier-Apache-2.0
     default_applicable_licenses: ["frameworks_native_license"],
+    default_team: "trendy_team_android_core_graphics_stack",
+}
+
+aconfig_declarations {
+    name: "libgui_flags",
+    package: "com.android.graphics.libgui.flags",
+    container: "system",
+    srcs: ["libgui_flags.aconfig"],
+}
+
+cc_aconfig_library {
+    name: "libguiflags",
+    host_supported: true,
+    vendor_available: true,
+    min_sdk_version: "29",
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.media.swcodec",
+        "test_com.android.media.swcodec",
+    ],
+    aconfig_declarations: "libgui_flags",
+}
+
+cc_aconfig_library {
+    name: "libguiflags_no_apex",
+    aconfig_declarations: "libgui_flags",
 }
 
 cc_library_headers {
@@ -36,6 +62,8 @@ cc_library_headers {
         "android.hardware.graphics.bufferqueue@1.0",
         "android.hardware.graphics.bufferqueue@2.0",
     ],
+    static_libs: ["libguiflags"],
+    export_static_lib_headers: ["libguiflags"],
     min_sdk_version: "29",
     // TODO(b/218719284) can media use be constrained to libgui_bufferqueue_static?
     apex_available: [
@@ -62,7 +90,23 @@ filegroup {
     name: "guiconstants_aidl",
     srcs: [
         "android/gui/DropInputMode.aidl",
+        "android/gui/StalledTransactionInfo.aidl",
         "android/**/TouchOcclusionMode.aidl",
+        "android/gui/TrustedOverlay.aidl",
+    ],
+}
+
+filegroup {
+    name: "android_gui_aidl",
+    srcs: [
+        "android/gui/DisplayInfo.aidl",
+        "android/gui/FocusRequest.aidl",
+        "android/gui/InputApplicationInfo.aidl",
+        "android/gui/IWindowInfosListener.aidl",
+        "android/gui/IWindowInfosPublisher.aidl",
+        "android/gui/IWindowInfosReportedListener.aidl",
+        "android/gui/WindowInfo.aidl",
+        "android/gui/WindowInfosUpdate.aidl",
     ],
 }
 
@@ -77,10 +121,13 @@ cc_library_static {
         "android/gui/FocusRequest.aidl",
         "android/gui/InputApplicationInfo.aidl",
         "android/gui/IWindowInfosListener.aidl",
+        "android/gui/IWindowInfosPublisher.aidl",
         "android/gui/IWindowInfosReportedListener.aidl",
+        "android/gui/WindowInfosUpdate.aidl",
         "android/gui/WindowInfo.aidl",
         "DisplayInfo.cpp",
         "WindowInfo.cpp",
+        "WindowInfosUpdate.cpp",
     ],
 
     shared_libs: [
@@ -115,17 +162,59 @@ cc_library_static {
 }
 
 filegroup {
+    name: "libgui_extra_aidl_files",
+    srcs: [
+        "android/gui/DisplayInfo.aidl",
+        "android/gui/FocusRequest.aidl",
+        "android/gui/InputApplicationInfo.aidl",
+        "android/gui/IWindowInfosListener.aidl",
+        "android/gui/IWindowInfosPublisher.aidl",
+        "android/gui/IWindowInfosReportedListener.aidl",
+        "android/gui/StalledTransactionInfo.aidl",
+        "android/gui/WindowInfo.aidl",
+        "android/gui/WindowInfosUpdate.aidl",
+    ],
+}
+
+filegroup {
+    name: "libgui_extra_unstructured_aidl_files",
+    srcs: [
+        "android/gui/DisplayInfo.aidl",
+        "android/gui/InputApplicationInfo.aidl",
+        "android/gui/WindowInfo.aidl",
+        "android/gui/WindowInfosUpdate.aidl",
+    ],
+}
+
+aidl_library {
+    name: "libgui_aidl_hdrs",
+    hdrs: [":libgui_extra_aidl_files"],
+}
+
+aidl_library {
+    name: "libgui_extra_unstructured_aidl_hdrs",
+    hdrs: [":libgui_extra_unstructured_aidl_files"],
+}
+
+aidl_library {
     name: "libgui_aidl",
     srcs: ["aidl/**/*.aidl"],
+    strip_import_prefix: "aidl",
+    deps: [
+        "libgui_aidl_hdrs",
+        "libgui_extra_unstructured_aidl_hdrs",
+    ],
+}
+
+filegroup {
+    name: "libgui_frame_event_aidl",
+    srcs: ["aidl/android/gui/FrameEvent.aidl"],
     path: "aidl/",
 }
 
 cc_library_static {
     name: "libgui_aidl_static",
     vendor_available: true,
-    srcs: [
-        ":libgui_aidl",
-    ],
 
     shared_libs: [
         "libbinder",
@@ -136,39 +225,27 @@ cc_library_static {
         "include",
     ],
 
+    include_dirs: [
+        "frameworks/native/include",
+    ],
+
     export_shared_lib_headers: [
         "libbinder",
     ],
 
     static_libs: [
         "libui-types",
+        "libgui_window_info_static",
     ],
 
     aidl: {
         export_aidl_headers: true,
+        libs: ["libgui_aidl"],
     },
 }
 
-cc_library_shared {
-    name: "libgui",
-    vendor_available: true,
-    vndk: {
-        enabled: true,
-        private: true,
-    },
-    double_loadable: true,
-
-    defaults: ["libgui_bufferqueue-defaults"],
-
-    static_libs: [
-        "libgui_aidl_static",
-        "libgui_window_info_static",
-    ],
-    export_static_lib_headers: [
-        "libgui_aidl_static",
-        "libgui_window_info_static",
-    ],
-
+filegroup {
+    name: "libgui-sources",
     srcs: [
         ":framework_native_aidl_binder",
         ":framework_native_aidl_gui",
@@ -178,22 +255,24 @@ cc_library_shared {
         "BitTube.cpp",
         "BLASTBufferQueue.cpp",
         "BufferItemConsumer.cpp",
+        "BufferReleaseChannel.cpp",
+        "Choreographer.cpp",
+        "CompositorTiming.cpp",
         "ConsumerBase.cpp",
         "CpuConsumer.cpp",
         "DebugEGLImageTracker.cpp",
         "DisplayEventDispatcher.cpp",
         "DisplayEventReceiver.cpp",
-        "FrameTimelineInfo.cpp",
+        "FenceMonitor.cpp",
         "GLConsumer.cpp",
         "IConsumerListener.cpp",
         "IGraphicBufferConsumer.cpp",
         "IGraphicBufferProducer.cpp",
         "IProducerListener.cpp",
         "ISurfaceComposer.cpp",
-        "ISurfaceComposerClient.cpp",
         "ITransactionCompletedListener.cpp",
-        "LayerDebugInfo.cpp",
         "LayerMetadata.cpp",
+        "LayerStatePermissions.cpp",
         "LayerState.cpp",
         "OccupancyTracker.cpp",
         "StreamSplitter.cpp",
@@ -202,7 +281,6 @@ cc_library_shared {
         "SurfaceControl.cpp",
         "SurfaceComposerClient.cpp",
         "SyncFeatures.cpp",
-        "TransactionTracing.cpp",
         "VsyncEventData.cpp",
         "view/Surface.cpp",
         "WindowInfosListenerReporter.cpp",
@@ -211,9 +289,38 @@ cc_library_shared {
         "bufferqueue/2.0/B2HProducerListener.cpp",
         "bufferqueue/2.0/H2BGraphicBufferProducer.cpp",
     ],
+}
 
+cc_defaults {
+    name: "libgui-defaults",
+    defaults: ["libgui_bufferqueue-defaults"],
+    srcs: [":libgui-sources"],
+    static_libs: [
+        "libgui_aidl_static",
+        "libgui_window_info_static",
+        "libguiflags",
+    ],
     shared_libs: [
         "libbinder",
+        "libGLESv2",
+    ],
+    export_static_lib_headers: [
+        "libguiflags",
+    ],
+}
+
+cc_library_shared {
+    name: "libgui",
+    vendor_available: true,
+    double_loadable: true,
+
+    defaults: [
+        "libgui-defaults",
+    ],
+
+    export_static_lib_headers: [
+        "libgui_aidl_static",
+        "libgui_window_info_static",
     ],
 
     export_shared_lib_headers: [
@@ -222,6 +329,7 @@ cc_library_shared {
 
     export_header_lib_headers: [
         "libgui_aidl_headers",
+        "jni_headers",
     ],
 
     aidl: {
@@ -229,9 +337,8 @@ cc_library_shared {
     },
 
     header_libs: [
-        "libdvr_headers",
+        "jni_headers",
         "libgui_aidl_headers",
-        "libpdx_headers",
     ],
 
     afdo: true,
@@ -239,6 +346,10 @@ cc_library_shared {
     lto: {
         thin: true,
     },
+
+    cflags: [
+        "-Wthread-safety",
+    ],
 }
 
 // Used by media codec services exclusively as a static lib for
@@ -259,10 +370,16 @@ cc_library_static {
     defaults: ["libgui_bufferqueue-defaults"],
 
     srcs: [
+        ":libgui_frame_event_aidl",
         ":inputconstants_aidl",
         ":libgui_bufferqueue_sources",
-        ":libgui_aidl",
     ],
+
+    aidl: {
+        include_dirs: [
+            "frameworks/native/libs/gui",
+        ],
+    },
 }
 
 filegroup {
@@ -276,6 +393,7 @@ filegroup {
         "BufferQueueProducer.cpp",
         "BufferQueueThreadState.cpp",
         "BufferSlot.cpp",
+        "FrameRateUtils.cpp",
         "FrameTimestamps.cpp",
         "GLConsumerUtils.cpp",
         "HdrMetadata.cpp",
@@ -292,6 +410,8 @@ filegroup {
 // Common build config shared by libgui and libgui_bufferqueue_static.
 cc_defaults {
     name: "libgui_bufferqueue-defaults",
+
+    defaults: ["android.hardware.graphics.common-ndk_shared"],
 
     cflags: [
         "-Wall",
@@ -321,19 +441,16 @@ cc_defaults {
         "android.hardware.graphics.bufferqueue@2.0",
         "android.hardware.graphics.common@1.1",
         "android.hardware.graphics.common@1.2",
-        "android.hardware.graphics.common-V4-ndk",
         "android.hidl.token@1.0-utils",
         "libbase",
         "libcutils",
         "libEGL",
-        "libGLESv2",
         "libhidlbase",
         "liblog",
         "libnativewindow",
         "libsync",
         "libui",
         "libutils",
-        "libvndksupport",
     ],
 
     static_libs: [
@@ -378,9 +495,11 @@ cc_library_static {
     static_libs: [
         "libgtest",
         "libgmock",
+        "libguiflags",
     ],
 
     srcs: [
+        ":libgui_frame_event_aidl",
         "mock/GraphicBufferConsumer.cpp",
         "mock/GraphicBufferProducer.cpp",
     ],

@@ -17,10 +17,17 @@
 #define LOG_TAG "ITransactionCompletedListener"
 //#define LOG_NDEBUG 0
 
+#include <cstdint>
+#include <optional>
+
 #include <gui/ISurfaceComposer.h>
 #include <gui/ITransactionCompletedListener.h>
 #include <gui/LayerState.h>
 #include <private/gui/ParcelUtils.h>
+
+#include <com_android_graphics_libgui_flags.h>
+
+using namespace com::android::graphics::libgui;
 
 namespace android {
 
@@ -30,7 +37,8 @@ enum class Tag : uint32_t {
     ON_TRANSACTION_COMPLETED = IBinder::FIRST_CALL_TRANSACTION,
     ON_RELEASE_BUFFER,
     ON_TRANSACTION_QUEUE_STALLED,
-    LAST = ON_RELEASE_BUFFER,
+    ON_TRUSTED_PRESENTATION_CHANGED,
+    LAST = ON_TRUSTED_PRESENTATION_CHANGED,
 };
 
 } // Anonymous namespace
@@ -38,6 +46,11 @@ enum class Tag : uint32_t {
 status_t FrameEventHistoryStats::writeToParcel(Parcel* output) const {
     status_t err = output->writeUint64(frameNumber);
     if (err != NO_ERROR) return err;
+
+    if (flags::frametimestamps_previousrelease()) {
+        err = output->writeUint64(previousFrameNumber);
+        if (err != NO_ERROR) return err;
+    }
 
     if (gpuCompositionDoneFence) {
         err = output->writeBool(true);
@@ -69,6 +82,11 @@ status_t FrameEventHistoryStats::readFromParcel(const Parcel* input) {
     status_t err = input->readUint64(&frameNumber);
     if (err != NO_ERROR) return err;
 
+    if (flags::frametimestamps_previousrelease()) {
+        err = input->readUint64(&previousFrameNumber);
+        if (err != NO_ERROR) return err;
+    }
+
     bool hasFence = false;
     err = input->readBool(&hasFence);
     if (err != NO_ERROR) return err;
@@ -95,21 +113,6 @@ status_t FrameEventHistoryStats::readFromParcel(const Parcel* input) {
     return err;
 }
 
-JankData::JankData()
-      : frameVsyncId(FrameTimelineInfo::INVALID_VSYNC_ID), jankType(JankType::None) {}
-
-status_t JankData::writeToParcel(Parcel* output) const {
-    SAFE_PARCEL(output->writeInt64, frameVsyncId);
-    SAFE_PARCEL(output->writeInt32, jankType);
-    return NO_ERROR;
-}
-
-status_t JankData::readFromParcel(const Parcel* input) {
-    SAFE_PARCEL(input->readInt64, &frameVsyncId);
-    SAFE_PARCEL(input->readInt32, &jankType);
-    return NO_ERROR;
-}
-
 status_t SurfaceStats::writeToParcel(Parcel* output) const {
     SAFE_PARCEL(output->writeStrongBinder, surfaceControl);
     if (const auto* acquireFence = std::get_if<sp<Fence>>(&acquireTimeOrFence)) {
@@ -126,13 +129,14 @@ status_t SurfaceStats::writeToParcel(Parcel* output) const {
     } else {
         SAFE_PARCEL(output->writeBool, false);
     }
-    SAFE_PARCEL(output->writeUint32, transformHint);
+
+    SAFE_PARCEL(output->writeBool, transformHint.has_value());
+    if (transformHint.has_value()) {
+        output->writeUint32(transformHint.value());
+    }
+
     SAFE_PARCEL(output->writeUint32, currentMaxAcquiredBufferCount);
     SAFE_PARCEL(output->writeParcelable, eventStats);
-    SAFE_PARCEL(output->writeInt32, static_cast<int32_t>(jankData.size()));
-    for (const auto& data : jankData) {
-        SAFE_PARCEL(output->writeParcelable, data);
-    }
     SAFE_PARCEL(output->writeParcelable, previousReleaseCallbackId);
     return NO_ERROR;
 }
@@ -156,17 +160,19 @@ status_t SurfaceStats::readFromParcel(const Parcel* input) {
         previousReleaseFence = new Fence();
         SAFE_PARCEL(input->read, *previousReleaseFence);
     }
-    SAFE_PARCEL(input->readUint32, &transformHint);
+    bool hasTransformHint = false;
+    SAFE_PARCEL(input->readBool, &hasTransformHint);
+    if (hasTransformHint) {
+        uint32_t tempTransformHint;
+        SAFE_PARCEL(input->readUint32, &tempTransformHint);
+        transformHint = std::make_optional(tempTransformHint);
+    } else {
+        transformHint = std::nullopt;
+    }
+
     SAFE_PARCEL(input->readUint32, &currentMaxAcquiredBufferCount);
     SAFE_PARCEL(input->readParcelable, &eventStats);
 
-    int32_t jankData_size = 0;
-    SAFE_PARCEL_READ_SIZE(input->readInt32, &jankData_size, input->dataSize());
-    for (int i = 0; i < jankData_size; i++) {
-        JankData data;
-        SAFE_PARCEL(input->readParcelable, &data);
-        jankData.push_back(data);
-    }
     SAFE_PARCEL(input->readParcelable, &previousReleaseCallbackId);
     return NO_ERROR;
 }
@@ -273,15 +279,22 @@ public:
 
     void onReleaseBuffer(ReleaseCallbackId callbackId, sp<Fence> releaseFence,
                          uint32_t currentMaxAcquiredBufferCount) override {
-        callRemoteAsync<decltype(
-                &ITransactionCompletedListener::onReleaseBuffer)>(Tag::ON_RELEASE_BUFFER,
-                                                                  callbackId, releaseFence,
-                                                                  currentMaxAcquiredBufferCount);
+        callRemoteAsync<decltype(&ITransactionCompletedListener::
+                                         onReleaseBuffer)>(Tag::ON_RELEASE_BUFFER, callbackId,
+                                                           releaseFence,
+                                                           currentMaxAcquiredBufferCount);
     }
 
-    void onTransactionQueueStalled() override {
-        callRemoteAsync<decltype(&ITransactionCompletedListener::onTransactionQueueStalled)>(
-            Tag::ON_TRANSACTION_QUEUE_STALLED);
+    void onTransactionQueueStalled(const String8& reason) override {
+        callRemoteAsync<
+                decltype(&ITransactionCompletedListener::
+                                 onTransactionQueueStalled)>(Tag::ON_TRANSACTION_QUEUE_STALLED,
+                                                             reason);
+    }
+
+    void onTrustedPresentationChanged(int id, bool inTrustedPresentationState) override {
+        callRemoteAsync<decltype(&ITransactionCompletedListener::onTrustedPresentationChanged)>(
+                Tag::ON_TRUSTED_PRESENTATION_CHANGED, id, inTrustedPresentationState);
     }
 };
 
@@ -306,6 +319,9 @@ status_t BnTransactionCompletedListener::onTransact(uint32_t code, const Parcel&
         case Tag::ON_TRANSACTION_QUEUE_STALLED:
             return callLocalAsync(data, reply,
                                   &ITransactionCompletedListener::onTransactionQueueStalled);
+        case Tag::ON_TRUSTED_PRESENTATION_CHANGED:
+            return callLocalAsync(data, reply,
+                                  &ITransactionCompletedListener::onTrustedPresentationChanged);
     }
 }
 

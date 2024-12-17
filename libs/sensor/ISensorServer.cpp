@@ -22,12 +22,12 @@
 #include <cutils/native_handle.h>
 #include <utils/Errors.h>
 #include <utils/RefBase.h>
-#include <utils/Vector.h>
 #include <utils/Timers.h>
+#include <utils/Vector.h>
 
-#include <binder/Parcel.h>
 #include <binder/IInterface.h>
 #include <binder/IResultReceiver.h>
+#include <binder/Parcel.h>
 
 #include <sensor/Sensor.h>
 #include <sensor/ISensorEventConnection.h>
@@ -42,6 +42,9 @@ enum {
     GET_DYNAMIC_SENSOR_LIST,
     CREATE_SENSOR_DIRECT_CONNECTION,
     SET_OPERATION_PARAMETER,
+    GET_RUNTIME_SENSOR_LIST,
+    ENABLE_REPLAY_DATA_INJECTION,
+    ENABLE_HAL_BYPASS_REPLAY_DATA_INJECTION,
 };
 
 class BpSensorServer : public BpInterface<ISensorServer>
@@ -63,10 +66,22 @@ public:
         Sensor s;
         Vector<Sensor> v;
         uint32_t n = reply.readUint32();
+        // The size of the n Sensor elements on the wire is what we really want, but
+        // this is better than nothing.
+        if (n > reply.dataAvail()) {
+            ALOGE("Failed to get a reasonable size of the sensor list. This is likely a "
+                  "malformed reply parcel. Number of elements: %d, data available in reply: %zu",
+                  n, reply.dataAvail());
+            return v;
+        }
         v.setCapacity(n);
         while (n) {
             n--;
-            reply.read(s);
+            if(reply.read(s) != OK) {
+                ALOGE("Failed to read reply from getSensorList");
+                v.clear();
+                break;
+            }
             v.add(s);
         }
         return v;
@@ -81,6 +96,45 @@ public:
         Sensor s;
         Vector<Sensor> v;
         uint32_t n = reply.readUint32();
+        // The size of the n Sensor elements on the wire is what we really want, but
+        // this is better than nothing.
+        if (n > reply.dataAvail()) {
+            ALOGE("Failed to get a reasonable size of the sensor list. This is likely a "
+                  "malformed reply parcel. Number of elements: %d, data available in reply: %zu",
+                  n, reply.dataAvail());
+            return v;
+        }
+        v.setCapacity(n);
+        while (n) {
+            n--;
+            if(reply.read(s) != OK) {
+                ALOGE("Failed to read reply from getDynamicSensorList");
+                v.clear();
+                break;
+            }
+            v.add(s);
+        }
+        return v;
+    }
+
+    virtual Vector<Sensor> getRuntimeSensorList(const String16& opPackageName, int deviceId)
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(ISensorServer::getInterfaceDescriptor());
+        data.writeString16(opPackageName);
+        data.writeInt32(deviceId);
+        remote()->transact(GET_RUNTIME_SENSOR_LIST, data, &reply);
+        Sensor s;
+        Vector<Sensor> v;
+        uint32_t n = reply.readUint32();
+        // The size of the n Sensor elements on the wire is what we really want, but
+        // this is better than nothing.
+        if (n > reply.dataAvail()) {
+            ALOGE("Failed to get a reasonable size of the sensor list. This is likely a "
+                  "malformed reply parcel. Number of elements: %d, data available in reply: %zu",
+                  n, reply.dataAvail());
+            return v;
+        }
         v.setCapacity(n);
         while (n) {
             n--;
@@ -110,11 +164,27 @@ public:
         return reply.readInt32();
     }
 
+    virtual int isReplayDataInjectionEnabled() {
+        Parcel data, reply;
+        data.writeInterfaceToken(ISensorServer::getInterfaceDescriptor());
+        remote()->transact(ENABLE_REPLAY_DATA_INJECTION, data, &reply);
+        return reply.readInt32();
+    }
+
+    virtual int isHalBypassReplayDataInjectionEnabled() {
+        Parcel data, reply;
+        data.writeInterfaceToken(ISensorServer::getInterfaceDescriptor());
+        remote()->transact(ENABLE_HAL_BYPASS_REPLAY_DATA_INJECTION, data, &reply);
+        return reply.readInt32();
+    }
+
     virtual sp<ISensorEventConnection> createSensorDirectConnection(const String16& opPackageName,
-            uint32_t size, int32_t type, int32_t format, const native_handle_t *resource) {
+            int deviceId, uint32_t size, int32_t type, int32_t format,
+            const native_handle_t *resource) {
         Parcel data, reply;
         data.writeInterfaceToken(ISensorServer::getInterfaceDescriptor());
         data.writeString16(opPackageName);
+        data.writeInt32(deviceId);
         data.writeUint32(size);
         data.writeInt32(type);
         data.writeInt32(format);
@@ -183,6 +253,18 @@ status_t BnSensorServer::onTransact(
             reply->writeInt32(static_cast<int32_t>(ret));
             return NO_ERROR;
         }
+        case ENABLE_REPLAY_DATA_INJECTION: {
+            CHECK_INTERFACE(ISensorServer, data, reply);
+            int32_t ret = isReplayDataInjectionEnabled();
+            reply->writeInt32(static_cast<int32_t>(ret));
+            return NO_ERROR;
+        }
+        case ENABLE_HAL_BYPASS_REPLAY_DATA_INJECTION: {
+            CHECK_INTERFACE(ISensorServer, data, reply);
+            int32_t ret = isHalBypassReplayDataInjectionEnabled();
+            reply->writeInt32(static_cast<int32_t>(ret));
+            return NO_ERROR;
+        }
         case GET_DYNAMIC_SENSOR_LIST: {
             CHECK_INTERFACE(ISensorServer, data, reply);
             const String16& opPackageName = data.readString16();
@@ -194,9 +276,22 @@ status_t BnSensorServer::onTransact(
             }
             return NO_ERROR;
         }
+        case GET_RUNTIME_SENSOR_LIST: {
+            CHECK_INTERFACE(ISensorServer, data, reply);
+            const String16& opPackageName = data.readString16();
+            const int deviceId = data.readInt32();
+            Vector<Sensor> v(getRuntimeSensorList(opPackageName, deviceId));
+            size_t n = v.size();
+            reply->writeUint32(static_cast<uint32_t>(n));
+            for (size_t i = 0; i < n; i++) {
+                reply->write(v[i]);
+            }
+            return NO_ERROR;
+        }
         case CREATE_SENSOR_DIRECT_CONNECTION: {
             CHECK_INTERFACE(ISensorServer, data, reply);
             const String16& opPackageName = data.readString16();
+            const int deviceId = data.readInt32();
             uint32_t size = data.readUint32();
             int32_t type = data.readInt32();
             int32_t format = data.readInt32();
@@ -205,9 +300,10 @@ status_t BnSensorServer::onTransact(
             if (resource == nullptr) {
                 return BAD_VALUE;
             }
-            sp<ISensorEventConnection> ch =
-                    createSensorDirectConnection(opPackageName, size, type, format, resource);
-            native_handle_close(resource);
+            native_handle_set_fdsan_tag(resource);
+            sp<ISensorEventConnection> ch = createSensorDirectConnection(
+                    opPackageName, deviceId, size, type, format, resource);
+            native_handle_close_with_tag(resource);
             native_handle_delete(resource);
             reply->writeStrongBinder(IInterface::asBinder(ch));
             return NO_ERROR;

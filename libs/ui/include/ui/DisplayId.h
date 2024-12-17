@@ -17,8 +17,11 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
+#include <ostream>
 #include <string>
+
+#include <ftl/hash.h>
+#include <ftl/optional.h>
 
 namespace android {
 
@@ -35,6 +38,9 @@ struct DisplayId {
     DisplayId() = default;
     constexpr DisplayId(const DisplayId&) = default;
     DisplayId& operator=(const DisplayId&) = default;
+
+    constexpr bool isVirtual() const { return value & FLAG_VIRTUAL; }
+    constexpr bool isStable() const { return value & FLAG_STABLE; }
 
     uint64_t value;
 
@@ -66,13 +72,18 @@ inline std::string to_string(DisplayId displayId) {
     return std::to_string(displayId.value);
 }
 
+// For tests.
+inline std::ostream& operator<<(std::ostream& stream, DisplayId displayId) {
+    return stream << "DisplayId{" << displayId.value << '}';
+}
+
 // DisplayId of a physical display, such as the internal display or externally connected display.
 struct PhysicalDisplayId : DisplayId {
-    static constexpr std::optional<PhysicalDisplayId> tryCast(DisplayId id) {
-        if (id.value & FLAG_VIRTUAL) {
+    static constexpr ftl::Optional<PhysicalDisplayId> tryCast(DisplayId id) {
+        if (id.isVirtual()) {
             return std::nullopt;
         }
-        return {PhysicalDisplayId(id)};
+        return PhysicalDisplayId(id);
     }
 
     // Returns a stable ID based on EDID information.
@@ -110,25 +121,23 @@ struct VirtualDisplayId : DisplayId {
     static constexpr uint64_t FLAG_GPU = 1ULL << 61;
 
     static constexpr std::optional<VirtualDisplayId> tryCast(DisplayId id) {
-        if (id.value & FLAG_VIRTUAL) {
-            return {VirtualDisplayId(id)};
+        if (id.isVirtual()) {
+            return VirtualDisplayId(id);
         }
         return std::nullopt;
     }
 
 protected:
-    constexpr VirtualDisplayId(uint64_t flags, BaseId baseId)
-          : DisplayId(DisplayId::FLAG_VIRTUAL | flags | baseId) {}
-
+    explicit constexpr VirtualDisplayId(uint64_t value) : DisplayId(FLAG_VIRTUAL | value) {}
     explicit constexpr VirtualDisplayId(DisplayId other) : DisplayId(other) {}
 };
 
 struct HalVirtualDisplayId : VirtualDisplayId {
-    explicit constexpr HalVirtualDisplayId(BaseId baseId) : VirtualDisplayId(0, baseId) {}
+    explicit constexpr HalVirtualDisplayId(BaseId baseId) : VirtualDisplayId(baseId) {}
 
     static constexpr std::optional<HalVirtualDisplayId> tryCast(DisplayId id) {
-        if ((id.value & FLAG_VIRTUAL) && !(id.value & VirtualDisplayId::FLAG_GPU)) {
-            return {HalVirtualDisplayId(id)};
+        if (id.isVirtual() && !(id.value & FLAG_GPU)) {
+            return HalVirtualDisplayId(id);
         }
         return std::nullopt;
     }
@@ -138,17 +147,27 @@ private:
 };
 
 struct GpuVirtualDisplayId : VirtualDisplayId {
-    explicit constexpr GpuVirtualDisplayId(BaseId baseId)
-          : VirtualDisplayId(VirtualDisplayId::FLAG_GPU, baseId) {}
+    explicit constexpr GpuVirtualDisplayId(BaseId baseId) : VirtualDisplayId(FLAG_GPU | baseId) {}
+
+    static constexpr std::optional<GpuVirtualDisplayId> fromUniqueId(const std::string& uniqueId) {
+        if (const auto hashOpt = ftl::stable_hash(uniqueId)) {
+            return GpuVirtualDisplayId(HashTag{}, *hashOpt);
+        }
+        return {};
+    }
 
     static constexpr std::optional<GpuVirtualDisplayId> tryCast(DisplayId id) {
-        if ((id.value & FLAG_VIRTUAL) && (id.value & VirtualDisplayId::FLAG_GPU)) {
-            return {GpuVirtualDisplayId(id)};
+        if (id.isVirtual() && (id.value & FLAG_GPU)) {
+            return GpuVirtualDisplayId(id);
         }
         return std::nullopt;
     }
 
 private:
+    struct HashTag {}; // Disambiguate with BaseId constructor.
+    constexpr GpuVirtualDisplayId(HashTag, uint64_t hash)
+          : VirtualDisplayId(FLAG_STABLE | FLAG_GPU | hash) {}
+
     explicit constexpr GpuVirtualDisplayId(DisplayId other) : VirtualDisplayId(other) {}
 };
 
@@ -162,7 +181,7 @@ struct HalDisplayId : DisplayId {
         if (GpuVirtualDisplayId::tryCast(id)) {
             return std::nullopt;
         }
-        return {HalDisplayId(id)};
+        return HalDisplayId(id);
     }
 
 private:

@@ -14,24 +14,24 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUT_INPUTDISPATCHER_ENTRY_H
-#define _UI_INPUT_INPUTDISPATCHER_ENTRY_H
+#pragma once
 
 #include "InjectionState.h"
-#include "InputTarget.h"
+#include "InputTargetFlags.h"
+#include "trace/EventTrackerInterface.h"
 
 #include <gui/InputApplication.h>
 #include <input/Input.h>
 #include <stdint.h>
 #include <utils/Timers.h>
 #include <functional>
+#include <ostream>
 #include <string>
 
 namespace android::inputdispatcher {
 
 struct EventEntry {
     enum class Type {
-        CONFIGURATION_CHANGED,
         DEVICE_RESET,
         FOCUS,
         KEY,
@@ -48,9 +48,9 @@ struct EventEntry {
     Type type;
     nsecs_t eventTime;
     uint32_t policyFlags;
-    InjectionState* injectionState;
+    std::shared_ptr<InjectionState> injectionState;
 
-    bool dispatchInProgress; // initially false, set to true while dispatching
+    mutable bool dispatchInProgress; // initially false, set to true while dispatching
 
     /**
      * Injected keys are events from an external (probably untrusted) application
@@ -72,17 +72,9 @@ struct EventEntry {
     virtual std::string getDescription() const = 0;
 
     EventEntry(int32_t id, Type type, nsecs_t eventTime, uint32_t policyFlags);
-    virtual ~EventEntry();
-
-protected:
-    void releaseInjectionState();
-};
-
-struct ConfigurationChangedEntry : EventEntry {
-    explicit ConfigurationChangedEntry(int32_t id, nsecs_t eventTime);
-    std::string getDescription() const override;
-
-    ~ConfigurationChangedEntry() override;
+    EventEntry(const EventEntry&) = delete;
+    EventEntry& operator=(const EventEntry&) = delete;
+    virtual ~EventEntry() = default;
 };
 
 struct DeviceResetEntry : EventEntry {
@@ -90,8 +82,6 @@ struct DeviceResetEntry : EventEntry {
 
     DeviceResetEntry(int32_t id, nsecs_t eventTime, int32_t deviceId);
     std::string getDescription() const override;
-
-    ~DeviceResetEntry() override;
 };
 
 struct FocusEntry : EventEntry {
@@ -102,8 +92,6 @@ struct FocusEntry : EventEntry {
     FocusEntry(int32_t id, nsecs_t eventTime, sp<IBinder> connectionToken, bool hasFocus,
                const std::string& reason);
     std::string getDescription() const override;
-
-    ~FocusEntry() override;
 };
 
 struct PointerCaptureChangedEntry : EventEntry {
@@ -111,8 +99,6 @@ struct PointerCaptureChangedEntry : EventEntry {
 
     PointerCaptureChangedEntry(int32_t id, nsecs_t eventTime, const PointerCaptureRequest&);
     std::string getDescription() const override;
-
-    ~PointerCaptureChangedEntry() override;
 };
 
 struct DragEntry : EventEntry {
@@ -123,46 +109,47 @@ struct DragEntry : EventEntry {
     DragEntry(int32_t id, nsecs_t eventTime, sp<IBinder> connectionToken, bool isExiting, float x,
               float y);
     std::string getDescription() const override;
-
-    ~DragEntry() override;
 };
 
 struct KeyEntry : EventEntry {
     int32_t deviceId;
     uint32_t source;
-    int32_t displayId;
+    ui::LogicalDisplayId displayId;
     int32_t action;
-    int32_t flags;
     int32_t keyCode;
     int32_t scanCode;
     int32_t metaState;
-    int32_t repeatCount;
     nsecs_t downTime;
+    std::unique_ptr<trace::EventTrackerInterface> traceTracker;
 
     bool syntheticRepeat; // set to true for synthetic key repeats
 
-    enum InterceptKeyResult {
-        INTERCEPT_KEY_RESULT_UNKNOWN,
-        INTERCEPT_KEY_RESULT_SKIP,
-        INTERCEPT_KEY_RESULT_CONTINUE,
-        INTERCEPT_KEY_RESULT_TRY_AGAIN_LATER,
+    enum class InterceptKeyResult {
+        UNKNOWN,
+        SKIP,
+        CONTINUE,
+        TRY_AGAIN_LATER,
     };
-    InterceptKeyResult interceptKeyResult; // set based on the interception result
-    nsecs_t interceptKeyWakeupTime;        // used with INTERCEPT_KEY_RESULT_TRY_AGAIN_LATER
+    // These are special fields that may need to be modified while the event is being dispatched.
+    mutable InterceptKeyResult interceptKeyResult; // set based on the interception result
+    mutable nsecs_t interceptKeyWakeupTime;        // used with INTERCEPT_KEY_RESULT_TRY_AGAIN_LATER
+    mutable int32_t flags;
+    // TODO(b/328618922): Refactor key repeat generation to make repeatCount non-mutable.
+    mutable int32_t repeatCount;
 
-    KeyEntry(int32_t id, nsecs_t eventTime, int32_t deviceId, uint32_t source, int32_t displayId,
+    KeyEntry(int32_t id, std::shared_ptr<InjectionState> injectionState, nsecs_t eventTime,
+             int32_t deviceId, uint32_t source, ui::LogicalDisplayId displayId,
              uint32_t policyFlags, int32_t action, int32_t flags, int32_t keyCode, int32_t scanCode,
              int32_t metaState, int32_t repeatCount, nsecs_t downTime);
     std::string getDescription() const override;
-    void recycle();
-
-    ~KeyEntry() override;
 };
+
+std::ostream& operator<<(std::ostream& out, const KeyEntry& motionEntry);
 
 struct MotionEntry : EventEntry {
     int32_t deviceId;
     uint32_t source;
-    int32_t displayId;
+    ui::LogicalDisplayId displayId;
     int32_t action;
     int32_t actionButton;
     int32_t flags;
@@ -175,20 +162,24 @@ struct MotionEntry : EventEntry {
     float xCursorPosition;
     float yCursorPosition;
     nsecs_t downTime;
-    uint32_t pointerCount;
-    PointerProperties pointerProperties[MAX_POINTERS];
-    PointerCoords pointerCoords[MAX_POINTERS];
+    std::vector<PointerProperties> pointerProperties;
+    std::vector<PointerCoords> pointerCoords;
+    std::unique_ptr<trace::EventTrackerInterface> traceTracker;
 
-    MotionEntry(int32_t id, nsecs_t eventTime, int32_t deviceId, uint32_t source, int32_t displayId,
+    size_t getPointerCount() const { return pointerProperties.size(); }
+
+    MotionEntry(int32_t id, std::shared_ptr<InjectionState> injectionState, nsecs_t eventTime,
+                int32_t deviceId, uint32_t source, ui::LogicalDisplayId displayId,
                 uint32_t policyFlags, int32_t action, int32_t actionButton, int32_t flags,
                 int32_t metaState, int32_t buttonState, MotionClassification classification,
                 int32_t edgeFlags, float xPrecision, float yPrecision, float xCursorPosition,
-                float yCursorPosition, nsecs_t downTime, uint32_t pointerCount,
-                const PointerProperties* pointerProperties, const PointerCoords* pointerCoords);
+                float yCursorPosition, nsecs_t downTime,
+                const std::vector<PointerProperties>& pointerProperties,
+                const std::vector<PointerCoords>& pointerCoords);
     std::string getDescription() const override;
-
-    ~MotionEntry() override;
 };
+
+std::ostream& operator<<(std::ostream& out, const MotionEntry& motionEntry);
 
 struct SensorEntry : EventEntry {
     int32_t deviceId;
@@ -205,25 +196,22 @@ struct SensorEntry : EventEntry {
                 InputDeviceSensorAccuracy accuracy, bool accuracyChanged,
                 std::vector<float> values);
     std::string getDescription() const override;
-
-    ~SensorEntry() override;
 };
 
 struct TouchModeEntry : EventEntry {
     bool inTouchMode;
+    ui::LogicalDisplayId displayId;
 
-    TouchModeEntry(int32_t id, nsecs_t eventTime, bool inTouchMode);
+    TouchModeEntry(int32_t id, nsecs_t eventTime, bool inTouchMode, ui::LogicalDisplayId displayId);
     std::string getDescription() const override;
-
-    ~TouchModeEntry() override;
 };
 
 // Tracks the progress of dispatching a particular event to a particular connection.
 struct DispatchEntry {
     const uint32_t seq; // unique sequence number, never 0
 
-    std::shared_ptr<EventEntry> eventEntry; // the event to dispatch
-    int32_t targetFlags;
+    std::shared_ptr<const EventEntry> eventEntry; // the event to dispatch
+    const ftl::Flags<InputTargetFlags> targetFlags;
     ui::Transform transform;
     ui::Transform rawTransform;
     float globalScaleFactor;
@@ -233,18 +221,29 @@ struct DispatchEntry {
     // An ANR will be triggered if a response for this entry is not received by timeoutTime
     nsecs_t timeoutTime;
 
-    // Set to the resolved ID, action and flags when the event is enqueued.
-    int32_t resolvedEventId;
-    int32_t resolvedAction;
     int32_t resolvedFlags;
 
-    DispatchEntry(std::shared_ptr<EventEntry> eventEntry, int32_t targetFlags,
-                  const ui::Transform& transform, const ui::Transform& rawTransform,
-                  float globalScaleFactor);
+    // Information about the dispatch window used for tracing. We avoid holding a window handle
+    // here because information in a window handle may be dynamically updated within the lifespan
+    // of this dispatch entry.
+    gui::Uid targetUid;
+    int64_t vsyncId;
+    // The window that this event is targeting. The only case when this windowId is not populated
+    // is when dispatching an event to a global monitor.
+    std::optional<int32_t> windowId;
 
-    inline bool hasForegroundTarget() const { return targetFlags & InputTarget::FLAG_FOREGROUND; }
+    DispatchEntry(std::shared_ptr<const EventEntry> eventEntry,
+                  ftl::Flags<InputTargetFlags> targetFlags, const ui::Transform& transform,
+                  const ui::Transform& rawTransform, float globalScaleFactor, gui::Uid targetUid,
+                  int64_t vsyncId, std::optional<int32_t> windowId);
+    DispatchEntry(const DispatchEntry&) = delete;
+    DispatchEntry& operator=(const DispatchEntry&) = delete;
 
-    inline bool isSplit() const { return targetFlags & InputTarget::FLAG_SPLIT; }
+    inline bool hasForegroundTarget() const {
+        return targetFlags.test(InputTargetFlags::FOREGROUND);
+    }
+
+    inline bool isSplit() const { return targetFlags.test(InputTargetFlags::SPLIT); }
 
 private:
     static volatile int32_t sNextSeqAtomic;
@@ -252,10 +251,10 @@ private:
     static uint32_t nextSeq();
 };
 
+std::ostream& operator<<(std::ostream& out, const DispatchEntry& entry);
+
 VerifiedKeyEvent verifiedKeyEventFromKeyEntry(const KeyEntry& entry);
 VerifiedMotionEvent verifiedMotionEventFromMotionEntry(const MotionEntry& entry,
                                                        const ui::Transform& rawTransform);
 
 } // namespace android::inputdispatcher
-
-#endif // _UI_INPUT_INPUTDISPATCHER_ENTRY_H

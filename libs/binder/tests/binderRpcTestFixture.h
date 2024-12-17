@@ -35,6 +35,12 @@ public:
     struct SessionInfo {
         sp<RpcSession> session;
         sp<IBinder> root;
+// Trusty defines its own socket APIs in trusty_ipc.h but doesn't include
+// sockaddr types.
+#ifndef __TRUSTY__
+        sockaddr_storage addr;
+        socklen_t addrLen;
+#endif
     };
 
     // client session objects associated with other process
@@ -64,6 +70,22 @@ struct BinderRpcTestProcessSession {
     // whether session should be invalidated by end of run
     bool expectAlreadyShutdown = false;
 
+    // TODO(b/271830568): fix this in binderRpcTest, we always use the first session to cause the
+    // remote process to shutdown. Normally, when we shutdown, the default in the destructor is to
+    // check that there are no leaks and shutdown. However, when there are incoming threadpools,
+    // there will be a few extra binder threads there, so we can't shutdown the server. We should
+    // consider an alternative way of doing the test so that we don't need this, some ideas, such as
+    // program in understanding of incoming threadpool into the destructor so that (e.g.
+    // intelligently wait for sessions to shutdown now that they will do this)
+    void forceShutdown() {
+        if (auto status = rootIface->scheduleShutdown(); !status.isOk()) {
+            EXPECT_EQ(DEAD_OBJECT, status.transactionError()) << status;
+        }
+        EXPECT_TRUE(proc->sessions.at(0).session->shutdownAndWait(true));
+        expectAlreadyShutdown = true;
+    }
+
+    BinderRpcTestProcessSession(std::unique_ptr<ProcessSession> proc) : proc(std::move(proc)){};
     BinderRpcTestProcessSession(BinderRpcTestProcessSession&&) = default;
     ~BinderRpcTestProcessSession() {
         if (!expectAlreadyShutdown) {
@@ -90,15 +112,23 @@ struct BinderRpcTestProcessSession {
     }
 };
 
-class BinderRpc : public ::testing::TestWithParam<
-                          std::tuple<SocketType, RpcSecurity, uint32_t, uint32_t, bool, bool>> {
+struct BinderRpcParam {
+    SocketType type;
+    RpcSecurity security;
+    uint32_t clientVersion;
+    uint32_t serverVersion;
+    bool singleThreaded;
+    bool noKernel;
+};
+class BinderRpc : public ::testing::TestWithParam<BinderRpcParam> {
 public:
-    SocketType socketType() const { return std::get<0>(GetParam()); }
-    RpcSecurity rpcSecurity() const { return std::get<1>(GetParam()); }
-    uint32_t clientVersion() const { return std::get<2>(GetParam()); }
-    uint32_t serverVersion() const { return std::get<3>(GetParam()); }
-    bool serverSingleThreaded() const { return std::get<4>(GetParam()); }
-    bool noKernel() const { return std::get<5>(GetParam()); }
+    // TODO: avoid unnecessary layer of indirection
+    SocketType socketType() const { return GetParam().type; }
+    RpcSecurity rpcSecurity() const { return GetParam().security; }
+    uint32_t clientVersion() const { return GetParam().clientVersion; }
+    uint32_t serverVersion() const { return GetParam().serverVersion; }
+    bool serverSingleThreaded() const { return GetParam().singleThreaded; }
+    bool noKernel() const { return GetParam().noKernel; }
 
     bool clientOrServerSingleThreaded() const {
         return !kEnableRpcThreads || serverSingleThreaded();
@@ -106,6 +136,10 @@ public:
 
     // Whether the test params support sending FDs in parcels.
     bool supportsFdTransport() const {
+        if (socketType() == SocketType::TIPC) {
+            // Trusty does not support file descriptors yet
+            return false;
+        }
         return clientVersion() >= 1 && serverVersion() >= 1 && rpcSecurity() != RpcSecurity::TLS &&
                 (socketType() == SocketType::PRECONNECTED || socketType() == SocketType::UNIX ||
                  socketType() == SocketType::UNIX_BOOTSTRAP ||
@@ -119,9 +153,7 @@ public:
     }
 
     BinderRpcTestProcessSession createRpcTestSocketServerProcess(const BinderRpcOptions& options) {
-        BinderRpcTestProcessSession ret{
-                .proc = createRpcTestSocketServerProcessEtc(options),
-        };
+        BinderRpcTestProcessSession ret(createRpcTestSocketServerProcessEtc(options));
 
         ret.rootBinder = ret.proc->sessions.empty() ? nullptr : ret.proc->sessions.at(0).root;
         ret.rootIface = interface_cast<IBinderRpcTest>(ret.rootBinder);
@@ -129,9 +161,27 @@ public:
         return ret;
     }
 
-    static std::string PrintParamInfo(const testing::TestParamInfo<ParamType>& info);
+    static std::string PrintParamInfo(const testing::TestParamInfo<ParamType>& info) {
+        auto ret = PrintToString(info.param.type) + "_" +
+                newFactory(info.param.security)->toCString() + "_clientV" +
+                std::to_string(info.param.clientVersion) + "_serverV" +
+                std::to_string(info.param.serverVersion);
+        if (info.param.singleThreaded) {
+            ret += "_single_threaded";
+        } else {
+            ret += "_multi_threaded";
+        }
+        if (info.param.noKernel) {
+            ret += "_no_kernel";
+        } else {
+            ret += "_with_kernel";
+        }
+        return ret;
+    }
 
 protected:
+    static std::unique_ptr<RpcTransportCtxFactory> newFactory(RpcSecurity rpcSecurity);
+
     std::unique_ptr<ProcessSession> createRpcTestSocketServerProcessEtc(
             const BinderRpcOptions& options);
 };

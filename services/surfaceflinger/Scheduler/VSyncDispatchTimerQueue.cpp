@@ -19,13 +19,18 @@
 #include <vector>
 
 #include <android-base/stringprintf.h>
+#include <common/trace.h>
 #include <ftl/concat.h>
-#include <utils/Trace.h>
+#include <log/log_main.h>
 
 #include <scheduler/TimeKeeper.h>
 
+#include <common/FlagManager.h>
 #include "VSyncDispatchTimerQueue.h"
 #include "VSyncTracker.h"
+
+#undef LOG_TAG
+#define LOG_TAG "VSyncDispatch"
 
 namespace android::scheduler {
 
@@ -33,16 +38,21 @@ using base::StringAppendF;
 
 namespace {
 
-nsecs_t getExpectedCallbackTime(nsecs_t nextVsyncTime,
-                                const VSyncDispatch::ScheduleTiming& timing) {
-    return nextVsyncTime - timing.readyDuration - timing.workDuration;
+ScheduleResult getExpectedCallbackTime(nsecs_t nextVsyncTime,
+                                       const VSyncDispatch::ScheduleTiming& timing) {
+    return {TimePoint::fromNs(nextVsyncTime - timing.readyDuration - timing.workDuration),
+            TimePoint::fromNs(nextVsyncTime)};
 }
 
-nsecs_t getExpectedCallbackTime(VSyncTracker& tracker, nsecs_t now,
-                                const VSyncDispatch::ScheduleTiming& timing) {
-    const auto nextVsyncTime = tracker.nextAnticipatedVSyncTimeFrom(
-            std::max(timing.earliestVsync, now + timing.workDuration + timing.readyDuration));
-    return getExpectedCallbackTime(nextVsyncTime, timing);
+void traceEntry(const VSyncDispatchTimerQueueEntry& entry, nsecs_t now) {
+    if (!SFTRACE_ENABLED() || !entry.wakeupTime().has_value() || !entry.targetVsync().has_value()) {
+        return;
+    }
+
+    ftl::Concat trace(ftl::truncated<5>(entry.name()), " alarm in ",
+                      ns2us(*entry.wakeupTime() - now), "us; VSYNC in ",
+                      ns2us(*entry.targetVsync() - now), "us");
+    SFTRACE_FORMAT_INSTANT(trace.c_str());
 }
 
 } // namespace
@@ -88,59 +98,128 @@ std::optional<nsecs_t> VSyncDispatchTimerQueueEntry::targetVsync() const {
 
 ScheduleResult VSyncDispatchTimerQueueEntry::schedule(VSyncDispatch::ScheduleTiming timing,
                                                       VSyncTracker& tracker, nsecs_t now) {
-    auto nextVsyncTime = tracker.nextAnticipatedVSyncTimeFrom(
-            std::max(timing.earliestVsync, now + timing.workDuration + timing.readyDuration));
+    SFTRACE_NAME("VSyncDispatchTimerQueueEntry::schedule");
+    auto nextVsyncTime =
+            tracker.nextAnticipatedVSyncTimeFrom(std::max(timing.lastVsync,
+                                                          now + timing.workDuration +
+                                                                  timing.readyDuration),
+                                                 timing.committedVsyncOpt.value_or(
+                                                         timing.lastVsync));
     auto nextWakeupTime = nextVsyncTime - timing.workDuration - timing.readyDuration;
 
     bool const wouldSkipAVsyncTarget =
             mArmedInfo && (nextVsyncTime > (mArmedInfo->mActualVsyncTime + mMinVsyncDistance));
     bool const wouldSkipAWakeup =
             mArmedInfo && ((nextWakeupTime > (mArmedInfo->mActualWakeupTime + mMinVsyncDistance)));
-    if (wouldSkipAVsyncTarget && wouldSkipAWakeup) {
-        return getExpectedCallbackTime(nextVsyncTime, timing);
-    }
-
-    bool const alreadyDispatchedForVsync = mLastDispatchTime &&
-            ((*mLastDispatchTime + mMinVsyncDistance) >= nextVsyncTime &&
-             (*mLastDispatchTime - mMinVsyncDistance) <= nextVsyncTime);
-    if (alreadyDispatchedForVsync) {
-        nextVsyncTime =
-                tracker.nextAnticipatedVSyncTimeFrom(*mLastDispatchTime + mMinVsyncDistance);
+    SFTRACE_FORMAT_INSTANT("%s: wouldSkipAVsyncTarget=%d wouldSkipAWakeup=%d", mName.c_str(),
+                           wouldSkipAVsyncTarget, wouldSkipAWakeup);
+    if (FlagManager::getInstance().dont_skip_on_early_ro()) {
+        if (wouldSkipAVsyncTarget || wouldSkipAWakeup) {
+            nextVsyncTime = mArmedInfo->mActualVsyncTime;
+        } else {
+            nextVsyncTime = adjustVsyncIfNeeded(tracker, nextVsyncTime);
+        }
+        nextWakeupTime = std::max(now, nextVsyncTime - timing.workDuration - timing.readyDuration);
+    } else {
+        if (wouldSkipAVsyncTarget && wouldSkipAWakeup) {
+            return getExpectedCallbackTime(nextVsyncTime, timing);
+        }
+        nextVsyncTime = adjustVsyncIfNeeded(tracker, nextVsyncTime);
         nextWakeupTime = nextVsyncTime - timing.workDuration - timing.readyDuration;
     }
 
     auto const nextReadyTime = nextVsyncTime - timing.readyDuration;
     mScheduleTiming = timing;
     mArmedInfo = {nextWakeupTime, nextVsyncTime, nextReadyTime};
-    return getExpectedCallbackTime(nextVsyncTime, timing);
+    return ScheduleResult{TimePoint::fromNs(nextWakeupTime), TimePoint::fromNs(nextVsyncTime)};
 }
 
-void VSyncDispatchTimerQueueEntry::addPendingWorkloadUpdate(VSyncDispatch::ScheduleTiming timing) {
+ScheduleResult VSyncDispatchTimerQueueEntry::addPendingWorkloadUpdate(
+        VSyncTracker& tracker, nsecs_t now, VSyncDispatch::ScheduleTiming timing) {
     mWorkloadUpdateInfo = timing;
+    const auto armedInfo = getArmedInfo(tracker, now, timing, mArmedInfo);
+    return {TimePoint::fromNs(armedInfo.mActualWakeupTime),
+            TimePoint::fromNs(armedInfo.mActualVsyncTime)};
 }
 
 bool VSyncDispatchTimerQueueEntry::hasPendingWorkloadUpdate() const {
     return mWorkloadUpdateInfo.has_value();
 }
 
+nsecs_t VSyncDispatchTimerQueueEntry::adjustVsyncIfNeeded(VSyncTracker& tracker,
+                                                          nsecs_t nextVsyncTime) const {
+    bool const alreadyDispatchedForVsync = mLastDispatchTime &&
+            ((*mLastDispatchTime + mMinVsyncDistance) >= nextVsyncTime &&
+             (*mLastDispatchTime - mMinVsyncDistance) <= nextVsyncTime);
+    const nsecs_t currentPeriod = tracker.currentPeriod();
+    bool const nextVsyncTooClose = mLastDispatchTime &&
+            (nextVsyncTime - *mLastDispatchTime + mMinVsyncDistance) <= currentPeriod;
+    if (alreadyDispatchedForVsync) {
+        SFTRACE_FORMAT_INSTANT("alreadyDispatchedForVsync");
+        return tracker.nextAnticipatedVSyncTimeFrom(*mLastDispatchTime + mMinVsyncDistance,
+                                                    *mLastDispatchTime);
+    }
+
+    if (nextVsyncTooClose) {
+        SFTRACE_FORMAT_INSTANT("nextVsyncTooClose");
+        return tracker.nextAnticipatedVSyncTimeFrom(*mLastDispatchTime + currentPeriod,
+                                                    *mLastDispatchTime + currentPeriod);
+    }
+
+    return nextVsyncTime;
+}
+
+auto VSyncDispatchTimerQueueEntry::getArmedInfo(VSyncTracker& tracker, nsecs_t now,
+                                                VSyncDispatch::ScheduleTiming timing,
+                                                std::optional<ArmingInfo> armedInfo) const
+        -> ArmingInfo {
+    SFTRACE_NAME("VSyncDispatchTimerQueueEntry::getArmedInfo");
+    const auto earliestReadyBy = now + timing.workDuration + timing.readyDuration;
+    const auto earliestVsync = std::max(earliestReadyBy, timing.lastVsync);
+
+    const auto nextVsyncTime =
+            adjustVsyncIfNeeded(tracker, /*nextVsyncTime*/
+                                tracker.nextAnticipatedVSyncTimeFrom(earliestVsync,
+                                                                     timing.lastVsync));
+    const auto nextReadyTime = nextVsyncTime - timing.readyDuration;
+    const auto nextWakeupTime = nextReadyTime - timing.workDuration;
+
+    if (FlagManager::getInstance().dont_skip_on_early_ro()) {
+        bool const wouldSkipAVsyncTarget =
+                armedInfo && (nextVsyncTime > (armedInfo->mActualVsyncTime + mMinVsyncDistance));
+        bool const wouldSkipAWakeup =
+                armedInfo && (nextWakeupTime > (armedInfo->mActualWakeupTime + mMinVsyncDistance));
+        SFTRACE_FORMAT_INSTANT("%s: wouldSkipAVsyncTarget=%d wouldSkipAWakeup=%d", mName.c_str(),
+                               wouldSkipAVsyncTarget, wouldSkipAWakeup);
+        if (wouldSkipAVsyncTarget || wouldSkipAWakeup) {
+            return *armedInfo;
+        }
+    }
+
+    return ArmingInfo{nextWakeupTime, nextVsyncTime, nextReadyTime};
+}
+
 void VSyncDispatchTimerQueueEntry::update(VSyncTracker& tracker, nsecs_t now) {
+    SFTRACE_NAME("VSyncDispatchTimerQueueEntry::update");
     if (!mArmedInfo && !mWorkloadUpdateInfo) {
         return;
     }
 
     if (mWorkloadUpdateInfo) {
+        const auto workDelta = mWorkloadUpdateInfo->workDuration - mScheduleTiming.workDuration;
+        const auto readyDelta = mWorkloadUpdateInfo->readyDuration - mScheduleTiming.readyDuration;
+        const auto lastVsyncDelta = mWorkloadUpdateInfo->lastVsync - mScheduleTiming.lastVsync;
+        const auto lastCommittedVsyncDelta =
+                mWorkloadUpdateInfo->committedVsyncOpt.value_or(mWorkloadUpdateInfo->lastVsync) -
+                mScheduleTiming.committedVsyncOpt.value_or(mScheduleTiming.lastVsync);
+        SFTRACE_FORMAT_INSTANT("Workload updated workDelta=%" PRId64 " readyDelta=%" PRId64
+                               " lastVsyncDelta=%" PRId64 " committedVsyncDelta=%" PRId64,
+                               workDelta, readyDelta, lastVsyncDelta, lastCommittedVsyncDelta);
         mScheduleTiming = *mWorkloadUpdateInfo;
         mWorkloadUpdateInfo.reset();
     }
 
-    const auto earliestReadyBy = now + mScheduleTiming.workDuration + mScheduleTiming.readyDuration;
-    const auto earliestVsync = std::max(earliestReadyBy, mScheduleTiming.earliestVsync);
-
-    const auto nextVsyncTime = tracker.nextAnticipatedVSyncTimeFrom(earliestVsync);
-    const auto nextReadyTime = nextVsyncTime - mScheduleTiming.readyDuration;
-    const auto nextWakeupTime = nextReadyTime - mScheduleTiming.workDuration;
-
-    mArmedInfo = {nextWakeupTime, nextVsyncTime, nextReadyTime};
+    mArmedInfo = getArmedInfo(tracker, now, mScheduleTiming, mArmedInfo);
 }
 
 void VSyncDispatchTimerQueueEntry::disarm() {
@@ -186,10 +265,14 @@ void VSyncDispatchTimerQueueEntry::dump(std::string& result) const {
     StringAppendF(&result, "\t\t%s: %s %s\n", mName.c_str(),
                   mRunning ? "(in callback function)" : "", armedInfo.c_str());
     StringAppendF(&result,
-                  "\t\t\tworkDuration: %.2fms readyDuration: %.2fms earliestVsync: %.2fms relative "
-                  "to now\n",
+                  "\t\t\tworkDuration: %.2fms readyDuration: %.2fms "
+                  "lastVsync: %.2fms relative to now "
+                  "committedVsync: %.2fms relative to now\n",
                   mScheduleTiming.workDuration / 1e6f, mScheduleTiming.readyDuration / 1e6f,
-                  (mScheduleTiming.earliestVsync - systemTime()) / 1e6f);
+                  (mScheduleTiming.lastVsync - systemTime()) / 1e6f,
+                  (mScheduleTiming.committedVsyncOpt.value_or(mScheduleTiming.lastVsync) -
+                   systemTime()) /
+                          1e6f);
 
     if (mLastDispatchTime) {
         StringAppendF(&result, "\t\t\tmLastDispatchTime: %.2fms ago\n",
@@ -200,16 +283,21 @@ void VSyncDispatchTimerQueueEntry::dump(std::string& result) const {
 }
 
 VSyncDispatchTimerQueue::VSyncDispatchTimerQueue(std::unique_ptr<TimeKeeper> tk,
-                                                 VSyncTracker& tracker, nsecs_t timerSlack,
-                                                 nsecs_t minVsyncDistance)
+                                                 VsyncSchedule::TrackerPtr tracker,
+                                                 nsecs_t timerSlack, nsecs_t minVsyncDistance)
       : mTimeKeeper(std::move(tk)),
-        mTracker(tracker),
+        mTracker(std::move(tracker)),
         mTimerSlack(timerSlack),
         mMinVsyncDistance(minVsyncDistance) {}
 
 VSyncDispatchTimerQueue::~VSyncDispatchTimerQueue() {
     std::lock_guard lock(mMutex);
+    mRunning = false;
     cancelTimer();
+    for (auto& [_, entry] : mCallbacks) {
+        ALOGE("Forgot to unregister a callback on VSyncDispatch!");
+        entry->ensureNotRunning();
+    }
 }
 
 void VSyncDispatchTimerQueue::cancelTimer() {
@@ -225,24 +313,28 @@ void VSyncDispatchTimerQueue::setTimer(nsecs_t targetTime, nsecs_t /*now*/) {
 }
 
 void VSyncDispatchTimerQueue::rearmTimer(nsecs_t now) {
-    rearmTimerSkippingUpdateFor(now, mCallbacks.end());
+    rearmTimerSkippingUpdateFor(now, mCallbacks.cend());
 }
 
 void VSyncDispatchTimerQueue::rearmTimerSkippingUpdateFor(
-        nsecs_t now, CallbackMap::iterator const& skipUpdateIt) {
+        nsecs_t now, CallbackMap::const_iterator skipUpdateIt) {
+    SFTRACE_CALL();
     std::optional<nsecs_t> min;
     std::optional<nsecs_t> targetVsync;
     std::optional<std::string_view> nextWakeupName;
-    for (auto it = mCallbacks.begin(); it != mCallbacks.end(); it++) {
+    for (auto it = mCallbacks.cbegin(); it != mCallbacks.cend(); ++it) {
         auto& callback = it->second;
         if (!callback->wakeupTime() && !callback->hasPendingWorkloadUpdate()) {
             continue;
         }
 
         if (it != skipUpdateIt) {
-            callback->update(mTracker, now);
+            callback->update(*mTracker, now);
         }
-        auto const wakeupTime = *callback->wakeupTime();
+
+        traceEntry(*callback, now);
+
+        const auto wakeupTime = *callback->wakeupTime();
         if (!min || *min > wakeupTime) {
             nextWakeupName = callback->name();
             min = wakeupTime;
@@ -251,19 +343,15 @@ void VSyncDispatchTimerQueue::rearmTimerSkippingUpdateFor(
     }
 
     if (min && min < mIntendedWakeupTime) {
-        if (ATRACE_ENABLED() && nextWakeupName && targetVsync) {
-            ftl::Concat trace(ftl::truncated<5>(*nextWakeupName), " alarm in ", ns2us(*min - now),
-                              "us; VSYNC in ", ns2us(*targetVsync - now), "us");
-            ATRACE_NAME(trace.c_str());
-        }
         setTimer(*min, now);
     } else {
-        ATRACE_NAME("cancel timer");
+        SFTRACE_NAME("cancel timer");
         cancelTimer();
     }
 }
 
 void VSyncDispatchTimerQueue::timerCallback() {
+    SFTRACE_CALL();
     struct Invocation {
         std::shared_ptr<VSyncDispatchTimerQueueEntry> callback;
         nsecs_t vsyncTimestamp;
@@ -273,6 +361,10 @@ void VSyncDispatchTimerQueue::timerCallback() {
     std::vector<Invocation> invocations;
     {
         std::lock_guard lock(mMutex);
+        if (!mRunning) {
+            ALOGD("TimerQueue is not running. Skipping callback.");
+            return;
+        }
         auto const now = mTimeKeeper->now();
         mLastTimerCallback = now;
         for (auto it = mCallbacks.begin(); it != mCallbacks.end(); it++) {
@@ -282,8 +374,9 @@ void VSyncDispatchTimerQueue::timerCallback() {
                 continue;
             }
 
-            auto const readyTime = callback->readyTime();
+            traceEntry(*callback, now);
 
+            auto const readyTime = callback->readyTime();
             auto const lagAllowance = std::max(now - mIntendedWakeupTime, static_cast<nsecs_t>(0));
             if (*wakeupTime < mIntendedWakeupTime + mTimerSlack + lagAllowance) {
                 callback->executing();
@@ -297,6 +390,8 @@ void VSyncDispatchTimerQueue::timerCallback() {
     }
 
     for (auto const& invocation : invocations) {
+        ftl::Concat trace(ftl::truncated<5>(invocation.callback->name()));
+        SFTRACE_FORMAT("%s: %s", __func__, trace.c_str());
         invocation.callback->callback(invocation.vsyncTimestamp, invocation.wakeupTimestamp,
                                       invocation.deadlineTimestamp);
     }
@@ -305,13 +400,12 @@ void VSyncDispatchTimerQueue::timerCallback() {
 VSyncDispatchTimerQueue::CallbackToken VSyncDispatchTimerQueue::registerCallback(
         Callback callback, std::string callbackName) {
     std::lock_guard lock(mMutex);
-    return CallbackToken{
-            mCallbacks
-                    .emplace(++mCallbackToken,
-                             std::make_shared<VSyncDispatchTimerQueueEntry>(std::move(callbackName),
-                                                                            std::move(callback),
-                                                                            mMinVsyncDistance))
-                    .first->first};
+    return mCallbacks
+            .try_emplace(++mCallbackToken,
+                         std::make_shared<VSyncDispatchTimerQueueEntry>(std::move(callbackName),
+                                                                        std::move(callback),
+                                                                        mMinVsyncDistance))
+            .first->first;
 }
 
 void VSyncDispatchTimerQueue::unregisterCallback(CallbackToken token) {
@@ -321,7 +415,7 @@ void VSyncDispatchTimerQueue::unregisterCallback(CallbackToken token) {
         auto it = mCallbacks.find(token);
         if (it != mCallbacks.end()) {
             entry = it->second;
-            mCallbacks.erase(it);
+            mCallbacks.erase(it->first);
         }
     }
 
@@ -330,38 +424,51 @@ void VSyncDispatchTimerQueue::unregisterCallback(CallbackToken token) {
     }
 }
 
-ScheduleResult VSyncDispatchTimerQueue::schedule(CallbackToken token,
-                                                 ScheduleTiming scheduleTiming) {
-    ScheduleResult result;
-    {
-        std::lock_guard lock(mMutex);
+std::optional<ScheduleResult> VSyncDispatchTimerQueue::schedule(CallbackToken token,
+                                                                ScheduleTiming scheduleTiming) {
+    std::lock_guard lock(mMutex);
+    return scheduleLocked(token, scheduleTiming);
+}
 
-        auto it = mCallbacks.find(token);
-        if (it == mCallbacks.end()) {
-            return result;
-        }
-        auto& callback = it->second;
-        auto const now = mTimeKeeper->now();
+std::optional<ScheduleResult> VSyncDispatchTimerQueue::scheduleLocked(
+        CallbackToken token, ScheduleTiming scheduleTiming) {
+    auto it = mCallbacks.find(token);
+    if (it == mCallbacks.end()) {
+        return {};
+    }
+    auto& callback = it->second;
+    auto const now = mTimeKeeper->now();
 
-        /* If the timer thread will run soon, we'll apply this work update via the callback
-         * timer recalculation to avoid cancelling a callback that is about to fire. */
-        auto const rearmImminent = now > mIntendedWakeupTime;
-        if (CC_UNLIKELY(rearmImminent)) {
-            callback->addPendingWorkloadUpdate(scheduleTiming);
-            return getExpectedCallbackTime(mTracker, now, scheduleTiming);
-        }
+    /* If the timer thread will run soon, we'll apply this work update via the callback
+     * timer recalculation to avoid cancelling a callback that is about to fire. */
+    auto const rearmImminent = now > mIntendedWakeupTime;
+    if (CC_UNLIKELY(rearmImminent)) {
+        return callback->addPendingWorkloadUpdate(*mTracker, now, scheduleTiming);
+    }
 
-        result = callback->schedule(scheduleTiming, mTracker, now);
-        if (!result.has_value()) {
-            return result;
-        }
+    const auto result = callback->schedule(scheduleTiming, *mTracker, now);
 
-        if (callback->wakeupTime() < mIntendedWakeupTime - mTimerSlack) {
-            rearmTimerSkippingUpdateFor(now, it);
-        }
+    if (callback->wakeupTime() < mIntendedWakeupTime - mTimerSlack) {
+        rearmTimerSkippingUpdateFor(now, it);
     }
 
     return result;
+}
+
+std::optional<ScheduleResult> VSyncDispatchTimerQueue::update(CallbackToken token,
+                                                              ScheduleTiming scheduleTiming) {
+    std::lock_guard lock(mMutex);
+    const auto it = mCallbacks.find(token);
+    if (it == mCallbacks.end()) {
+        return {};
+    }
+
+    auto& callback = it->second;
+    if (!callback->targetVsync().has_value()) {
+        return {};
+    }
+
+    return scheduleLocked(token, scheduleTiming);
 }
 
 CancelResult VSyncDispatchTimerQueue::cancel(CallbackToken token) {
@@ -403,44 +510,50 @@ void VSyncDispatchTimerQueue::dump(std::string& result) const {
     }
 }
 
-VSyncCallbackRegistration::VSyncCallbackRegistration(VSyncDispatch& dispatch,
+VSyncCallbackRegistration::VSyncCallbackRegistration(std::shared_ptr<VSyncDispatch> dispatch,
                                                      VSyncDispatch::Callback callback,
                                                      std::string callbackName)
-      : mDispatch(dispatch),
-        mToken(dispatch.registerCallback(std::move(callback), std::move(callbackName))),
-        mValidToken(true) {}
+      : mDispatch(std::move(dispatch)),
+        mToken(mDispatch->registerCallback(std::move(callback), std::move(callbackName))) {}
 
 VSyncCallbackRegistration::VSyncCallbackRegistration(VSyncCallbackRegistration&& other)
-      : mDispatch(other.mDispatch),
-        mToken(std::move(other.mToken)),
-        mValidToken(std::move(other.mValidToken)) {
-    other.mValidToken = false;
-}
+      : mDispatch(std::move(other.mDispatch)), mToken(std::exchange(other.mToken, std::nullopt)) {}
 
 VSyncCallbackRegistration& VSyncCallbackRegistration::operator=(VSyncCallbackRegistration&& other) {
+    if (this == &other) return *this;
+    if (mToken) {
+        mDispatch->unregisterCallback(*mToken);
+    }
     mDispatch = std::move(other.mDispatch);
-    mToken = std::move(other.mToken);
-    mValidToken = std::move(other.mValidToken);
-    other.mValidToken = false;
+    mToken = std::exchange(other.mToken, std::nullopt);
     return *this;
 }
 
 VSyncCallbackRegistration::~VSyncCallbackRegistration() {
-    if (mValidToken) mDispatch.get().unregisterCallback(mToken);
+    if (mToken) mDispatch->unregisterCallback(*mToken);
 }
 
-ScheduleResult VSyncCallbackRegistration::schedule(VSyncDispatch::ScheduleTiming scheduleTiming) {
-    if (!mValidToken) {
+std::optional<ScheduleResult> VSyncCallbackRegistration::schedule(
+        VSyncDispatch::ScheduleTiming scheduleTiming) {
+    if (!mToken) {
         return std::nullopt;
     }
-    return mDispatch.get().schedule(mToken, scheduleTiming);
+    return mDispatch->schedule(*mToken, scheduleTiming);
+}
+
+std::optional<ScheduleResult> VSyncCallbackRegistration::update(
+        VSyncDispatch::ScheduleTiming scheduleTiming) {
+    if (!mToken) {
+        return std::nullopt;
+    }
+    return mDispatch->update(*mToken, scheduleTiming);
 }
 
 CancelResult VSyncCallbackRegistration::cancel() {
-    if (!mValidToken) {
+    if (!mToken) {
         return CancelResult::Error;
     }
-    return mDispatch.get().cancel(mToken);
+    return mDispatch->cancel(*mToken);
 }
 
 } // namespace android::scheduler

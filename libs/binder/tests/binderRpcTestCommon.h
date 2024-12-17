@@ -22,40 +22,53 @@
 #include <BnBinderRpcCallback.h>
 #include <BnBinderRpcSession.h>
 #include <BnBinderRpcTest.h>
-#include <aidl/IBinderRpcTest.h>
-#include <android-base/file.h>
-#include <android-base/logging.h>
-#include <android-base/properties.h>
-#include <android/binder_auto_utils.h>
-#include <android/binder_libbinder.h>
 #include <binder/Binder.h>
 #include <binder/BpBinder.h>
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
-#include <binder/ProcessState.h>
 #include <binder/RpcServer.h>
 #include <binder/RpcSession.h>
 #include <binder/RpcThreads.h>
-#include <binder/RpcTlsTestUtils.h>
-#include <binder/RpcTlsUtils.h>
 #include <binder/RpcTransport.h>
 #include <binder/RpcTransportRaw.h>
-#include <binder/RpcTransportTls.h>
 #include <unistd.h>
+#include <cinttypes>
 #include <string>
 #include <vector>
 
+#ifdef __ANDROID__
+#include <android-base/properties.h>
+#endif
+
+#ifndef __TRUSTY__
+#include <android/binder_auto_utils.h>
+#include <android/binder_libbinder.h>
+#include <binder/ProcessState.h>
+#include <binder/RpcTlsTestUtils.h>
+#include <binder/RpcTlsUtils.h>
+#include <binder/RpcTransportTls.h>
+
 #include <signal.h>
+
+#include "../OS.h"               // for testing UnixBootstrap clients
+#include "../RpcSocketAddress.h" // for testing preconnected clients
+#include "../vm_sockets.h"       // for VMADDR_*
+#endif                           // __TRUSTY__
 
 #include "../BuildFlags.h"
 #include "../FdTrigger.h"
-#include "../OS.h"               // for testing UnixBootstrap clients
-#include "../RpcSocketAddress.h" // for testing preconnected clients
-#include "../RpcState.h"         // for debugging
-#include "../vm_sockets.h"       // for VMADDR_*
+#include "../FdUtils.h"
+#include "../RpcState.h" // for debugging
+#include "FileUtils.h"
 #include "utils/Errors.h"
 
 namespace android {
+
+#ifdef BINDER_NO_KERNEL_IPC_TESTING
+constexpr bool kEnableKernelIpcTesting = false;
+#else
+constexpr bool kEnableKernelIpcTesting = true;
+#endif
 
 constexpr char kLocalInetAddress[] = "127.0.0.1";
 
@@ -65,6 +78,43 @@ static inline std::vector<RpcSecurity> RpcSecurityValues() {
     return {RpcSecurity::RAW, RpcSecurity::TLS};
 }
 
+static inline std::vector<bool> noKernelValues() {
+    std::vector<bool> values = {true};
+    if (kEnableKernelIpcTesting) {
+        values.push_back(false);
+    }
+    return values;
+}
+
+static inline bool hasExperimentalRpc() {
+#ifdef BINDER_RPC_TO_TRUSTY_TEST
+    // Trusty services do not support the experimental version,
+    // so that we can update the prebuilts separately.
+    // This covers the binderRpcToTrustyTest case on Android.
+    return false;
+#endif
+#ifdef __ANDROID__
+    return base::GetProperty("ro.build.version.codename", "") != "REL";
+#else
+    return false;
+#endif
+}
+
+static inline std::vector<uint32_t> testVersions() {
+    std::vector<uint32_t> versions;
+    for (size_t i = 0; i < RPC_WIRE_PROTOCOL_VERSION_NEXT; i++) {
+        versions.push_back(i);
+    }
+    if (hasExperimentalRpc()) {
+        versions.push_back(RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL);
+    }
+    return versions;
+}
+
+static inline std::string trustyIpcPort(uint32_t serverVersion) {
+    return "com.android.trusty.binderRpcTestService.V" + std::to_string(serverVersion);
+}
+
 enum class SocketType {
     PRECONNECTED,
     UNIX,
@@ -72,6 +122,7 @@ enum class SocketType {
     UNIX_RAW,
     VSOCK,
     INET,
+    TIPC,
 };
 
 static inline std::string PrintToString(SocketType socketType) {
@@ -88,6 +139,8 @@ static inline std::string PrintToString(SocketType socketType) {
             return "vm_socket";
         case SocketType::INET:
             return "inet_socket";
+        case SocketType::TIPC:
+            return "trusty_ipc";
         default:
             LOG_ALWAYS_FATAL("Unknown socket type");
             return "";
@@ -105,7 +158,11 @@ static inline size_t epochMillis() {
 struct BinderRpcOptions {
     size_t numThreads = 1;
     size_t numSessions = 1;
-    size_t numIncomingConnections = 0;
+    // right now, this can be empty, or length numSessions, where each value
+    // represents the info for the corresponding session, but we should
+    // probably switch this to be a list of sessions options so that other
+    // options can all be specified per session
+    std::vector<size_t> numIncomingConnectionsBySession = {};
     size_t numOutgoingConnections = SIZE_MAX;
     RpcSession::FileDescriptorTransportMode clientFileDescriptorTransportMode =
             RpcSession::FileDescriptorTransportMode::NONE;
@@ -118,37 +175,39 @@ struct BinderRpcOptions {
     bool allowConnectFailure = false;
 };
 
-static inline void writeString(android::base::borrowed_fd fd, std::string_view str) {
+#ifndef __TRUSTY__
+static inline void writeString(binder::borrowed_fd fd, std::string_view str) {
     uint64_t length = str.length();
-    CHECK(android::base::WriteFully(fd, &length, sizeof(length)));
-    CHECK(android::base::WriteFully(fd, str.data(), str.length()));
+    LOG_ALWAYS_FATAL_IF(!android::binder::WriteFully(fd, &length, sizeof(length)));
+    LOG_ALWAYS_FATAL_IF(!android::binder::WriteFully(fd, str.data(), str.length()));
 }
 
-static inline std::string readString(android::base::borrowed_fd fd) {
+static inline std::string readString(binder::borrowed_fd fd) {
     uint64_t length;
-    CHECK(android::base::ReadFully(fd, &length, sizeof(length)));
+    LOG_ALWAYS_FATAL_IF(!android::binder::ReadFully(fd, &length, sizeof(length)));
     std::string ret(length, '\0');
-    CHECK(android::base::ReadFully(fd, ret.data(), length));
+    LOG_ALWAYS_FATAL_IF(!android::binder::ReadFully(fd, ret.data(), length));
     return ret;
 }
 
-static inline void writeToFd(android::base::borrowed_fd fd, const Parcelable& parcelable) {
+static inline void writeToFd(binder::borrowed_fd fd, const Parcelable& parcelable) {
     Parcel parcel;
-    CHECK_EQ(OK, parcelable.writeToParcel(&parcel));
+    LOG_ALWAYS_FATAL_IF(OK != parcelable.writeToParcel(&parcel));
     writeString(fd, std::string(reinterpret_cast<const char*>(parcel.data()), parcel.dataSize()));
 }
 
 template <typename T>
-static inline T readFromFd(android::base::borrowed_fd fd) {
+static inline T readFromFd(binder::borrowed_fd fd) {
     std::string data = readString(fd);
     Parcel parcel;
-    CHECK_EQ(OK, parcel.setData(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
+    LOG_ALWAYS_FATAL_IF(OK !=
+                        parcel.setData(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
     T object;
-    CHECK_EQ(OK, object.readFromParcel(&parcel));
+    LOG_ALWAYS_FATAL_IF(OK != object.readFromParcel(&parcel));
     return object;
 }
 
-static inline std::unique_ptr<RpcTransportCtxFactory> newFactory(
+static inline std::unique_ptr<RpcTransportCtxFactory> newTlsFactory(
         RpcSecurity rpcSecurity, std::shared_ptr<RpcCertificateVerifier> verifier = nullptr,
         std::unique_ptr<RpcAuth> auth = nullptr) {
     switch (rpcSecurity) {
@@ -164,17 +223,17 @@ static inline std::unique_ptr<RpcTransportCtxFactory> newFactory(
             return RpcTransportCtxFactoryTls::make(std::move(verifier), std::move(auth));
         }
         default:
-            LOG_ALWAYS_FATAL("Unknown RpcSecurity %d", rpcSecurity);
+            LOG_ALWAYS_FATAL("Unknown RpcSecurity %d", static_cast<int>(rpcSecurity));
     }
 }
 
 // Create an FD that returns `contents` when read.
-static inline base::unique_fd mockFileDescriptor(std::string contents) {
-    android::base::unique_fd readFd, writeFd;
-    CHECK(android::base::Pipe(&readFd, &writeFd)) << strerror(errno);
+static inline binder::unique_fd mockFileDescriptor(std::string contents) {
+    binder::unique_fd readFd, writeFd;
+    LOG_ALWAYS_FATAL_IF(!binder::Pipe(&readFd, &writeFd), "%s", strerror(errno));
     RpcMaybeThread([writeFd = std::move(writeFd), contents = std::move(contents)]() {
         signal(SIGPIPE, SIG_IGN); // ignore possible SIGPIPE from the write
-        if (!WriteStringToFd(contents, writeFd)) {
+        if (!android::binder::WriteStringToFd(contents, writeFd)) {
             int savedErrno = errno;
             LOG_ALWAYS_FATAL_IF(EPIPE != savedErrno, "mockFileDescriptor write failed: %s",
                                 strerror(savedErrno));
@@ -182,6 +241,7 @@ static inline base::unique_fd mockFileDescriptor(std::string contents) {
     }).detach();
     return readFd;
 }
+#endif // __TRUSTY__
 
 // A threadsafe channel where writes block until the value is read.
 template <typename T>
@@ -209,7 +269,7 @@ public:
         mValue.reset();
         lock.unlock();
         mCvEmpty.notify_all();
-        return std::move(v);
+        return v;
     }
 
 private:
@@ -252,9 +312,12 @@ public:
     std::vector<std::string> mValues;
 };
 
-class MyBinderRpcTest : public BnBinderRpcTest {
+// Base class for all concrete implementations of MyBinderRpcTest.
+// Sub-classes that want to provide a full implementation should derive
+// from this class instead of MyBinderRpcTestDefault below so the compiler
+// checks that all methods are implemented.
+class MyBinderRpcTestBase : public BnBinderRpcTest {
 public:
-    wp<RpcServer> server;
     int port = 0;
 
     Status sendString(const std::string& str) override {
@@ -267,18 +330,6 @@ public:
     }
     Status getClientPort(int* out) override {
         *out = port;
-        return Status::ok();
-    }
-    Status countBinders(std::vector<int32_t>* out) override {
-        sp<RpcServer> spServer = server.promote();
-        if (spServer == nullptr) {
-            return Status::fromExceptionCode(Status::EX_NULL_POINTER);
-        }
-        out->clear();
-        for (auto session : spServer->listSessions()) {
-            size_t count = session->state()->countBinders();
-            out->push_back(count);
-        }
         return Status::ok();
     }
     Status getNullBinder(sp<IBinder>* out) override {
@@ -361,7 +412,7 @@ public:
         }
 
         if (delayed) {
-            RpcMaybeThread([=]() {
+            RpcMaybeThread([=, this]() {
                 ALOGE("Executing delayed callback: '%s'", value.c_str());
                 Status status = doCallback(callback, oneway, false, value);
                 ALOGE("Delayed callback status: '%s'", status.toString8().c_str());
@@ -381,63 +432,62 @@ public:
         return doCallback(callback, oneway, delayed, value);
     }
 
-    Status die(bool cleanup) override {
-        if (cleanup) {
-            exit(1);
-        } else {
-            _exit(1);
-        }
-    }
-
-    Status scheduleShutdown() override {
-        sp<RpcServer> strongServer = server.promote();
-        if (strongServer == nullptr) {
+protected:
+    // Generic version of countBinders that works with both
+    // RpcServer and RpcServerTrusty
+    template <typename T>
+    Status countBindersImpl(const wp<T>& server, std::vector<int32_t>* out) {
+        sp<T> spServer = server.promote();
+        if (spServer == nullptr) {
             return Status::fromExceptionCode(Status::EX_NULL_POINTER);
         }
-        RpcMaybeThread([=] {
-            LOG_ALWAYS_FATAL_IF(!strongServer->shutdown(), "Could not shutdown");
-        }).detach();
-        return Status::ok();
-    }
-
-    Status useKernelBinderCallingId() override {
-        // this is WRONG! It does not make sense when using RPC binder, and
-        // because it is SO wrong, and so much code calls this, it should abort!
-
-        if constexpr (kEnableKernelIpc) {
-            (void)IPCThreadState::self()->getCallingPid();
+        out->clear();
+        for (auto session : spServer->listSessions()) {
+            size_t count = session->state()->countBinders();
+            out->push_back(count);
         }
         return Status::ok();
     }
+};
 
-    Status echoAsFile(const std::string& content, android::os::ParcelFileDescriptor* out) override {
-        out->reset(mockFileDescriptor(content));
-        return Status::ok();
+// Default implementation of MyBinderRpcTest that can be used as-is
+// or derived from by classes that only want to implement a subset of
+// the unimplemented methods
+class MyBinderRpcTestDefault : public MyBinderRpcTestBase {
+public:
+    Status countBinders(std::vector<int32_t>* /*out*/) override {
+        return Status::fromStatusT(UNKNOWN_TRANSACTION);
     }
 
-    Status concatFiles(const std::vector<android::os::ParcelFileDescriptor>& files,
-                       android::os::ParcelFileDescriptor* out) override {
-        std::string acc;
-        for (const auto& file : files) {
-            std::string result;
-            CHECK(android::base::ReadFdToString(file.get(), &result));
-            acc.append(result);
-        }
-        out->reset(mockFileDescriptor(acc));
-        return Status::ok();
+    Status die(bool /*cleanup*/) override { return Status::fromStatusT(UNKNOWN_TRANSACTION); }
+
+    Status scheduleShutdown() override { return Status::fromStatusT(UNKNOWN_TRANSACTION); }
+
+    Status useKernelBinderCallingId() override { return Status::fromStatusT(UNKNOWN_TRANSACTION); }
+
+    Status echoAsFile(const std::string& /*content*/,
+                      android::os::ParcelFileDescriptor* /*out*/) override {
+        return Status::fromStatusT(UNKNOWN_TRANSACTION);
     }
 
-    HandoffChannel<android::base::unique_fd> mFdChannel;
-
-    Status blockingSendFdOneway(const android::os::ParcelFileDescriptor& fd) override {
-        mFdChannel.write(android::base::unique_fd(fcntl(fd.get(), F_DUPFD_CLOEXEC, 0)));
-        return Status::ok();
+    Status concatFiles(const std::vector<android::os::ParcelFileDescriptor>& /*files*/,
+                       android::os::ParcelFileDescriptor* /*out*/) override {
+        return Status::fromStatusT(UNKNOWN_TRANSACTION);
     }
 
-    Status blockingRecvFd(android::os::ParcelFileDescriptor* fd) override {
-        fd->reset(mFdChannel.read());
-        return Status::ok();
+    Status blockingSendFdOneway(const android::os::ParcelFileDescriptor& /*fd*/) override {
+        return Status::fromStatusT(UNKNOWN_TRANSACTION);
     }
+
+    Status blockingRecvFd(android::os::ParcelFileDescriptor* /*fd*/) override {
+        return Status::fromStatusT(UNKNOWN_TRANSACTION);
+    }
+
+    Status blockingSendIntOneway(int /*n*/) override {
+        return Status::fromStatusT(UNKNOWN_TRANSACTION);
+    }
+
+    Status blockingRecvInt(int* /*n*/) override { return Status::fromStatusT(UNKNOWN_TRANSACTION); }
 };
 
 } // namespace android

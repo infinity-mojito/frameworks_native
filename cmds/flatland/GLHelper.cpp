@@ -18,6 +18,7 @@
 
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <com_android_graphics_libgui_flags.h>
 #include <gui/SurfaceComposerClient.h>
 #include <ui/DisplayMode.h>
 
@@ -35,8 +36,11 @@ GLHelper::GLHelper() :
 GLHelper::~GLHelper() {
 }
 
-bool GLHelper::setUp(const ShaderDesc* shaderDescs, size_t numShaders) {
+bool GLHelper::setUp(const sp<IBinder>& displayToken, const ShaderDesc* shaderDescs,
+                     size_t numShaders) {
     bool result;
+
+    mDisplayToken = displayToken;
 
     mDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (mDisplay == EGL_NO_DISPLAY) {
@@ -199,6 +203,14 @@ bool GLHelper::getShaderProgram(const char* name, GLuint* outPgm) {
 
 bool GLHelper::createNamedSurfaceTexture(GLuint name, uint32_t w, uint32_t h,
         sp<GLConsumer>* glConsumer, EGLSurface* surface) {
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    sp<GLConsumer> glc = new GLConsumer(name, GL_TEXTURE_EXTERNAL_OES, false, true);
+    glc->setDefaultBufferSize(w, h);
+    glc->getSurface()->setMaxDequeuedBufferCount(2);
+    glc->setConsumerUsageBits(GRALLOC_USAGE_HW_COMPOSER);
+
+    sp<ANativeWindow> anw = glc->getSurface();
+#else
     sp<IGraphicBufferProducer> producer;
     sp<IGraphicBufferConsumer> consumer;
     BufferQueue::createBufferQueue(&producer, &consumer);
@@ -209,6 +221,7 @@ bool GLHelper::createNamedSurfaceTexture(GLuint name, uint32_t w, uint32_t h,
     glc->setConsumerUsageBits(GRALLOC_USAGE_HW_COMPOSER);
 
     sp<ANativeWindow> anw = new Surface(producer);
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
     EGLSurface s = eglCreateWindowSurface(mDisplay, mConfig, anw.get(), nullptr);
     if (s == EGL_NO_SURFACE) {
         fprintf(stderr, "eglCreateWindowSurface error: %#x\n", eglGetError());
@@ -221,14 +234,8 @@ bool GLHelper::createNamedSurfaceTexture(GLuint name, uint32_t w, uint32_t h,
 }
 
 bool GLHelper::computeWindowScale(uint32_t w, uint32_t h, float* scale) {
-    const sp<IBinder> dpy = mSurfaceComposerClient->getInternalDisplayToken();
-    if (dpy == nullptr) {
-        fprintf(stderr, "SurfaceComposer::getInternalDisplayToken failed.\n");
-        return false;
-    }
-
     ui::DisplayMode mode;
-    status_t err = mSurfaceComposerClient->getActiveDisplayMode(dpy, &mode);
+    status_t err = mSurfaceComposerClient->getActiveDisplayMode(mDisplayToken, &mode);
     if (err != NO_ERROR) {
         fprintf(stderr, "SurfaceComposer::getActiveDisplayMode failed: %#x\n", err);
         return false;

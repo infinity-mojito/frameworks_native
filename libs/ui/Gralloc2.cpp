@@ -161,7 +161,7 @@ status_t Gralloc2Mapper::createDescriptor(void* bufferDescriptorInfo,
     return static_cast<status_t>((ret.isOk()) ? error : kTransactionError);
 }
 
-status_t Gralloc2Mapper::importBuffer(const hardware::hidl_handle& rawHandle,
+status_t Gralloc2Mapper::importBuffer(const native_handle_t* rawHandle,
                                       buffer_handle_t* outBufferHandle) const {
     Error error;
     auto ret = mMapper->importBuffer(rawHandle,
@@ -384,8 +384,8 @@ std::string Gralloc2Allocator::dumpDebugInfo(bool /*less*/) const {
 
 status_t Gralloc2Allocator::allocate(std::string /*requestorName*/, uint32_t width, uint32_t height,
                                      PixelFormat format, uint32_t layerCount, uint64_t usage,
-                                     uint32_t bufferCount, uint32_t* outStride,
-                                     buffer_handle_t* outBufferHandles, bool importBuffers) const {
+                                     uint32_t* outStride, buffer_handle_t* outBufferHandles,
+                                     bool importBuffers) const {
     IMapper::BufferDescriptorInfo descriptorInfo = {};
     descriptorInfo.width = width;
     descriptorInfo.height = height;
@@ -399,6 +399,8 @@ status_t Gralloc2Allocator::allocate(std::string /*requestorName*/, uint32_t wid
     if (error != NO_ERROR) {
         return error;
     }
+
+    constexpr auto bufferCount = 1;
 
     auto ret = mAllocator->allocate(descriptor, bufferCount,
                                     [&](const auto& tmpError, const auto& tmpStride,

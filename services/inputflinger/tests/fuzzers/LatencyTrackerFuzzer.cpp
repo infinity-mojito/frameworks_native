@@ -15,6 +15,10 @@
  */
 
 #include <fuzzer/FuzzedDataProvider.h>
+#include <linux/input.h>
+
+#include "../../InputDeviceMetricsSource.h"
+#include "../InputEventTimeline.h"
 #include "dispatcher/LatencyTracker.h"
 
 namespace android {
@@ -42,7 +46,7 @@ static sp<IBinder> getConnectionToken(FuzzedDataProvider& fdp,
     if (useExistingToken) {
         return tokens[fdp.ConsumeIntegralInRange<size_t>(0ul, tokens.size() - 1)];
     }
-    return new BBinder();
+    return sp<BBinder>::make();
 }
 
 extern "C" int LLVMFuzzerTestOneInput(uint8_t* data, size_t size) {
@@ -54,7 +58,7 @@ extern "C" int LLVMFuzzerTestOneInput(uint8_t* data, size_t size) {
     // Make some pre-defined tokens to ensure that some timelines are complete.
     std::array<sp<IBinder> /*token*/, 10> predefinedTokens;
     for (size_t i = 0; i < predefinedTokens.size(); i++) {
-        predefinedTokens[i] = new BBinder();
+        predefinedTokens[i] = sp<BBinder>::make();
     }
 
     // Randomly invoke LatencyTracker api's until randomness is exhausted.
@@ -62,10 +66,15 @@ extern "C" int LLVMFuzzerTestOneInput(uint8_t* data, size_t size) {
         fdp.PickValueInArray<std::function<void()>>({
                 [&]() -> void {
                     int32_t inputEventId = fdp.ConsumeIntegral<int32_t>();
-                    int32_t isDown = fdp.ConsumeBool();
                     nsecs_t eventTime = fdp.ConsumeIntegral<nsecs_t>();
                     nsecs_t readTime = fdp.ConsumeIntegral<nsecs_t>();
-                    tracker.trackListener(inputEventId, isDown, eventTime, readTime);
+                    const DeviceId deviceId = fdp.ConsumeIntegral<int32_t>();
+                    std::set<InputDeviceUsageSource> sources = {
+                            fdp.ConsumeEnum<InputDeviceUsageSource>()};
+                    const int32_t inputEventActionType = fdp.ConsumeIntegral<int32_t>();
+                    const InputEventType inputEventType = fdp.ConsumeEnum<InputEventType>();
+                    tracker.trackListener(inputEventId, eventTime, readTime, deviceId, sources,
+                                          inputEventActionType, inputEventType);
                 },
                 [&]() -> void {
                     int32_t inputEventId = fdp.ConsumeIntegral<int32_t>();

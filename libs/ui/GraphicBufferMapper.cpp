@@ -36,12 +36,17 @@
 #include <ui/Gralloc2.h>
 #include <ui/Gralloc3.h>
 #include <ui/Gralloc4.h>
+#include <ui/Gralloc5.h>
 #include <ui/GraphicBuffer.h>
 
 #include <system/graphics.h>
 
+using unique_fd = ::android::base::unique_fd;
+
 namespace android {
 // ---------------------------------------------------------------------------
+
+using LockResult = GraphicBufferMapper::LockResult;
 
 ANDROID_SINGLETON_STATIC_INSTANCE( GraphicBufferMapper )
 
@@ -49,9 +54,15 @@ void GraphicBufferMapper::preloadHal() {
     Gralloc2Mapper::preload();
     Gralloc3Mapper::preload();
     Gralloc4Mapper::preload();
+    Gralloc5Mapper::preload();
 }
 
 GraphicBufferMapper::GraphicBufferMapper() {
+    mMapper = std::make_unique<const Gralloc5Mapper>();
+    if (mMapper->isLoaded()) {
+        mMapperVersion = Version::GRALLOC_5;
+        return;
+    }
     mMapper = std::make_unique<const Gralloc4Mapper>();
     if (mMapper->isLoaded()) {
         mMapperVersion = Version::GRALLOC_4;
@@ -82,15 +93,14 @@ void GraphicBufferMapper::dumpBufferToSystemLog(buffer_handle_t bufferHandle, bo
     ALOGD("%s", s.c_str());
 }
 
-status_t GraphicBufferMapper::importBuffer(buffer_handle_t rawHandle,
-        uint32_t width, uint32_t height, uint32_t layerCount,
-        PixelFormat format, uint64_t usage, uint32_t stride,
-        buffer_handle_t* outHandle)
-{
+status_t GraphicBufferMapper::importBuffer(const native_handle_t* rawHandle, uint32_t width,
+                                           uint32_t height, uint32_t layerCount, PixelFormat format,
+                                           uint64_t usage, uint32_t stride,
+                                           buffer_handle_t* outHandle) {
     ATRACE_CALL();
 
     buffer_handle_t bufferHandle;
-    status_t error = mMapper->importBuffer(hardware::hidl_handle(rawHandle), &bufferHandle);
+    status_t error = mMapper->importBuffer(rawHandle, &bufferHandle);
     if (error != NO_ERROR) {
         ALOGW("importBuffer(%p) failed: %d", rawHandle, error);
         return error;
@@ -109,6 +119,11 @@ status_t GraphicBufferMapper::importBuffer(buffer_handle_t rawHandle,
     return NO_ERROR;
 }
 
+status_t GraphicBufferMapper::importBufferNoValidate(const native_handle_t* rawHandle,
+                                                     buffer_handle_t* outHandle) {
+    return mMapper->importBuffer(rawHandle, outHandle);
+}
+
 void GraphicBufferMapper::getTransportSize(buffer_handle_t handle,
             uint32_t* outTransportNumFds, uint32_t* outTransportNumInts)
 {
@@ -124,63 +139,88 @@ status_t GraphicBufferMapper::freeBuffer(buffer_handle_t handle)
     return NO_ERROR;
 }
 
-status_t GraphicBufferMapper::lock(buffer_handle_t handle, uint32_t usage, const Rect& bounds,
-                                   void** vaddr, int32_t* outBytesPerPixel,
-                                   int32_t* outBytesPerStride) {
-    return lockAsync(handle, usage, bounds, vaddr, -1, outBytesPerPixel, outBytesPerStride);
-}
+ui::Result<LockResult> GraphicBufferMapper::lock(buffer_handle_t handle, int64_t usage,
+                                                 const Rect& bounds, unique_fd&& acquireFence) {
+    ATRACE_CALL();
 
-status_t GraphicBufferMapper::lockYCbCr(buffer_handle_t handle, uint32_t usage,
-        const Rect& bounds, android_ycbcr *ycbcr)
-{
-    return lockAsyncYCbCr(handle, usage, bounds, ycbcr, -1);
-}
-
-status_t GraphicBufferMapper::unlock(buffer_handle_t handle)
-{
-    int32_t fenceFd = -1;
-    status_t error = unlockAsync(handle, &fenceFd);
-    if (error == NO_ERROR && fenceFd >= 0) {
-        sync_wait(fenceFd, -1);
-        close(fenceFd);
+    LockResult result;
+    status_t status = mMapper->lock(handle, usage, bounds, acquireFence.release(), &result.address,
+                                    &result.bytesPerPixel, &result.bytesPerStride);
+    if (status != OK) {
+        return base::unexpected(ui::Error::statusToCode(status));
+    } else {
+        return result;
     }
-    return error;
+}
+
+ui::Result<android_ycbcr> GraphicBufferMapper::lockYCbCr(buffer_handle_t handle, int64_t usage,
+                                                         const Rect& bounds,
+                                                         base::unique_fd&& acquireFence) {
+    ATRACE_CALL();
+
+    android_ycbcr result = {};
+    status_t status = mMapper->lock(handle, usage, bounds, acquireFence.release(), &result);
+    if (status != OK) {
+        return base::unexpected(ui::Error::statusToCode(status));
+    } else {
+        return result;
+    }
+}
+
+status_t GraphicBufferMapper::unlock(buffer_handle_t handle, base::unique_fd* outFence) {
+    ATRACE_CALL();
+    int fence = mMapper->unlock(handle);
+    if (outFence) {
+        *outFence = unique_fd{fence};
+    } else {
+        sync_wait(fence, -1);
+        close(fence);
+    }
+    return OK;
+}
+
+status_t GraphicBufferMapper::lock(buffer_handle_t handle, uint32_t usage, const Rect& bounds,
+                                   void** vaddr) {
+    auto result = lock(handle, static_cast<int64_t>(usage), bounds);
+    if (!result.has_value()) return result.asStatus();
+    auto val = result.value();
+    *vaddr = val.address;
+    return OK;
+}
+
+status_t GraphicBufferMapper::lockYCbCr(buffer_handle_t handle, uint32_t usage, const Rect& bounds,
+                                        android_ycbcr* ycbcr) {
+    auto result = lockYCbCr(handle, static_cast<int64_t>(usage), bounds);
+    if (!result.has_value()) return result.asStatus();
+    *ycbcr = result.value();
+    return OK;
 }
 
 status_t GraphicBufferMapper::lockAsync(buffer_handle_t handle, uint32_t usage, const Rect& bounds,
-                                        void** vaddr, int fenceFd, int32_t* outBytesPerPixel,
-                                        int32_t* outBytesPerStride) {
-    return lockAsync(handle, usage, usage, bounds, vaddr, fenceFd, outBytesPerPixel,
-                     outBytesPerStride);
+                                        void** vaddr, int fenceFd) {
+    auto result = lock(handle, static_cast<int64_t>(usage), bounds, unique_fd{fenceFd});
+    if (!result.has_value()) return result.asStatus();
+    auto val = result.value();
+    *vaddr = val.address;
+    return OK;
 }
 
 status_t GraphicBufferMapper::lockAsync(buffer_handle_t handle, uint64_t producerUsage,
                                         uint64_t consumerUsage, const Rect& bounds, void** vaddr,
-                                        int fenceFd, int32_t* outBytesPerPixel,
-                                        int32_t* outBytesPerStride) {
-    ATRACE_CALL();
-
-    const uint64_t usage = static_cast<uint64_t>(
-            android_convertGralloc1To0Usage(producerUsage, consumerUsage));
-    return mMapper->lock(handle, usage, bounds, fenceFd, vaddr, outBytesPerPixel,
-                         outBytesPerStride);
+                                        int fenceFd) {
+    return lockAsync(handle,
+                     ANDROID_NATIVE_UNSIGNED_CAST(
+                             android_convertGralloc1To0Usage(producerUsage, consumerUsage)),
+                     bounds, vaddr, fenceFd);
 }
 
-status_t GraphicBufferMapper::lockAsyncYCbCr(buffer_handle_t handle,
-        uint32_t usage, const Rect& bounds, android_ycbcr *ycbcr, int fenceFd)
-{
-    ATRACE_CALL();
-
-    return mMapper->lock(handle, usage, bounds, fenceFd, ycbcr);
-}
-
-status_t GraphicBufferMapper::unlockAsync(buffer_handle_t handle, int *fenceFd)
-{
-    ATRACE_CALL();
-
-    *fenceFd = mMapper->unlock(handle);
-
-    return NO_ERROR;
+status_t GraphicBufferMapper::lockAsyncYCbCr(buffer_handle_t handle, uint32_t usage,
+                                             const Rect& bounds, android_ycbcr* ycbcr,
+                                             int fenceFd) {
+    auto result = lockYCbCr(handle, static_cast<int64_t>(usage), bounds, unique_fd{fenceFd});
+    if (!result.has_value()) return result.asStatus();
+    *ycbcr = result.value();
+    return OK;
 }
 
 status_t GraphicBufferMapper::isSupported(uint32_t width, uint32_t height,
@@ -276,6 +316,17 @@ status_t GraphicBufferMapper::getPlaneLayouts(buffer_handle_t bufferHandle,
     return mMapper->getPlaneLayouts(bufferHandle, outPlaneLayouts);
 }
 
+ui::Result<std::vector<ui::PlaneLayout>> GraphicBufferMapper::getPlaneLayouts(
+        buffer_handle_t bufferHandle) {
+    std::vector<ui::PlaneLayout> temp;
+    status_t status = mMapper->getPlaneLayouts(bufferHandle, &temp);
+    if (status == OK) {
+        return std::move(temp);
+    } else {
+        return base::unexpected(ui::Error::statusToCode(status));
+    }
+}
+
 status_t GraphicBufferMapper::getDataspace(buffer_handle_t bufferHandle,
                                            ui::Dataspace* outDataspace) {
     return mMapper->getDataspace(bufferHandle, outDataspace);
@@ -328,85 +379,6 @@ status_t GraphicBufferMapper::getSmpte2094_10(
 status_t GraphicBufferMapper::setSmpte2094_10(buffer_handle_t bufferHandle,
                                               std::optional<std::vector<uint8_t>> smpte2094_10) {
     return mMapper->setSmpte2094_10(bufferHandle, smpte2094_10);
-}
-
-status_t GraphicBufferMapper::getDefaultPixelFormatFourCC(uint32_t width, uint32_t height,
-                                                          PixelFormat format, uint32_t layerCount,
-                                                          uint64_t usage,
-                                                          uint32_t* outPixelFormatFourCC) {
-    return mMapper->getDefaultPixelFormatFourCC(width, height, format, layerCount, usage,
-                                                outPixelFormatFourCC);
-}
-
-status_t GraphicBufferMapper::getDefaultPixelFormatModifier(uint32_t width, uint32_t height,
-                                                            PixelFormat format, uint32_t layerCount,
-                                                            uint64_t usage,
-                                                            uint64_t* outPixelFormatModifier) {
-    return mMapper->getDefaultPixelFormatModifier(width, height, format, layerCount, usage,
-                                                  outPixelFormatModifier);
-}
-
-status_t GraphicBufferMapper::getDefaultAllocationSize(uint32_t width, uint32_t height,
-                                                       PixelFormat format, uint32_t layerCount,
-                                                       uint64_t usage,
-                                                       uint64_t* outAllocationSize) {
-    return mMapper->getDefaultAllocationSize(width, height, format, layerCount, usage,
-                                             outAllocationSize);
-}
-
-status_t GraphicBufferMapper::getDefaultProtectedContent(uint32_t width, uint32_t height,
-                                                         PixelFormat format, uint32_t layerCount,
-                                                         uint64_t usage,
-                                                         uint64_t* outProtectedContent) {
-    return mMapper->getDefaultProtectedContent(width, height, format, layerCount, usage,
-                                               outProtectedContent);
-}
-
-status_t GraphicBufferMapper::getDefaultCompression(
-        uint32_t width, uint32_t height, PixelFormat format, uint32_t layerCount, uint64_t usage,
-        aidl::android::hardware::graphics::common::ExtendableType* outCompression) {
-    return mMapper->getDefaultCompression(width, height, format, layerCount, usage, outCompression);
-}
-
-status_t GraphicBufferMapper::getDefaultCompression(uint32_t width, uint32_t height,
-                                                    PixelFormat format, uint32_t layerCount,
-                                                    uint64_t usage,
-                                                    ui::Compression* outCompression) {
-    return mMapper->getDefaultCompression(width, height, format, layerCount, usage, outCompression);
-}
-
-status_t GraphicBufferMapper::getDefaultInterlaced(
-        uint32_t width, uint32_t height, PixelFormat format, uint32_t layerCount, uint64_t usage,
-        aidl::android::hardware::graphics::common::ExtendableType* outInterlaced) {
-    return mMapper->getDefaultInterlaced(width, height, format, layerCount, usage, outInterlaced);
-}
-
-status_t GraphicBufferMapper::getDefaultInterlaced(uint32_t width, uint32_t height,
-                                                   PixelFormat format, uint32_t layerCount,
-                                                   uint64_t usage, ui::Interlaced* outInterlaced) {
-    return mMapper->getDefaultInterlaced(width, height, format, layerCount, usage, outInterlaced);
-}
-
-status_t GraphicBufferMapper::getDefaultChromaSiting(
-        uint32_t width, uint32_t height, PixelFormat format, uint32_t layerCount, uint64_t usage,
-        aidl::android::hardware::graphics::common::ExtendableType* outChromaSiting) {
-    return mMapper->getDefaultChromaSiting(width, height, format, layerCount, usage,
-                                           outChromaSiting);
-}
-
-status_t GraphicBufferMapper::getDefaultChromaSiting(uint32_t width, uint32_t height,
-                                                     PixelFormat format, uint32_t layerCount,
-                                                     uint64_t usage,
-                                                     ui::ChromaSiting* outChromaSiting) {
-    return mMapper->getDefaultChromaSiting(width, height, format, layerCount, usage,
-                                           outChromaSiting);
-}
-
-status_t GraphicBufferMapper::getDefaultPlaneLayouts(
-        uint32_t width, uint32_t height, PixelFormat format, uint32_t layerCount, uint64_t usage,
-        std::vector<ui::PlaneLayout>* outPlaneLayouts) {
-    return mMapper->getDefaultPlaneLayouts(width, height, format, layerCount, usage,
-                                           outPlaneLayouts);
 }
 
 // ---------------------------------------------------------------------------

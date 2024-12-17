@@ -41,7 +41,6 @@
 #include <android/hidl/manager/1.0/IServiceManager.h>
 #include <hidl/ServiceManagement.h>
 
-#include <pdx/default_transport/service_utility.h>
 #include <utils/String8.h>
 #include <utils/Timers.h>
 #include <utils/Tokenizer.h>
@@ -53,7 +52,6 @@
 #include <android-base/stringprintf.h>
 
 using namespace android;
-using pdx::default_transport::ServiceUtility;
 using hardware::hidl_vec;
 using hardware::hidl_string;
 using hardware::Return;
@@ -68,10 +66,10 @@ using std::string;
 const char* k_traceTagsProperty = "debug.atrace.tags.enableflags";
 const char* k_userInitiatedTraceProperty = "debug.atrace.user_initiated";
 
+const char* k_tracePreferSdkProperty = "debug.atrace.prefer_sdk";
 const char* k_traceAppsNumberProperty = "debug.atrace.app_number";
 const char* k_traceAppsPropertyTemplate = "debug.atrace.app_%d";
 const char* k_coreServiceCategory = "core_services";
-const char* k_pdxServiceCategory = "pdx";
 const char* k_coreServicesProp = "ro.atrace.core.services";
 
 const char* kVendorCategoriesPath = "/vendor/etc/atrace/atrace_categories.txt";
@@ -130,7 +128,6 @@ static const TracingCategory k_categories[] = {
     { "nnapi",      "NNAPI",                    ATRACE_TAG_NNAPI, { } },
     { "rro",        "Runtime Resource Overlay", ATRACE_TAG_RRO, { } },
     { k_coreServiceCategory, "Core services", 0, { } },
-    { k_pdxServiceCategory, "PDX services", 0, { } },
     { "sched",      "CPU Scheduling",   0, {
         { REQ,      "events/sched/sched_switch/enable" },
         { REQ,      "events/sched/sched_wakeup/enable" },
@@ -298,7 +295,6 @@ static const char* g_debugAppCmdLine = "";
 static const char* g_outputFile = nullptr;
 
 /* Global state */
-static bool g_tracePdx = false;
 static bool g_traceAborted = false;
 static bool g_categoryEnables[arraysize(k_categories)] = {};
 static std::string g_traceFolder;
@@ -312,12 +308,6 @@ static const char* k_traceClockPath =
 
 static const char* k_traceBufferSizePath =
     "buffer_size_kb";
-
-#if 0
-// TODO: Re-enable after stabilization
-static const char* k_traceCmdlineSizePath =
-    "saved_cmdlines_size";
-#endif
 
 static const char* k_tracingOverwriteEnablePath =
     "options/overwrite";
@@ -461,10 +451,6 @@ static bool isCategorySupported(const TracingCategory& category)
         return !android::base::GetProperty(k_coreServicesProp, "").empty();
     }
 
-    if (strcmp(category.name, k_pdxServiceCategory) == 0) {
-        return true;
-    }
-
     bool ok = category.tags != 0;
     for (int i = 0; i < MAX_SYS_FILES; i++) {
         const char* path = category.sysfiles[i].path;
@@ -545,18 +531,6 @@ static bool setTraceBufferSizeKB(int size)
     return writeStr(k_traceBufferSizePath, str);
 }
 
-#if 0
-// TODO: Re-enable after stabilization
-// Set the default size of cmdline hashtable
-static bool setCmdlineSize()
-{
-    if (fileExists(k_traceCmdlineSizePath)) {
-        return writeStr(k_traceCmdlineSizePath, "8192");
-    }
-    return true;
-}
-#endif
-
 // Set the clock to the best available option while tracing. Use 'boot' if it's
 // available; otherwise, use 'mono'. If neither are available use 'global'.
 // Any write to the trace_clock sysfs file will reset the buffer, so only
@@ -616,6 +590,17 @@ static void clearAppProperties()
         fprintf(stderr, "failed to clear system property: %s",
               k_traceAppsNumberProperty);
     }
+}
+
+// Set the property that's read by userspace to prefer the perfetto SDK.
+static bool setPreferSdkProperty(uint64_t tags)
+{
+    std::string value = android::base::StringPrintf("%#" PRIx64, tags);
+    if (!android::base::SetProperty(k_tracePreferSdkProperty, value)) {
+        fprintf(stderr, "error setting prefer_sdk system property\n");
+        return false;
+    }
+    return true;
 }
 
 // Set the system property that indicates which apps should perform
@@ -692,7 +677,7 @@ static bool verifyKernelTraceFuncs(const char* funcs)
     while (func) {
         if (!strchr(func, '*')) {
             String8 fancyFunc = String8::format("\n%s\n", func);
-            bool found = funcList.find(fancyFunc.string(), 0) >= 0;
+            bool found = funcList.find(fancyFunc.c_str(), 0) >= 0;
             if (!found || func[0] == '\0') {
                 fprintf(stderr, "error: \"%s\" is not a valid kernel function "
                         "to trace.\n", func);
@@ -796,11 +781,11 @@ static bool setCategoriesEnableFromFile(const char* categories_file)
     bool ok = true;
     while (!tokenizer->isEol()) {
         String8 token = tokenizer->nextToken(" ");
-        if (token.isEmpty()) {
+        if (token.empty()) {
             tokenizer->skipDelimiters(" ");
             continue;
         }
-        ok &= setCategoryEnable(token.string());
+        ok &= setCategoryEnable(token.c_str());
     }
     delete tokenizer;
     return ok;
@@ -824,11 +809,6 @@ static bool setUpUserspaceTracing()
         if (strcmp(k_categories[i].name, k_coreServiceCategory) == 0) {
             coreServicesTagEnabled = g_categoryEnables[i];
         }
-
-        // Set whether to poke PDX services in this session.
-        if (strcmp(k_categories[i].name, k_pdxServiceCategory) == 0) {
-            g_tracePdx = g_categoryEnables[i];
-        }
     }
 
     std::string packageList(g_debugAppCmdLine);
@@ -840,9 +820,6 @@ static bool setUpUserspaceTracing()
     }
     ok &= setAppCmdlineProperty(&packageList[0]);
     ok &= setTagsProperty(tags);
-    if (g_tracePdx) {
-        ok &= ServiceUtility::PokeServices();
-    }
 
     return ok;
 }
@@ -851,10 +828,6 @@ static void cleanUpUserspaceTracing()
 {
     setTagsProperty(0);
     clearAppProperties();
-
-    if (g_tracePdx) {
-        ServiceUtility::PokeServices();
-    }
 }
 
 
@@ -870,8 +843,6 @@ static bool setUpKernelTracing()
     ok &= setCategoriesEnableFromFile(g_categoriesFile);
     ok &= setTraceOverwriteEnable(g_traceOverwrite);
     ok &= setTraceBufferSizeKB(g_traceBufferSizeKB);
-    // TODO: Re-enable after stabilization
-    //ok &= setCmdlineSize();
     ok &= setClock();
     ok &= setPrintTgidEnableIfPresent(true);
     ok &= setKernelTraceFuncs(g_kernelTraceFuncs);
@@ -936,6 +907,17 @@ static bool startTrace()
 static void stopTrace()
 {
     setTracingEnabled(false);
+}
+
+static bool preferSdkCategories() {
+    uint64_t tags = 0;
+    for (size_t i = 0; i < arraysize(k_categories); i++) {
+        if (g_categoryEnables[i]) {
+            const TracingCategory& c = k_categories[i];
+            tags |= c.tags;
+        }
+    }
+    return setPreferSdkProperty(tags);
 }
 
 // Read data from the tracing pipe and forward to stdout
@@ -1128,6 +1110,9 @@ static void showHelp(const char *cmd)
                     "                    CPU performance, like pagecache usage.\n"
                     "  --list_categories\n"
                     "                  list the available tracing categories\n"
+                    "  --prefer_sdk\n"
+                    "                  prefer the perfetto sdk over legacy atrace for\n"
+                    "                    categories and exits immediately\n"
                     " -o filename      write the trace to the specified file instead\n"
                     "                    of stdout.\n"
             );
@@ -1272,6 +1257,7 @@ int main(int argc, char **argv)
     bool traceStop = true;
     bool traceDump = true;
     bool traceStream = false;
+    bool preferSdk = false;
     bool onlyUserspace = false;
 
     if (argc == 2 && 0 == strcmp(argv[1], "--help")) {
@@ -1296,6 +1282,7 @@ int main(int argc, char **argv)
             {"only_userspace",    no_argument, nullptr,  0 },
             {"list_categories",   no_argument, nullptr,  0 },
             {"stream",            no_argument, nullptr,  0 },
+            {"prefer_sdk",        no_argument, nullptr,  0 },
             {nullptr,                       0, nullptr,  0 }
         };
 
@@ -1368,6 +1355,8 @@ int main(int argc, char **argv)
                 } else if (!strcmp(long_options[option_index].name, "stream")) {
                     traceStream = true;
                     traceDump = false;
+                } else if (!strcmp(long_options[option_index].name, "prefer_sdk")) {
+                    preferSdk = true;
                 } else if (!strcmp(long_options[option_index].name, "list_categories")) {
                     listSupportedCategories();
                     exit(0);
@@ -1380,6 +1369,11 @@ int main(int argc, char **argv)
                 exit(-1);
             break;
         }
+    }
+
+    if (preferSdk) {
+        bool res = preferSdkCategories();
+        exit(res ? 0 : 1);
     }
 
     if (onlyUserspace) {

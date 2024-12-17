@@ -19,6 +19,7 @@
 #include <binder/Parcel.h>
 #include <binder/Parcelable.h>
 #include <ui/Fence.h>
+#include <ui/FenceResult.h>
 #include <ui/GraphicBuffer.h>
 
 namespace android::gui {
@@ -31,11 +32,15 @@ public:
     status_t readFromParcel(const android::Parcel* parcel) override;
 
     sp<GraphicBuffer> buffer;
-    sp<Fence> fence = Fence::NO_FENCE;
+    FenceResult fenceResult = Fence::NO_FENCE;
     bool capturedSecureLayers{false};
     bool capturedHdrLayers{false};
     ui::Dataspace capturedDataspace{ui::Dataspace::V0_SRGB};
-    status_t result = OK;
+    // A gainmap that can be used to "lift" the screenshot into HDR
+    sp<GraphicBuffer> optionalGainMap;
+    // HDR/SDR ratio value that fully applies the gainmap.
+    // Note that we use 1/64 epsilon offsets to eliminate precision issues
+    float hdrSdrRatio{1.0f};
 };
 
 } // namespace android::gui

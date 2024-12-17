@@ -16,20 +16,17 @@
 
 #pragma once
 
-#include <condition_variable>
 #include <deque>
-#include <mutex>
-#include <queue>
-#include <thread>
+#include <optional>
 #include <unordered_map>
-#include <unordered_set>
 
 #include <android-base/thread_annotations.h>
 #include <binder/IBinder.h>
-#include <compositionengine/FenceResult.h>
 #include <ftl/future.h>
+#include <gui/BufferReleaseChannel.h>
 #include <gui/ITransactionCompletedListener.h>
 #include <ui/Fence.h>
+#include <ui/FenceResult.h>
 
 namespace android {
 
@@ -45,41 +42,38 @@ public:
     bool releasePreviousBuffer = false;
     std::string name;
     sp<Fence> previousReleaseFence;
-    std::vector<ftl::SharedFuture<FenceResult>> previousReleaseFences;
+    std::vector<ftl::Future<FenceResult>> previousReleaseFences;
+    std::vector<ftl::SharedFuture<FenceResult>> previousSharedReleaseFences;
     std::variant<nsecs_t, sp<Fence>> acquireTimeOrFence = -1;
     nsecs_t latchTime = -1;
-    uint32_t transformHint = 0;
+    std::optional<uint32_t> transformHint = std::nullopt;
     uint32_t currentMaxAcquiredBufferCount = 0;
     std::shared_ptr<FenceTime> gpuCompositionDoneFence{FenceTime::NO_FENCE};
     CompositorTiming compositorTiming;
     nsecs_t refreshStartTime = 0;
     nsecs_t dequeueReadyTime = 0;
     uint64_t frameNumber = 0;
+    uint64_t previousFrameNumber = 0;
     ReleaseCallbackId previousReleaseCallbackId = ReleaseCallbackId::INVALID_ID;
+    std::shared_ptr<gui::BufferReleaseChannel::ProducerEndpoint> bufferReleaseChannel;
 };
 
 class TransactionCallbackInvoker {
 public:
-    status_t addCallbackHandles(const std::deque<sp<CallbackHandle>>& handles,
-                                const std::vector<JankData>& jankData);
+    status_t addCallbackHandles(const std::deque<sp<CallbackHandle>>& handles);
     status_t addOnCommitCallbackHandles(const std::deque<sp<CallbackHandle>>& handles,
                                              std::deque<sp<CallbackHandle>>& outRemainingHandles);
 
-    // Adds the Transaction CallbackHandle from a layer that does not need to be relatched and
-    // presented this frame.
-    status_t registerUnpresentedCallbackHandle(const sp<CallbackHandle>& handle);
     void addEmptyTransaction(const ListenerCallbacks& listenerCallbacks);
 
-    void addPresentFence(const sp<Fence>& presentFence);
+    void addPresentFence(sp<Fence>);
 
     void sendCallbacks(bool onCommitOnly);
     void clearCompletedTransactions() {
         mCompletedTransactions.clear();
     }
 
-    status_t addCallbackHandle(const sp<CallbackHandle>& handle,
-                               const std::vector<JankData>& jankData);
-
+    status_t addCallbackHandle(const sp<CallbackHandle>& handle);
 
 private:
     status_t findOrCreateTransactionStats(const sp<IBinder>& listener,
@@ -88,6 +82,14 @@ private:
 
     std::unordered_map<sp<IBinder>, std::deque<TransactionStats>, IListenerHash>
         mCompletedTransactions;
+
+    struct BufferRelease {
+        std::shared_ptr<gui::BufferReleaseChannel::ProducerEndpoint> channel;
+        ReleaseCallbackId callbackId;
+        sp<Fence> fence;
+        uint32_t currentMaxAcquiredBufferCount;
+    };
+    std::vector<BufferRelease> mBufferReleases;
 
     sp<Fence> mPresentFence;
 };

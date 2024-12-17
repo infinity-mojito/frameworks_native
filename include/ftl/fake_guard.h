@@ -76,15 +76,10 @@ struct [[clang::scoped_lockable]] FakeGuard final {
   FTL_ATTRIBUTE(release_capability(mutex))
 #endif
 
-// The parentheses around `expr` are needed to deduce an lvalue or rvalue reference.
-#define FTL_FAKE_GUARD2(mutex, expr)            \
-  [&]() -> decltype(auto) {                     \
-    const android::ftl::FakeGuard guard(mutex); \
-    return (expr);                              \
-  }()
+#define FTL_FAKE_GUARD2(mutex, expr) \
+    (android::ftl::FakeGuard(mutex), expr)
 
 #define FTL_MAKE_FAKE_GUARD(arg1, arg2, guard, ...) guard
 
-// The void argument suppresses a warning about zero variadic macro arguments.
 #define FTL_FAKE_GUARD(...) \
-  FTL_MAKE_FAKE_GUARD(__VA_ARGS__, FTL_FAKE_GUARD2, FTL_FAKE_GUARD1, void)(__VA_ARGS__)
+  FTL_MAKE_FAKE_GUARD(__VA_ARGS__, FTL_FAKE_GUARD2, FTL_FAKE_GUARD1, )(__VA_ARGS__)

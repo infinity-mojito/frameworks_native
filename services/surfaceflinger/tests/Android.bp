@@ -19,26 +19,35 @@ package {
     // to get the below license kinds:
     //   SPDX-license-identifier-Apache-2.0
     default_applicable_licenses: ["frameworks_native_license"],
+    default_team: "trendy_team_android_core_graphics_stack",
 }
 
 cc_test {
     name: "SurfaceFlinger_test",
-    defaults: ["surfaceflinger_defaults"],
+    defaults: [
+        "android.hardware.graphics.common-ndk_shared",
+        "surfaceflinger_defaults",
+        "libsurfaceflinger_common_test_deps",
+        "libsurfaceflinger_proto_deps",
+    ],
     test_suites: ["device-tests"],
     srcs: [
         "BootDisplayMode_test.cpp",
+        "Binder_test.cpp",
         "BufferGenerator.cpp",
-        "CommonTypes_test.cpp",
         "Credentials_test.cpp",
         "DereferenceSurfaceControl_test.cpp",
         "DisplayConfigs_test.cpp",
         "DisplayEventReceiver_test.cpp",
+        "Dumpsys_test.cpp",
         "EffectLayer_test.cpp",
+        "HdrSdrRatioOverlay_test.cpp",
         "InvalidHandles_test.cpp",
         "LayerCallback_test.cpp",
         "LayerRenderTypeTransaction_test.cpp",
         "LayerState_test.cpp",
         "LayerTransaction_test.cpp",
+        "LayerTrustedPresentationListener_test.cpp",
         "LayerTypeAndRenderTypeTransaction_test.cpp",
         "LayerTypeTransaction_test.cpp",
         "LayerUpdate_test.cpp",
@@ -49,21 +58,17 @@ cc_test {
         "ReleaseBufferCallback_test.cpp",
         "ScreenCapture_test.cpp",
         "SetFrameRate_test.cpp",
-        "SetFrameRateOverride_test.cpp",
         "SetGeometry_test.cpp",
-        "Stress_test.cpp",
-        "SurfaceInterceptor_test.cpp",
+        "TextureFiltering_test.cpp",
         "VirtualDisplay_test.cpp",
         "WindowInfosListener_test.cpp",
     ],
     data: ["SurfaceFlinger_test.filter"],
     static_libs: [
-        "libtrace_proto",
-        "liblayers_proto",
         "android.hardware.graphics.composer@2.1",
+        "libsurfaceflinger_common",
     ],
     shared_libs: [
-        "android.hardware.graphics.common-V4-ndk",
         "android.hardware.graphics.common@1.2",
         "libandroid",
         "libbase",
@@ -77,6 +82,7 @@ cc_test {
         "libprotobuf-cpp-full",
         "libui",
         "libutils",
+        "server_configurable_flags",
     ],
     header_libs: [
         "libnativewindow_headers",
@@ -114,7 +120,6 @@ cc_test {
         "libEGL",
         "libGLESv2",
         "libgui",
-        "liblayers_proto",
         "liblog",
         "libprotobuf-cpp-full",
         "libui",
@@ -122,10 +127,12 @@ cc_test {
     ],
     cpp_std: "experimental",
     gnu_extensions: false,
+    data: [
+        ":SurfaceFlinger_test",
+    ],
 }
 
 subdirs = [
-    "fakehwc",
     "hwc2",
     "unittests",
     "utils",

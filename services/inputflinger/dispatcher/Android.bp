@@ -13,6 +13,7 @@
 // limitations under the License.
 
 package {
+    default_team: "trendy_team_input_framework",
     // See: http://go/android-license-faq
     // A large-scale-change added 'default_applicable_licenses' to import
     // all of the 'license_kinds' from "frameworks_native_license"
@@ -23,6 +24,7 @@ package {
 
 cc_library_headers {
     name: "libinputdispatcher_headers",
+    host_supported: true,
     export_include_dirs: [
         "include",
     ],
@@ -33,6 +35,8 @@ filegroup {
     srcs: [
         "AnrTracker.cpp",
         "Connection.cpp",
+        "DebugConfig.cpp",
+        "DragState.cpp",
         "Entry.cpp",
         "FocusResolver.cpp",
         "InjectionState.cpp",
@@ -44,16 +48,21 @@ filegroup {
         "LatencyAggregator.cpp",
         "LatencyTracker.cpp",
         "Monitor.cpp",
+        "TouchedWindow.cpp",
         "TouchState.cpp",
-        "DragState.cpp",
+        "trace/*.cpp",
     ],
 }
 
 cc_defaults {
     name: "libinputdispatcher_defaults",
-    srcs: [":libinputdispatcher_sources"],
+    srcs: [
+        ":libinputdispatcher_sources",
+    ],
     shared_libs: [
         "libbase",
+        "libbinder",
+        "libbinder_ndk",
         "libcrypto",
         "libcutils",
         "libinput",
@@ -61,16 +70,25 @@ cc_defaults {
         "liblog",
         "libprotobuf-cpp-lite",
         "libstatslog",
+        "libutils",
         "libstatspull",
         "libstatssocket",
-        "libui",
-        "libgui",
-        "libutils",
+        "packagemanager_aidl-cpp",
         "server_configurable_flags",
     ],
     static_libs: [
         "libattestation",
+        "libgui_window_info_static",
+        "libperfetto_client_experimental",
+        "perfetto_winscope_extensions_zero",
     ],
+    target: {
+        android: {
+            shared_libs: [
+                "libgui",
+            ],
+        },
+    },
     header_libs: [
         "libinputdispatcher_headers",
     ],
@@ -78,6 +96,7 @@ cc_defaults {
 
 cc_library_static {
     name: "libinputdispatcher",
+    host_supported: true,
     defaults: [
         "inputflinger_defaults",
         "libinputdispatcher_defaults",
@@ -85,8 +104,8 @@ cc_library_static {
     shared_libs: [
         // This should consist only of dependencies from inputflinger. Other dependencies should be
         // in cc_defaults so that they are included in the tests.
-        "libinputreporter",
         "libinputflinger_base",
+        "libinputreporter",
     ],
     export_header_lib_headers: [
         "libinputdispatcher_headers",

@@ -17,17 +17,20 @@
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
 #include "GaussianBlurFilter.h"
+#include <SkBlendMode.h>
 #include <SkCanvas.h>
-#include <SkData.h>
+#include <SkImageFilters.h>
 #include <SkPaint.h>
 #include <SkRRect.h>
 #include <SkRuntimeEffect.h>
-#include <SkImageFilters.h>
 #include <SkSize.h>
 #include <SkString.h>
 #include <SkSurface.h>
+#include <SkTileMode.h>
+#include <common/trace.h>
+#include <include/gpu/ganesh/SkSurfaceGanesh.h>
 #include <log/log.h>
-#include <utils/Trace.h>
+#include "include/gpu/GpuTypes.h" // from Skia
 
 namespace android {
 namespace renderengine {
@@ -39,13 +42,13 @@ static const float BLUR_SIGMA_SCALE = 0.57735f;
 
 GaussianBlurFilter::GaussianBlurFilter(): BlurFilter(/* maxCrossFadeRadius= */ 0.0f) {}
 
-sk_sp<SkImage> GaussianBlurFilter::generate(GrRecordingContext* context, const uint32_t blurRadius,
-                                            const sk_sp<SkImage> input, const SkRect& blurRect)
-    const {
+sk_sp<SkImage> GaussianBlurFilter::generate(SkiaGpuContext* context, const uint32_t blurRadius,
+                                            const sk_sp<SkImage> input,
+                                            const SkRect& blurRect) const {
     // Create blur surface with the bit depth and colorspace of the original surface
     SkImageInfo scaledInfo = input->imageInfo().makeWH(std::ceil(blurRect.width() * kInputScale),
                                                        std::ceil(blurRect.height() * kInputScale));
-    sk_sp<SkSurface> surface = SkSurface::MakeRenderTarget(context, SkBudgeted::kNo, scaledInfo);
+    sk_sp<SkSurface> surface = context->createRenderTarget(scaledInfo);
 
     SkPaint paint;
     paint.setBlendMode(SkBlendMode::kSrc);

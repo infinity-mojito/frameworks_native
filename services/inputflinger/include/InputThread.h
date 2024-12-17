@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUT_THREAD_H
-#define _UI_INPUT_THREAD_H
+#pragma once
 
 #include <utils/Thread.h>
 
@@ -39,8 +38,7 @@ private:
     std::string mName;
     std::function<void()> mThreadWake;
     sp<Thread> mThread;
+    bool applyInputEventProfile();
 };
 
 } // namespace android
-
-#endif // _UI_INPUT_THREAD_H

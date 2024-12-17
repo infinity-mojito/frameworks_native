@@ -22,11 +22,9 @@
 #include <gtest/gtest.h>
 #include <gui/LayerMetadata.h>
 
-#include "BufferStateLayer.h"
 #include "TestableSurfaceFlinger.h"
 #include "TunnelModeEnabledReporter.h"
 #include "mock/DisplayHardware/MockComposer.h"
-#include "mock/MockEventThread.h"
 
 namespace android {
 
@@ -36,8 +34,6 @@ using testing::Return;
 
 using android::Hwc2::IComposer;
 using android::Hwc2::IComposerClient;
-
-using FakeHwcDisplayInjector = TestableSurfaceFlinger::FakeHwcDisplayInjector;
 
 constexpr int DEFAULT_SIDEBAND_STREAM = 51;
 
@@ -62,9 +58,7 @@ protected:
     static constexpr uint32_t HEIGHT = 100;
     static constexpr uint32_t LAYER_FLAGS = 0;
 
-    void setupScheduler();
-    void setupComposer(uint32_t virtualDisplayCount);
-    sp<BufferStateLayer> createBufferStateLayer(LayerMetadata metadata);
+    sp<Layer> createBufferStateLayer(LayerMetadata metadata);
 
     TestableSurfaceFlinger mFlinger;
     Hwc2::mock::Composer* mComposer = nullptr;
@@ -81,7 +75,7 @@ TunnelModeEnabledReporterTest::TunnelModeEnabledReporterTest() {
             ::testing::UnitTest::GetInstance()->current_test_info();
     ALOGD("**** Setting up for %s.%s\n", test_info->test_case_name(), test_info->name());
 
-    setupScheduler();
+    mFlinger.setupMockScheduler();
     mFlinger.setupComposer(std::make_unique<Hwc2::mock::Composer>());
     mFlinger.flinger()->mTunnelModeEnabledReporter = mTunnelModeEnabledReporter;
     mTunnelModeEnabledReporter->dispatchTunnelModeEnabled(false);
@@ -95,36 +89,10 @@ TunnelModeEnabledReporterTest::~TunnelModeEnabledReporterTest() {
     mTunnelModeEnabledReporter->removeListener(mTunnelModeEnabledListener);
 }
 
-sp<BufferStateLayer> TunnelModeEnabledReporterTest::createBufferStateLayer(
-        LayerMetadata metadata = {}) {
+sp<Layer> TunnelModeEnabledReporterTest::createBufferStateLayer(LayerMetadata metadata = {}) {
     sp<Client> client;
     LayerCreationArgs args(mFlinger.flinger(), client, "buffer-state-layer", LAYER_FLAGS, metadata);
-    return new BufferStateLayer(args);
-}
-
-void TunnelModeEnabledReporterTest::setupScheduler() {
-    auto eventThread = std::make_unique<mock::EventThread>();
-    auto sfEventThread = std::make_unique<mock::EventThread>();
-
-    EXPECT_CALL(*eventThread, registerDisplayEventConnection(_));
-    EXPECT_CALL(*eventThread, createEventConnection(_, _))
-            .WillOnce(Return(new EventThreadConnection(eventThread.get(), /*callingUid=*/0,
-                                                       ResyncCallback())));
-
-    EXPECT_CALL(*sfEventThread, registerDisplayEventConnection(_));
-    EXPECT_CALL(*sfEventThread, createEventConnection(_, _))
-            .WillOnce(Return(new EventThreadConnection(sfEventThread.get(), /*callingUid=*/0,
-                                                       ResyncCallback())));
-
-    auto vsyncController = std::make_unique<mock::VsyncController>();
-    auto vsyncTracker = std::make_unique<mock::VSyncTracker>();
-
-    EXPECT_CALL(*vsyncTracker, nextAnticipatedVSyncTimeFrom(_)).WillRepeatedly(Return(0));
-    EXPECT_CALL(*vsyncTracker, currentPeriod())
-            .WillRepeatedly(Return(FakeHwcDisplayInjector::DEFAULT_VSYNC_PERIOD));
-    EXPECT_CALL(*vsyncTracker, nextAnticipatedVSyncTimeFrom(_)).WillRepeatedly(Return(0));
-    mFlinger.setupScheduler(std::move(vsyncController), std::move(vsyncTracker),
-                            std::move(eventThread), std::move(sfEventThread));
+    return sp<Layer>::make(args);
 }
 
 namespace {
@@ -159,13 +127,11 @@ TEST_F(TunnelModeEnabledReporterTest, callsNewListenerWithFreshInformation) {
     sp<NativeHandle> stream =
             NativeHandle::create(reinterpret_cast<native_handle_t*>(DEFAULT_SIDEBAND_STREAM),
                                  false);
-    layer->setSidebandStream(stream);
-    mFlinger.mutableCurrentState().layersSortedByZ.add(layer);
+    layer->setSidebandStream(stream, FrameTimelineInfo{}, 20, gui::GameMode::Unsupported);
     mTunnelModeEnabledReporter->updateTunnelModeStatus();
     mTunnelModeEnabledReporter->addListener(mTunnelModeEnabledListener);
     EXPECT_EQ(true, mTunnelModeEnabledListener->mTunnelModeEnabled);
     mTunnelModeEnabledReporter->removeListener(mTunnelModeEnabledListener);
-    mFlinger.mutableCurrentState().layersSortedByZ.remove(layer);
     layer = nullptr;
 
     mTunnelModeEnabledReporter->updateTunnelModeStatus();
@@ -183,14 +149,12 @@ TEST_F(TunnelModeEnabledReporterTest, layerWithSidebandStreamTriggersUpdate) {
     sp<NativeHandle> stream =
             NativeHandle::create(reinterpret_cast<native_handle_t*>(DEFAULT_SIDEBAND_STREAM),
                                  false);
-    layerWithSidebandStream->setSidebandStream(stream);
+    layerWithSidebandStream->setSidebandStream(stream, FrameTimelineInfo{}, 20,
+                                               gui::GameMode::Unsupported);
 
-    mFlinger.mutableCurrentState().layersSortedByZ.add(simpleLayer);
-    mFlinger.mutableCurrentState().layersSortedByZ.add(layerWithSidebandStream);
     mTunnelModeEnabledReporter->updateTunnelModeStatus();
     EXPECT_EQ(true, mTunnelModeEnabledListener->mTunnelModeEnabled);
 
-    mFlinger.mutableCurrentState().layersSortedByZ.remove(layerWithSidebandStream);
     layerWithSidebandStream = nullptr;
     mTunnelModeEnabledReporter->updateTunnelModeStatus();
     EXPECT_EQ(false, mTunnelModeEnabledListener->mTunnelModeEnabled);

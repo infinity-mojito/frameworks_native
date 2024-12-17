@@ -20,9 +20,10 @@
 //#define LOG_NDEBUG 0
 
 #include <assert.h>
+#include <common/trace.h>
 #include <cutils/properties.h>
+#include <ftl/concat.h>
 #include <log/log.h>
-#include <utils/Trace.h>
 
 #include "../TracedOrdinal.h"
 #include "VSyncDispatch.h"
@@ -39,17 +40,20 @@ nsecs_t SystemClock::now() const {
     return systemTime(SYSTEM_TIME_MONOTONIC);
 }
 
-VSyncReactor::VSyncReactor(std::unique_ptr<Clock> clock, VSyncTracker& tracker,
-                           size_t pendingFenceLimit, bool supportKernelIdleTimer)
-      : mClock(std::move(clock)),
+VSyncReactor::VSyncReactor(PhysicalDisplayId id, std::unique_ptr<Clock> clock,
+                           VSyncTracker& tracker, size_t pendingFenceLimit,
+                           bool supportKernelIdleTimer)
+      : mId(id),
+        mClock(std::move(clock)),
         mTracker(tracker),
         mPendingLimit(pendingFenceLimit),
-        // TODO(adyabr): change mSupportKernelIdleTimer when the active display changes
         mSupportKernelIdleTimer(supportKernelIdleTimer) {}
 
 VSyncReactor::~VSyncReactor() = default;
 
 bool VSyncReactor::addPresentFence(std::shared_ptr<FenceTime> fence) {
+    SFTRACE_CALL();
+
     if (!fence) {
         return false;
     }
@@ -61,6 +65,8 @@ bool VSyncReactor::addPresentFence(std::shared_ptr<FenceTime> fence) {
 
     std::lock_guard lock(mMutex);
     if (mExternalIgnoreFences || mInternalIgnoreFences) {
+        SFTRACE_FORMAT_INSTANT("mExternalIgnoreFences=%d mInternalIgnoreFences=%d",
+                               mExternalIgnoreFences, mInternalIgnoreFences);
         return true;
     }
 
@@ -113,32 +119,35 @@ void VSyncReactor::updateIgnorePresentFencesInternal() {
     }
 }
 
-void VSyncReactor::startPeriodTransitionInternal(nsecs_t newPeriod) {
-    ATRACE_CALL();
+void VSyncReactor::startPeriodTransitionInternal(ftl::NonNull<DisplayModePtr> modePtr) {
+    SFTRACE_FORMAT("%s %" PRIu64, __func__, mId.value);
     mPeriodConfirmationInProgress = true;
-    mPeriodTransitioningTo = newPeriod;
+    mModePtrTransitioningTo = modePtr.get();
     mMoreSamplesNeeded = true;
     setIgnorePresentFencesInternal(true);
 }
 
 void VSyncReactor::endPeriodTransition() {
-    ATRACE_CALL();
-    mPeriodTransitioningTo.reset();
+    SFTRACE_FORMAT("%s %" PRIu64, __func__, mId.value);
+    mModePtrTransitioningTo.reset();
     mPeriodConfirmationInProgress = false;
     mLastHwVsync.reset();
 }
 
-void VSyncReactor::startPeriodTransition(nsecs_t period) {
-    ATRACE_INT64("VSR-setPeriod", period);
+void VSyncReactor::onDisplayModeChanged(ftl::NonNull<DisplayModePtr> modePtr, bool force) {
+    SFTRACE_INT64(ftl::Concat("VSR-", __func__, " ", mId.value).c_str(),
+                  modePtr->getVsyncRate().getPeriodNsecs());
     std::lock_guard lock(mMutex);
     mLastHwVsync.reset();
 
-    if (!mSupportKernelIdleTimer && period == mTracker.currentPeriod()) {
+    // kernel idle timer is not applicable for VRR
+    const bool supportKernelIdleTimer = mSupportKernelIdleTimer && !modePtr->getVrrConfig();
+    if (!supportKernelIdleTimer && mTracker.isCurrentMode(modePtr) && !force) {
         endPeriodTransition();
         setIgnorePresentFencesInternal(false);
         mMoreSamplesNeeded = false;
     } else {
-        startPeriodTransitionInternal(period);
+        startPeriodTransitionInternal(modePtr);
     }
 }
 
@@ -156,14 +165,16 @@ bool VSyncReactor::periodConfirmed(nsecs_t vsync_timestamp, std::optional<nsecs_
         return false;
     }
 
-    const bool periodIsChanging =
-            mPeriodTransitioningTo && (*mPeriodTransitioningTo != mTracker.currentPeriod());
+    const std::optional<Period> newPeriod = mModePtrTransitioningTo
+            ? mModePtrTransitioningTo->getVsyncRate().getPeriod()
+            : std::optional<Period>{};
+    const bool periodIsChanging = newPeriod && (newPeriod->ns() != mTracker.currentPeriod());
     if (mSupportKernelIdleTimer && !periodIsChanging) {
         // Clear out the Composer-provided period and use the allowance logic below
         HwcVsyncPeriod = {};
     }
 
-    auto const period = mPeriodTransitioningTo ? *mPeriodTransitioningTo : mTracker.currentPeriod();
+    auto const period = newPeriod ? newPeriod->ns() : mTracker.currentPeriod();
     static constexpr int allowancePercent = 10;
     static constexpr std::ratio<allowancePercent, 100> allowancePercentRatio;
     auto const allowance = period * allowancePercentRatio.num / allowancePercentRatio.den;
@@ -181,9 +192,9 @@ bool VSyncReactor::addHwVsyncTimestamp(nsecs_t timestamp, std::optional<nsecs_t>
 
     std::lock_guard lock(mMutex);
     if (periodConfirmed(timestamp, hwcVsyncPeriod)) {
-        ATRACE_NAME("VSR: period confirmed");
-        if (mPeriodTransitioningTo) {
-            mTracker.setPeriod(*mPeriodTransitioningTo);
+        SFTRACE_FORMAT("VSR %" PRIu64 ": period confirmed", mId.value);
+        if (mModePtrTransitioningTo) {
+            mTracker.setDisplayModePtr(ftl::as_non_null(mModePtrTransitioningTo));
             *periodFlushed = true;
         }
 
@@ -195,15 +206,20 @@ bool VSyncReactor::addHwVsyncTimestamp(nsecs_t timestamp, std::optional<nsecs_t>
         endPeriodTransition();
         mMoreSamplesNeeded = mTracker.needsMoreSamples();
     } else if (mPeriodConfirmationInProgress) {
-        ATRACE_NAME("VSR: still confirming period");
+        SFTRACE_FORMAT("VSR %" PRIu64 ": still confirming period", mId.value);
         mLastHwVsync = timestamp;
         mMoreSamplesNeeded = true;
         *periodFlushed = false;
     } else {
-        ATRACE_NAME("VSR: adding sample");
+        SFTRACE_FORMAT("VSR %" PRIu64 ": adding sample", mId.value);
         *periodFlushed = false;
         mTracker.addVsyncTimestamp(timestamp);
         mMoreSamplesNeeded = mTracker.needsMoreSamples();
+    }
+
+    if (mExternalIgnoreFences) {
+      // keep HWVSync on as long as we ignore present fences.
+      mMoreSamplesNeeded = true;
     }
 
     if (!mMoreSamplesNeeded) {
@@ -225,10 +241,11 @@ void VSyncReactor::dump(std::string& result) const {
                   mInternalIgnoreFences, mExternalIgnoreFences);
     StringAppendF(&result, "mMoreSamplesNeeded=%d mPeriodConfirmationInProgress=%d\n",
                   mMoreSamplesNeeded, mPeriodConfirmationInProgress);
-    if (mPeriodTransitioningTo) {
-        StringAppendF(&result, "mPeriodTransitioningTo=%" PRId64 "\n", *mPeriodTransitioningTo);
+    if (mModePtrTransitioningTo) {
+        StringAppendF(&result, "mModePtrTransitioningTo=%s\n",
+                      to_string(*mModePtrTransitioningTo).c_str());
     } else {
-        StringAppendF(&result, "mPeriodTransitioningTo=nullptr\n");
+        StringAppendF(&result, "mModePtrTransitioningTo=nullptr\n");
     }
 
     if (mLastHwVsync) {

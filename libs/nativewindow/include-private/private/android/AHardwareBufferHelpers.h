@@ -27,8 +27,8 @@
 
 #include <stdint.h>
 
-struct AHardwareBuffer;
-struct AHardwareBuffer_Desc;
+#include <vndk/hardware_buffer.h>
+
 struct ANativeWindowBuffer;
 
 namespace android {
@@ -37,14 +37,8 @@ namespace android {
 // parameters. Note: this does not verify any platform-specific contraints.
 bool AHardwareBuffer_isValidDescription(const AHardwareBuffer_Desc* desc, bool log);
 
-// whether this AHardwareBuffer format is valid
-bool AHardwareBuffer_isValidPixelFormat(uint32_t ahardwarebuffer_format);
-
 // whether this is a YUV type format
 bool AHardwareBuffer_formatIsYuv(uint32_t format);
-
-// number of bytes per pixel or 0 if unknown or multi-planar
-uint32_t AHardwareBuffer_bytesPerPixel(uint32_t format);
 
 // convert AHardwareBuffer format to HAL format (note: this is a no-op)
 uint32_t AHardwareBuffer_convertFromPixelFormat(uint32_t format);

@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUT_INPUTDISPATCHER_LATENCYTRACKER_H
-#define _UI_INPUT_INPUTDISPATCHER_LATENCYTRACKER_H
+#pragma once
+
+#include "../InputDeviceMetricsSource.h"
 
 #include <map>
 #include <unordered_map>
@@ -24,6 +25,7 @@
 #include <input/Input.h>
 
 #include "InputEventTimeline.h"
+#include "NotifyArgs.h"
 
 namespace android::inputdispatcher {
 
@@ -50,13 +52,16 @@ public:
      * duplicate events that happen to have the same eventTime and inputEventId. Therefore, we
      * must drop all duplicate data.
      */
-    void trackListener(int32_t inputEventId, bool isDown, nsecs_t eventTime, nsecs_t readTime);
+    void trackListener(int32_t inputEventId, nsecs_t eventTime, nsecs_t readTime, DeviceId deviceId,
+                       const std::set<InputDeviceUsageSource>& sources, int32_t inputEventAction,
+                       InputEventType inputEventType);
     void trackFinishedEvent(int32_t inputEventId, const sp<IBinder>& connectionToken,
                             nsecs_t deliveryTime, nsecs_t consumeTime, nsecs_t finishTime);
     void trackGraphicsLatency(int32_t inputEventId, const sp<IBinder>& connectionToken,
                               std::array<nsecs_t, GraphicsTimeline::SIZE> timeline);
 
-    std::string dump(const char* prefix);
+    std::string dump(const char* prefix) const;
+    void setInputDevices(const std::vector<InputDeviceInfo>& inputDevices);
 
 private:
     /**
@@ -77,9 +82,8 @@ private:
     std::multimap<nsecs_t /*eventTime*/, int32_t /*inputEventId*/> mEventTimes;
 
     InputEventTimelineProcessor* mTimelineProcessor;
+    std::vector<InputDeviceInfo> mInputDevices;
     void reportAndPruneMatureRecords(nsecs_t newEventTime);
 };
 
 } // namespace android::inputdispatcher
-
-#endif // _UI_INPUT_INPUTDISPATCHER_LATENCYTRACKER_H

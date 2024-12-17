@@ -16,14 +16,14 @@
 
 #include <locale>
 #include <regex>
+#include <sstream>
+#include <string>
 
+#include <android/sysprop/InputProperties.sysprop.h>
 #include <ftl/enum.h>
 
 #include "../Macros.h"
 #include "PeripheralController.h"
-
-// Log detailed debug messages about input device lights.
-static constexpr bool DEBUG_LIGHT_DETAILS = false;
 
 namespace android {
 
@@ -45,6 +45,10 @@ static inline int32_t getBlue(int32_t color) {
 
 static inline int32_t toArgb(int32_t brightness, int32_t red, int32_t green, int32_t blue) {
     return (brightness & 0xff) << 24 | (red & 0xff) << 16 | (green & 0xff) << 8 | (blue & 0xff);
+}
+
+static inline bool isKeyboardBacklightCustomLevelsEnabled() {
+    return sysprop::InputProperties::enable_keyboard_backlight_custom_levels().value_or(true);
 }
 
 /**
@@ -73,7 +77,7 @@ std::optional<std::int32_t> PeripheralController::Light::getRawLightBrightness(i
 
     // If the light node doesn't have max brightness, use the default max brightness.
     int rawMaxBrightness = rawInfoOpt->maxBrightness.value_or(MAX_BRIGHTNESS);
-    float ratio = MAX_BRIGHTNESS / rawMaxBrightness;
+    float ratio = static_cast<float>(MAX_BRIGHTNESS) / rawMaxBrightness;
     // Scale the returned brightness in [0, rawMaxBrightness] to [0, 255]
     if (rawMaxBrightness != MAX_BRIGHTNESS) {
         brightness = brightness * ratio;
@@ -92,7 +96,7 @@ void PeripheralController::Light::setRawLightBrightness(int32_t rawLightId, int3
     }
     // If the light node doesn't have max brightness, use the default max brightness.
     int rawMaxBrightness = rawInfo->maxBrightness.value_or(MAX_BRIGHTNESS);
-    float ratio = MAX_BRIGHTNESS / rawMaxBrightness;
+    float ratio = static_cast<float>(MAX_BRIGHTNESS) / rawMaxBrightness;
     // Scale the requested brightness in [0, 255] to [0, rawMaxBrightness]
     if (rawMaxBrightness != MAX_BRIGHTNESS) {
         brightness = ceil(brightness / ratio);
@@ -154,7 +158,7 @@ std::optional<int32_t> PeripheralController::MonoLight::getLightColor() {
         return std::nullopt;
     }
 
-    return toArgb(brightness.value(), 0 /* red */, 0 /* green */, 0 /* blue */);
+    return toArgb(brightness.value(), /*red=*/0, /*green=*/0, /*blue=*/0);
 }
 
 std::optional<int32_t> PeripheralController::RgbLight::getLightColor() {
@@ -199,13 +203,12 @@ std::optional<int32_t> PeripheralController::MultiColorLight::getLightColor() {
     }
     std::unordered_map<LightColor, int32_t> intensities = ret.value();
     // Get red, green, blue colors
-    int32_t color = toArgb(0 /* brightness */, intensities.at(LightColor::RED) /* red */,
-                           intensities.at(LightColor::GREEN) /* green */,
-                           intensities.at(LightColor::BLUE) /* blue */);
+    int32_t color = toArgb(/*brightness=*/0, intensities.at(LightColor::RED),
+                           intensities.at(LightColor::GREEN), intensities.at(LightColor::BLUE));
     // Get brightness
     std::optional<int32_t> brightness = getRawLightBrightness(rawId);
     if (brightness.has_value()) {
-        return toArgb(brightness.value() /* A */, 0, 0, 0) | color;
+        return toArgb(/*brightness=*/brightness.value(), 0, 0, 0) | color;
     }
     return std::nullopt;
 }
@@ -274,9 +277,42 @@ void PeripheralController::populateDeviceInfo(InputDeviceInfo* deviceInfo) {
 
     for (const auto& [lightId, light] : mLights) {
         // Input device light doesn't support ordinal, always pass 1.
-        InputDeviceLightInfo lightInfo(light->name, light->id, light->type, 1 /* ordinal */);
+        InputDeviceLightInfo lightInfo(light->name, light->id, light->type, light->capabilityFlags,
+                                       /*ordinal=*/1, getPreferredBrightnessLevels(light.get()));
         deviceInfo->addLightInfo(lightInfo);
     }
+}
+
+// TODO(b/281822656): Move to constructor and add as a parameter to avoid parsing repeatedly.
+// Need to change lifecycle of Peripheral controller so that Input device configuration map is
+// available at construction time before moving this logic to constructor.
+std::set<BrightnessLevel> PeripheralController::getPreferredBrightnessLevels(
+        const Light* light) const {
+    std::set<BrightnessLevel> levels;
+    if (!isKeyboardBacklightCustomLevelsEnabled() ||
+        light->type != InputDeviceLightType::KEYBOARD_BACKLIGHT) {
+        return levels;
+    }
+    std::optional<std::string> keyboardBacklightLevels =
+            mDeviceContext.getConfiguration().getString("keyboard.backlight.brightnessLevels");
+    if (!keyboardBacklightLevels) {
+        return levels;
+    }
+    std::stringstream ss(*keyboardBacklightLevels);
+    while (ss.good()) {
+        std::string substr;
+        std::getline(ss, substr, ',');
+        char* end;
+        int32_t value = static_cast<int32_t>(strtol(substr.c_str(), &end, 10));
+        if (*end != '\0' || value < 0 || value > 255) {
+            ALOGE("Error parsing keyboard backlight brightness levels, provided levels = %s",
+                  keyboardBacklightLevels->c_str());
+            levels.clear();
+            break;
+        }
+        levels.insert(BrightnessLevel(value));
+    }
+    return levels;
 }
 
 void PeripheralController::dump(std::string& dump) {
@@ -287,6 +323,8 @@ void PeripheralController::dump(std::string& dump) {
             dump += StringPrintf(INDENT4 "Id: %d", lightId);
             dump += StringPrintf(INDENT4 "Name: %s", light->name.c_str());
             dump += StringPrintf(INDENT4 "Type: %s", ftl::enum_string(light->type).c_str());
+            dump += StringPrintf(INDENT4 "Capability flags: %s",
+                                 light->capabilityFlags.string().c_str());
             light->dump(dump);
         }
     }
@@ -366,6 +404,8 @@ void PeripheralController::configureLights() {
     std::unordered_map<LightColor, int32_t /* rawLightId */> rawRgbIds;
     // Map from player Id to raw light Id
     std::unordered_map<int32_t, int32_t> playerIdLightIds;
+    // Set of Keyboard backlights
+    std::set<int32_t> keyboardBacklightIds;
 
     // Check raw lights
     const std::vector<int32_t> rawLightIds = getDeviceContext().getRawLightIds();
@@ -378,7 +418,11 @@ void PeripheralController::configureLights() {
         }
         rawInfos.insert_or_assign(rawId, rawInfo.value());
         // Check if this is a group LEDs for player ID
-        std::regex lightPattern("([a-z]+)([0-9]+)");
+        // The name for the light has already been parsed and is the `function`
+        // value; for player ID lights the function is expected to be `player-#`.
+        // However, the Sony driver will use `sony#` instead on SIXAXIS
+        // gamepads.
+        std::regex lightPattern("(player|sony)-?([0-9]+)");
         std::smatch results;
         if (std::regex_match(rawInfo->name, results, lightPattern)) {
             std::string commonName = results[1].str();
@@ -393,6 +437,10 @@ void PeripheralController::configureLights() {
                     playerIdLightIds.insert_or_assign(playerId, rawId);
                 }
             }
+        }
+        // Check if this is a Keyboard backlight
+        if (rawInfo->flags.test(InputLightClass::KEYBOARD_BACKLIGHT)) {
+            keyboardBacklightIds.insert(rawId);
         }
         // Check if this is an LED of RGB light
         if (rawInfo->flags.test(InputLightClass::RED)) {
@@ -434,8 +482,21 @@ void PeripheralController::configureLights() {
             ALOGD("Rgb light ids [%d, %d, %d] \n", rawRgbIds.at(LightColor::RED),
                   rawRgbIds.at(LightColor::GREEN), rawRgbIds.at(LightColor::BLUE));
         }
+        bool isKeyboardBacklight = keyboardBacklightIds.find(rawRgbIds.at(LightColor::RED)) !=
+                        keyboardBacklightIds.end() &&
+                keyboardBacklightIds.find(rawRgbIds.at(LightColor::GREEN)) !=
+                        keyboardBacklightIds.end() &&
+                keyboardBacklightIds.find(rawRgbIds.at(LightColor::BLUE)) !=
+                        keyboardBacklightIds.end() &&
+                (!rawGlobalId.has_value() ||
+                 keyboardBacklightIds.find(rawGlobalId.value()) != keyboardBacklightIds.end());
+
         std::unique_ptr<Light> light =
-                std::make_unique<RgbLight>(getDeviceContext(), ++mNextId, rawRgbIds, rawGlobalId);
+                std::make_unique<RgbLight>(getDeviceContext(), ++mNextId,
+                                           isKeyboardBacklight
+                                                   ? InputDeviceLightType::KEYBOARD_BACKLIGHT
+                                                   : InputDeviceLightType::INPUT,
+                                           rawRgbIds, rawGlobalId);
         mLights.insert_or_assign(light->id, std::move(light));
         // Remove from raw light info as they've been composed a RBG light.
         rawInfos.erase(rawRgbIds.at(LightColor::RED));
@@ -448,6 +509,15 @@ void PeripheralController::configureLights() {
 
     // Check the rest of raw light infos
     for (const auto& [rawId, rawInfo] : rawInfos) {
+        InputDeviceLightType type;
+        if (keyboardBacklightIds.find(rawId) != keyboardBacklightIds.end()) {
+            type = InputDeviceLightType::KEYBOARD_BACKLIGHT;
+        } else if (rawInfo.flags.test(InputLightClass::KEYBOARD_MIC_MUTE)) {
+            type = InputDeviceLightType::KEYBOARD_MIC_MUTE;
+        } else {
+            type = InputDeviceLightType::INPUT;
+        }
+
         // If the node is multi-color led, construct a MULTI_COLOR light
         if (rawInfo.flags.test(InputLightClass::MULTI_INDEX) &&
             rawInfo.flags.test(InputLightClass::MULTI_INTENSITY)) {
@@ -456,7 +526,7 @@ void PeripheralController::configureLights() {
             }
             std::unique_ptr<Light> light =
                     std::make_unique<MultiColorLight>(getDeviceContext(), rawInfo.name, ++mNextId,
-                                                      rawInfo.id);
+                                                      type, rawInfo.id);
             mLights.insert_or_assign(light->id, std::move(light));
             continue;
         }
@@ -465,7 +535,7 @@ void PeripheralController::configureLights() {
             ALOGD("Mono light Id %d name %s \n", rawInfo.id, rawInfo.name.c_str());
         }
         std::unique_ptr<Light> light = std::make_unique<MonoLight>(getDeviceContext(), rawInfo.name,
-                                                                   ++mNextId, rawInfo.id);
+                                                                   ++mNextId, type, rawInfo.id);
 
         mLights.insert_or_assign(light->id, std::move(light));
     }
@@ -527,5 +597,4 @@ std::optional<int32_t> PeripheralController::getLightPlayerId(int32_t lightId) {
 int32_t PeripheralController::getEventHubId() const {
     return getDeviceContext().getEventHubId();
 }
-
 } // namespace android

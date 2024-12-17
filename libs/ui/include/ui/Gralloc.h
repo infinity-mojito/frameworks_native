@@ -23,6 +23,7 @@
 #include <ui/PixelFormat.h>
 #include <ui/Rect.h>
 #include <utils/StrongPointer.h>
+#include "GraphicBufferAllocator.h"
 
 #include <string>
 
@@ -39,14 +40,11 @@ public:
         return "";
     }
 
-    virtual status_t createDescriptor(void* bufferDescriptorInfo,
-                                      void* outBufferDescriptor) const = 0;
-
     // Import a buffer that is from another HAL, another process, or is
     // cloned.
     //
     // The returned handle must be freed with freeBuffer.
-    virtual status_t importBuffer(const hardware::hidl_handle& rawHandle,
+    virtual status_t importBuffer(const native_handle_t* rawHandle,
                                   buffer_handle_t* outBufferHandle) const = 0;
 
     virtual void freeBuffer(buffer_handle_t bufferHandle) const = 0;
@@ -203,77 +201,6 @@ public:
                                      std::optional<std::vector<uint8_t>> /*smpte2094_10*/) const {
         return INVALID_OPERATION;
     }
-    virtual status_t getDefaultPixelFormatFourCC(uint32_t /*width*/, uint32_t /*height*/,
-                                                 PixelFormat /*format*/, uint32_t /*layerCount*/,
-                                                 uint64_t /*usage*/,
-                                                 uint32_t* /*outPixelFormatFourCC*/) const {
-        return INVALID_OPERATION;
-    }
-    virtual status_t getDefaultPixelFormatModifier(uint32_t /*width*/, uint32_t /*height*/,
-                                                   PixelFormat /*format*/, uint32_t /*layerCount*/,
-                                                   uint64_t /*usage*/,
-                                                   uint64_t* /*outPixelFormatModifier*/) const {
-        return INVALID_OPERATION;
-    }
-    virtual status_t getDefaultAllocationSize(uint32_t /*width*/, uint32_t /*height*/,
-                                              PixelFormat /*format*/, uint32_t /*layerCount*/,
-                                              uint64_t /*usage*/,
-                                              uint64_t* /*outAllocationSize*/) const {
-        return INVALID_OPERATION;
-    }
-    virtual status_t getDefaultProtectedContent(uint32_t /*width*/, uint32_t /*height*/,
-                                                PixelFormat /*format*/, uint32_t /*layerCount*/,
-                                                uint64_t /*usage*/,
-                                                uint64_t* /*outProtectedContent*/) const {
-        return INVALID_OPERATION;
-    }
-    virtual status_t getDefaultCompression(
-            uint32_t /*width*/, uint32_t /*height*/, PixelFormat /*format*/,
-            uint32_t /*layerCount*/, uint64_t /*usage*/,
-            aidl::android::hardware::graphics::common::ExtendableType* /*outCompression*/) const {
-        return INVALID_OPERATION;
-    }
-    virtual status_t getDefaultCompression(uint32_t /*width*/, uint32_t /*height*/,
-                                           PixelFormat /*format*/, uint32_t /*layerCount*/,
-                                           uint64_t /*usage*/,
-                                           ui::Compression* /*outCompression*/) const {
-        return INVALID_OPERATION;
-    }
-    virtual status_t getDefaultInterlaced(
-            uint32_t /*width*/, uint32_t /*height*/, PixelFormat /*format*/,
-            uint32_t /*layerCount*/, uint64_t /*usage*/,
-            aidl::android::hardware::graphics::common::ExtendableType* /*outInterlaced*/) const {
-        return INVALID_OPERATION;
-    }
-    virtual status_t getDefaultInterlaced(uint32_t /*width*/, uint32_t /*height*/,
-                                          PixelFormat /*format*/, uint32_t /*layerCount*/,
-                                          uint64_t /*usage*/,
-                                          ui::Interlaced* /*outInterlaced*/) const {
-        return INVALID_OPERATION;
-    }
-    virtual status_t getDefaultChromaSiting(
-            uint32_t /*width*/, uint32_t /*height*/, PixelFormat /*format*/,
-            uint32_t /*layerCount*/, uint64_t /*usage*/,
-            aidl::android::hardware::graphics::common::ExtendableType* /*outChromaSiting*/) const {
-        return INVALID_OPERATION;
-    }
-    virtual status_t getDefaultChromaSiting(uint32_t /*width*/, uint32_t /*height*/,
-                                            PixelFormat /*format*/, uint32_t /*layerCount*/,
-                                            uint64_t /*usage*/,
-                                            ui::ChromaSiting* /*outChromaSiting*/) const {
-        return INVALID_OPERATION;
-    }
-    virtual status_t getDefaultPlaneLayouts(
-            uint32_t /*width*/, uint32_t /*height*/, PixelFormat /*format*/,
-            uint32_t /*layerCount*/, uint64_t /*usage*/,
-            std::vector<ui::PlaneLayout>* /*outPlaneLayouts*/) const {
-        return INVALID_OPERATION;
-    }
-
-    virtual std::vector<android::hardware::graphics::mapper::V4_0::IMapper::MetadataTypeDescription>
-    listSupportedMetadataTypes() const {
-        return {};
-    }
 };
 
 // A wrapper to IAllocator
@@ -292,9 +219,15 @@ public:
      */
     virtual status_t allocate(std::string requestorName, uint32_t width, uint32_t height,
                               PixelFormat format, uint32_t layerCount, uint64_t usage,
-                              uint32_t bufferCount, uint32_t* outStride,
-                              buffer_handle_t* outBufferHandles,
+                              uint32_t* outStride, buffer_handle_t* outBufferHandles,
                               bool importBuffers = true) const = 0;
+
+    virtual GraphicBufferAllocator::AllocationResult allocate(
+            const GraphicBufferAllocator::AllocationRequest&) const {
+        return GraphicBufferAllocator::AllocationResult(UNKNOWN_TRANSACTION);
+    }
+
+    virtual bool supportsAdditionalOptions() const { return false; }
 };
 
 } // namespace android

@@ -17,13 +17,22 @@
 #undef LOG_TAG
 #define LOG_TAG "LibSurfaceFlingerUnittests"
 
+#include <com_android_graphics_surfaceflinger_flags.h>
+#include <common/test/FlagUtils.h>
 #include "DisplayTransactionTestHelpers.h"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+using namespace com::android::graphics::surfaceflinger;
+
 namespace android {
 namespace {
+
+MATCHER_P(DisplayModeFps, value, "equals") {
+    using fps_approx_ops::operator==;
+    return arg->getVsyncRate() == value;
+}
 
 // Used when we simulate a display that supports doze.
 template <typename Display>
@@ -59,54 +68,48 @@ struct DozeNotSupportedVariant {
 };
 
 struct EventThreadBaseSupportedVariant {
-    static void setupVsyncAndEventThreadNoCallExpectations(DisplayTransactionTest* test) {
-        // The callback should not be notified to toggle VSYNC.
-        EXPECT_CALL(test->mFlinger.mockSchedulerCallback(), setVsyncEnabled(_)).Times(0);
-
-        // The event thread should not be notified.
-        EXPECT_CALL(*test->mEventThread, onScreenReleased()).Times(0);
-        EXPECT_CALL(*test->mEventThread, onScreenAcquired()).Times(0);
+    static void setupVsyncNoCallExpectations(DisplayTransactionTest* test) {
+        // Expect no change to hardware nor synthetic VSYNC.
+        EXPECT_CALL(test->mFlinger.scheduler()->mockRequestHardwareVsync, Call(_, _)).Times(0);
+        EXPECT_CALL(*test->mEventThread, enableSyntheticVsync(_)).Times(0);
     }
 };
 
 struct EventThreadNotSupportedVariant : public EventThreadBaseSupportedVariant {
-    static void setupAcquireAndEnableVsyncCallExpectations(DisplayTransactionTest* test) {
-        // These calls are only expected for the primary display.
-
-        // Instead expect no calls.
-        setupVsyncAndEventThreadNoCallExpectations(test);
+    static void setupEnableVsyncCallExpectations(DisplayTransactionTest* test) {
+        EXPECT_CALL(test->mFlinger.scheduler()->mockRequestHardwareVsync, Call(_, true)).Times(1);
+        EXPECT_CALL(*test->mEventThread, enableSyntheticVsync(_)).Times(0);
     }
 
-    static void setupReleaseAndDisableVsyncCallExpectations(DisplayTransactionTest* test) {
-        // These calls are only expected for the primary display.
-
-        // Instead expect no calls.
-        setupVsyncAndEventThreadNoCallExpectations(test);
+    static void setupDisableVsyncCallExpectations(DisplayTransactionTest* test) {
+        EXPECT_CALL(test->mFlinger.scheduler()->mockRequestHardwareVsync, Call(_, false)).Times(1);
+        EXPECT_CALL(*test->mEventThread, enableSyntheticVsync(_)).Times(0);
     }
 };
 
 struct EventThreadIsSupportedVariant : public EventThreadBaseSupportedVariant {
-    static void setupAcquireAndEnableVsyncCallExpectations(DisplayTransactionTest* test) {
-        // The callback should be notified to enable VSYNC.
-        EXPECT_CALL(test->mFlinger.mockSchedulerCallback(), setVsyncEnabled(true)).Times(1);
-
-        // The event thread should be notified that the screen was acquired.
-        EXPECT_CALL(*test->mEventThread, onScreenAcquired()).Times(1);
+    static void setupEnableVsyncCallExpectations(DisplayTransactionTest* test) {
+        // Expect to enable hardware VSYNC and disable synthetic VSYNC.
+        EXPECT_CALL(test->mFlinger.scheduler()->mockRequestHardwareVsync, Call(_, true)).Times(1);
+        EXPECT_CALL(*test->mEventThread, enableSyntheticVsync(false)).Times(1);
     }
 
-    static void setupReleaseAndDisableVsyncCallExpectations(DisplayTransactionTest* test) {
-        // The callback should be notified to disable VSYNC.
-        EXPECT_CALL(test->mFlinger.mockSchedulerCallback(), setVsyncEnabled(false)).Times(1);
-
-        // The event thread should not be notified that the screen was released.
-        EXPECT_CALL(*test->mEventThread, onScreenReleased()).Times(1);
+    static void setupDisableVsyncCallExpectations(DisplayTransactionTest* test) {
+        // Expect to disable hardware VSYNC and enable synthetic VSYNC.
+        EXPECT_CALL(test->mFlinger.scheduler()->mockRequestHardwareVsync, Call(_, false)).Times(1);
+        EXPECT_CALL(*test->mEventThread, enableSyntheticVsync(true)).Times(1);
     }
 };
 
 struct DispSyncIsSupportedVariant {
     static void setupResetModelCallExpectations(DisplayTransactionTest* test) {
-        EXPECT_CALL(*test->mVsyncController, startPeriodTransition(DEFAULT_VSYNC_PERIOD)).Times(1);
-        EXPECT_CALL(*test->mVSyncTracker, resetModel()).Times(1);
+        auto vsyncSchedule = test->mFlinger.scheduler()->getVsyncSchedule();
+        EXPECT_CALL(static_cast<mock::VsyncController&>(vsyncSchedule->getController()),
+                    onDisplayModeChanged(DisplayModeFps(Fps::fromPeriodNsecs(DEFAULT_VSYNC_PERIOD)),
+                                         false))
+                .Times(1);
+        EXPECT_CALL(static_cast<mock::VSyncTracker&>(vsyncSchedule->getTracker()), resetModel())
+                .Times(1);
     }
 };
 
@@ -133,14 +136,13 @@ struct TransitionOffToOnVariant : public TransitionVariantCommon<PowerMode::OFF,
     template <typename Case>
     static void setupCallExpectations(DisplayTransactionTest* test) {
         Case::setupComposerCallExpectations(test, IComposerClient::PowerMode::ON);
-        Case::EventThread::setupAcquireAndEnableVsyncCallExpectations(test);
+        Case::EventThread::setupEnableVsyncCallExpectations(test);
         Case::DispSync::setupResetModelCallExpectations(test);
         Case::setupRepaintEverythingCallExpectations(test);
     }
 
     static void verifyPostconditions(DisplayTransactionTest* test) {
         EXPECT_TRUE(test->mFlinger.getVisibleRegionsDirty());
-        EXPECT_TRUE(test->mFlinger.getHasPoweredOff());
     }
 };
 
@@ -149,20 +151,19 @@ struct TransitionOffToDozeSuspendVariant
     template <typename Case>
     static void setupCallExpectations(DisplayTransactionTest* test) {
         Case::setupComposerCallExpectations(test, Case::Doze::ACTUAL_POWER_MODE_FOR_DOZE_SUSPEND);
-        Case::EventThread::setupVsyncAndEventThreadNoCallExpectations(test);
+        Case::EventThread::setupVsyncNoCallExpectations(test);
         Case::setupRepaintEverythingCallExpectations(test);
     }
 
     static void verifyPostconditions(DisplayTransactionTest* test) {
         EXPECT_TRUE(test->mFlinger.getVisibleRegionsDirty());
-        EXPECT_TRUE(test->mFlinger.getHasPoweredOff());
     }
 };
 
 struct TransitionOnToOffVariant : public TransitionVariantCommon<PowerMode::ON, PowerMode::OFF> {
     template <typename Case>
     static void setupCallExpectations(DisplayTransactionTest* test) {
-        Case::EventThread::setupReleaseAndDisableVsyncCallExpectations(test);
+        Case::EventThread::setupDisableVsyncCallExpectations(test);
         Case::setupComposerCallExpectations(test, IComposerClient::PowerMode::OFF);
     }
 
@@ -175,7 +176,7 @@ struct TransitionDozeSuspendToOffVariant
       : public TransitionVariantCommon<PowerMode::DOZE_SUSPEND, PowerMode::OFF> {
     template <typename Case>
     static void setupCallExpectations(DisplayTransactionTest* test) {
-        Case::EventThread::setupVsyncAndEventThreadNoCallExpectations(test);
+        Case::EventThread::setupVsyncNoCallExpectations(test);
         Case::setupComposerCallExpectations(test, IComposerClient::PowerMode::OFF);
     }
 
@@ -187,7 +188,7 @@ struct TransitionDozeSuspendToOffVariant
 struct TransitionOnToDozeVariant : public TransitionVariantCommon<PowerMode::ON, PowerMode::DOZE> {
     template <typename Case>
     static void setupCallExpectations(DisplayTransactionTest* test) {
-        Case::EventThread::setupVsyncAndEventThreadNoCallExpectations(test);
+        Case::EventThread::setupVsyncNoCallExpectations(test);
         Case::setupComposerCallExpectations(test, Case::Doze::ACTUAL_POWER_MODE_FOR_DOZE);
     }
 };
@@ -196,7 +197,7 @@ struct TransitionDozeSuspendToDozeVariant
       : public TransitionVariantCommon<PowerMode::DOZE_SUSPEND, PowerMode::DOZE> {
     template <typename Case>
     static void setupCallExpectations(DisplayTransactionTest* test) {
-        Case::EventThread::setupAcquireAndEnableVsyncCallExpectations(test);
+        Case::EventThread::setupEnableVsyncCallExpectations(test);
         Case::DispSync::setupResetModelCallExpectations(test);
         Case::setupComposerCallExpectations(test, Case::Doze::ACTUAL_POWER_MODE_FOR_DOZE);
     }
@@ -205,7 +206,7 @@ struct TransitionDozeSuspendToDozeVariant
 struct TransitionDozeToOnVariant : public TransitionVariantCommon<PowerMode::DOZE, PowerMode::ON> {
     template <typename Case>
     static void setupCallExpectations(DisplayTransactionTest* test) {
-        Case::EventThread::setupVsyncAndEventThreadNoCallExpectations(test);
+        Case::EventThread::setupVsyncNoCallExpectations(test);
         Case::setupComposerCallExpectations(test, IComposerClient::PowerMode::ON);
     }
 };
@@ -214,7 +215,7 @@ struct TransitionDozeSuspendToOnVariant
       : public TransitionVariantCommon<PowerMode::DOZE_SUSPEND, PowerMode::ON> {
     template <typename Case>
     static void setupCallExpectations(DisplayTransactionTest* test) {
-        Case::EventThread::setupAcquireAndEnableVsyncCallExpectations(test);
+        Case::EventThread::setupEnableVsyncCallExpectations(test);
         Case::DispSync::setupResetModelCallExpectations(test);
         Case::setupComposerCallExpectations(test, IComposerClient::PowerMode::ON);
     }
@@ -224,7 +225,7 @@ struct TransitionOnToDozeSuspendVariant
       : public TransitionVariantCommon<PowerMode::ON, PowerMode::DOZE_SUSPEND> {
     template <typename Case>
     static void setupCallExpectations(DisplayTransactionTest* test) {
-        Case::EventThread::setupReleaseAndDisableVsyncCallExpectations(test);
+        Case::EventThread::setupDisableVsyncCallExpectations(test);
         Case::setupComposerCallExpectations(test, Case::Doze::ACTUAL_POWER_MODE_FOR_DOZE_SUSPEND);
     }
 };
@@ -233,7 +234,7 @@ struct TransitionOnToUnknownVariant
       : public TransitionVariantCommon<PowerMode::ON, static_cast<PowerMode>(POWER_MODE_LEET)> {
     template <typename Case>
     static void setupCallExpectations(DisplayTransactionTest* test) {
-        Case::EventThread::setupVsyncAndEventThreadNoCallExpectations(test);
+        Case::EventThread::setupVsyncNoCallExpectations(test);
         Case::setupNoComposerPowerModeCallExpectations(test);
     }
 };
@@ -255,32 +256,22 @@ struct DisplayPowerCase {
     using DispSync = DispSyncVariant;
     using Transition = TransitionVariant;
 
-    static auto injectDisplayWithInitialPowerMode(DisplayTransactionTest* test, PowerMode mode) {
+    static sp<DisplayDevice> injectDisplayWithInitialPowerMode(DisplayTransactionTest* test,
+                                                               PowerMode mode) {
         Display::injectHwcDisplayWithNoDefaultCapabilities(test);
-        auto display = Display::makeFakeExistingDisplayInjector(test);
-        display.inject();
-        display.mutableDisplayDevice()->setPowerMode(mode);
-        if (display.mutableDisplayDevice()->isInternal()) {
-            test->mFlinger.mutableActiveDisplayToken() =
-                    display.mutableDisplayDevice()->getDisplayToken();
-        }
-
+        auto injector = Display::makeFakeExistingDisplayInjector(test);
+        const auto display = injector.inject();
+        display->setPowerMode(mode);
         return display;
     }
 
-    static void setInitialPrimaryHWVsyncEnabled(DisplayTransactionTest* test, bool enabled) {
-        test->mFlinger.scheduler()->mutablePrimaryHWVsyncEnabled() = enabled;
+    static void setInitialHwVsyncEnabled(DisplayTransactionTest* test, PhysicalDisplayId id,
+                                         bool enabled) {
+        test->mFlinger.scheduler()->setInitialHwVsyncEnabled(id, enabled);
     }
 
     static void setupRepaintEverythingCallExpectations(DisplayTransactionTest* test) {
-        EXPECT_CALL(*test->mFlinger.scheduler(), scheduleFrame()).Times(1);
-    }
-
-    static void setupSurfaceInterceptorCallExpectations(DisplayTransactionTest* test,
-                                                        PowerMode mode) {
-        EXPECT_CALL(*test->mSurfaceInterceptor, isEnabled()).WillOnce(Return(true));
-        EXPECT_CALL(*test->mSurfaceInterceptor, savePowerModeUpdate(_, static_cast<int32_t>(mode)))
-                .Times(1);
+        EXPECT_CALL(*test->mFlinger.scheduler(), scheduleFrame(_)).Times(1);
     }
 
     static void setupComposerCallExpectations(DisplayTransactionTest* test, PowerMode mode) {
@@ -313,6 +304,11 @@ using PrimaryDisplayPowerCase =
 // A sample configuration for the external display.
 // In addition to not having event thread support, we emulate not having doze
 // support.
+// TODO (b/267483230): ExternalDisplay supports the features tracked in
+// DispSyncIsSupportedVariant, but is the follower, so the
+// expectations set by DispSyncIsSupportedVariant don't match (wrong schedule).
+// We need a way to retrieve the proper DisplayId from
+// setupResetModelCallExpectations (or pass it in).
 template <typename TransitionVariant>
 using ExternalDisplayPowerCase =
         DisplayPowerCase<ExternalDisplayVariant, DozeNotSupportedVariant<ExternalDisplayVariant>,
@@ -342,21 +338,22 @@ void SetPowerModeInternalTest::transitionDisplayCommon() {
     Case::Doze::setupComposerCallExpectations(this);
     auto display =
             Case::injectDisplayWithInitialPowerMode(this, Case::Transition::INITIAL_POWER_MODE);
-    Case::setInitialPrimaryHWVsyncEnabled(this,
-                                          PowerModeInitialVSyncEnabled<
-                                                  Case::Transition::INITIAL_POWER_MODE>::value);
+    auto displayId = display->getId();
+    if (auto physicalDisplayId = PhysicalDisplayId::tryCast(displayId)) {
+        Case::setInitialHwVsyncEnabled(this, *physicalDisplayId,
+                                       PowerModeInitialVSyncEnabled<
+                                               Case::Transition::INITIAL_POWER_MODE>::value);
+    }
 
     // --------------------------------------------------------------------
     // Call Expectations
 
-    Case::setupSurfaceInterceptorCallExpectations(this, Case::Transition::TARGET_POWER_MODE);
     Case::Transition::template setupCallExpectations<Case>(this);
 
     // --------------------------------------------------------------------
     // Invocation
 
-    mFlinger.setPowerModeInternal(display.mutableDisplayDevice(),
-                                  Case::Transition::TARGET_POWER_MODE);
+    mFlinger.setPowerModeInternal(display, Case::Transition::TARGET_POWER_MODE);
 
     // --------------------------------------------------------------------
     // Postconditions
@@ -460,6 +457,7 @@ TEST_F(SetPowerModeInternalTest, transitionsDisplayFromOnToUnknownPrimaryDisplay
 }
 
 TEST_F(SetPowerModeInternalTest, transitionsDisplayFromOffToOnExternalDisplay) {
+    SET_FLAG_FOR_TEST(flags::multithreaded_present, true);
     transitionDisplayCommon<ExternalDisplayPowerCase<TransitionOffToOnVariant>>();
 }
 
@@ -468,6 +466,7 @@ TEST_F(SetPowerModeInternalTest, transitionsDisplayFromOffToDozeSuspendExternalD
 }
 
 TEST_F(SetPowerModeInternalTest, transitionsDisplayFromOnToOffExternalDisplay) {
+    SET_FLAG_FOR_TEST(flags::multithreaded_present, true);
     transitionDisplayCommon<ExternalDisplayPowerCase<TransitionOnToOffVariant>>();
 }
 
@@ -480,6 +479,7 @@ TEST_F(SetPowerModeInternalTest, transitionsDisplayFromOnToDozeExternalDisplay) 
 }
 
 TEST_F(SetPowerModeInternalTest, transitionsDisplayFromDozeSuspendToDozeExternalDisplay) {
+    SET_FLAG_FOR_TEST(flags::multithreaded_present, true);
     transitionDisplayCommon<ExternalDisplayPowerCase<TransitionDozeSuspendToDozeVariant>>();
 }
 
@@ -488,10 +488,12 @@ TEST_F(SetPowerModeInternalTest, transitionsDisplayFromDozeToOnExternalDisplay) 
 }
 
 TEST_F(SetPowerModeInternalTest, transitionsDisplayFromDozeSuspendToOnExternalDisplay) {
+    SET_FLAG_FOR_TEST(flags::multithreaded_present, true);
     transitionDisplayCommon<ExternalDisplayPowerCase<TransitionDozeSuspendToOnVariant>>();
 }
 
 TEST_F(SetPowerModeInternalTest, transitionsDisplayFromOnToDozeSuspendExternalDisplay) {
+    SET_FLAG_FOR_TEST(flags::multithreaded_present, true);
     transitionDisplayCommon<ExternalDisplayPowerCase<TransitionOnToDozeSuspendVariant>>();
 }
 

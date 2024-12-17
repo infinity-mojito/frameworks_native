@@ -725,8 +725,7 @@ inline status_t flatten(HGraphicBufferProducer::FrameEventsDelta const& t,
         std::vector<native_handle_t*>* nh,
         void*& buffer, size_t& size, int*& fds, size_t numFds) {
     // Check that t.index is within a valid range.
-    if (t.index >= static_cast<uint32_t>(FrameEventHistory::MAX_FRAME_HISTORY)
-            || t.index > std::numeric_limits<uint8_t>::max()) {
+    if (t.index > UINT8_MAX || t.index < 0) {
         return BAD_VALUE;
     }
 
@@ -829,7 +828,7 @@ inline status_t flatten(
         HGraphicBufferProducer::FrameEventHistoryDelta const& t,
         std::vector<std::vector<native_handle_t*> >* nh,
         void*& buffer, size_t& size, int*& fds, size_t& numFds) {
-    if (t.deltas.size() > ::android::FrameEventHistory::MAX_FRAME_HISTORY) {
+    if (t.deltas.size() > UINT8_MAX) {
         return BAD_VALUE;
     }
     if (size < getFlattenedSize(t)) {
@@ -1173,9 +1172,12 @@ status_t H2BGraphicBufferProducer::setGenerationNumber(uint32_t generationNumber
 
 String8 H2BGraphicBufferProducer::getConsumerName() const {
     String8 lName;
-    mBase->getConsumerName([&lName] (hidl_string const& name) {
-                lName = name.c_str();
-            });
+    status_t transStatus = toStatusT(
+            mBase->getConsumerName([&lName](hidl_string const& name) { lName = name.c_str(); }));
+    if (transStatus != NO_ERROR) {
+        ALOGE("getConsumerName failed to transact: %d", transStatus);
+        return String8("TransactFailed");
+    }
     return lName;
 }
 

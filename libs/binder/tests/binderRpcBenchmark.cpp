@@ -74,6 +74,44 @@ class MyBinderRpcBenchmark : public BnBinderRpcBenchmark {
         *out = bytes;
         return Status::ok();
     }
+
+    class CountedBinder : public BBinder {
+    public:
+        CountedBinder(const sp<MyBinderRpcBenchmark>& parent) : mParent(parent) {
+            std::lock_guard<std::mutex> l(mParent->mCountMutex);
+            mParent->mBinderCount++;
+            // std::cout << "Count + is now " << mParent->mBinderCount << std::endl;
+        }
+        ~CountedBinder() {
+            {
+                std::lock_guard<std::mutex> l(mParent->mCountMutex);
+                mParent->mBinderCount--;
+                // std::cout << "Count - is now " << mParent->mBinderCount << std::endl;
+
+                // skip notify
+                if (mParent->mBinderCount != 0) return;
+            }
+            mParent->mCountCv.notify_one();
+        }
+
+    private:
+        sp<MyBinderRpcBenchmark> mParent;
+    };
+
+    Status gimmeBinder(sp<IBinder>* out) override {
+        *out = sp<CountedBinder>::make(sp<MyBinderRpcBenchmark>::fromExisting(this));
+        return Status::ok();
+    }
+    Status waitGimmesDestroyed() override {
+        std::unique_lock<std::mutex> l(mCountMutex);
+        mCountCv.wait(l, [&] { return mBinderCount == 0; });
+        return Status::ok();
+    }
+
+    friend class CountedBinder;
+    std::mutex mCountMutex;
+    std::condition_variable mCountCv;
+    size_t mBinderCount;
 };
 
 enum Transport {
@@ -102,9 +140,11 @@ std::unique_ptr<RpcTransportCtxFactory> makeFactoryTls() {
 }
 
 static sp<RpcSession> gSession = RpcSession::make();
+static sp<IBinder> gRpcBinder;
 // Certificate validation happens during handshake and does not affect the result of benchmarks.
 // Skip certificate validation to simplify the setup process.
 static sp<RpcSession> gSessionTls = RpcSession::make(makeFactoryTls());
+static sp<IBinder> gRpcTlsBinder;
 #ifdef __BIONIC__
 static const String16 kKernelBinderInstance = String16(u"binderRpcBenchmark-control");
 static sp<IBinder> gKernelBinder;
@@ -118,12 +158,31 @@ static sp<IBinder> getBinderForOptions(benchmark::State& state) {
             return gKernelBinder;
 #endif
         case RPC:
-            return gSession->getRootObject();
+            return gRpcBinder;
         case RPC_TLS:
-            return gSessionTls->getRootObject();
+            return gRpcTlsBinder;
         default:
             LOG(FATAL) << "Unknown transport value: " << transport;
             return nullptr;
+    }
+}
+
+static void SetLabel(benchmark::State& state) {
+    Transport transport = static_cast<Transport>(state.range(0));
+    switch (transport) {
+#ifdef __BIONIC__
+        case KERNEL:
+            state.SetLabel("kernel");
+            break;
+#endif
+        case RPC:
+            state.SetLabel("rpc");
+            break;
+        case RPC_TLS:
+            state.SetLabel("rpc_tls");
+            break;
+        default:
+            LOG(FATAL) << "Unknown transport value: " << transport;
     }
 }
 
@@ -133,6 +192,8 @@ void BM_pingTransaction(benchmark::State& state) {
     while (state.KeepRunning()) {
         CHECK_EQ(OK, binder->pingBinder());
     }
+
+    SetLabel(state);
 }
 BENCHMARK(BM_pingTransaction)->ArgsProduct({kTransportList});
 
@@ -155,13 +216,15 @@ void BM_repeatTwoPageString(benchmark::State& state) {
     // by how many binder calls work together (and by factors like the scheduler,
     // thermal throttling, core choice, etc..).
     std::string str = std::string(getpagesize() * 2, 'a');
-    CHECK_EQ(str.size(), getpagesize() * 2);
+    CHECK_EQ(static_cast<ssize_t>(str.size()), getpagesize() * 2);
 
     while (state.KeepRunning()) {
         std::string out;
         Status ret = iface->repeatString(str, &out);
         CHECK(ret.isOk()) << ret;
     }
+
+    SetLabel(state);
 }
 BENCHMARK(BM_repeatTwoPageString)->ArgsProduct({kTransportList});
 
@@ -180,10 +243,44 @@ void BM_throughputForTransportAndBytes(benchmark::State& state) {
         Status ret = iface->repeatBytes(bytes, &out);
         CHECK(ret.isOk()) << ret;
     }
+
+    SetLabel(state);
 }
 BENCHMARK(BM_throughputForTransportAndBytes)
         ->ArgsProduct({kTransportList,
                        {64, 1024, 2048, 4096, 8182, 16364, 32728, 65535, 65536, 65537}});
+
+void BM_collectProxies(benchmark::State& state) {
+    sp<IBinder> binder = getBinderForOptions(state);
+    sp<IBinderRpcBenchmark> iface = interface_cast<IBinderRpcBenchmark>(binder);
+    CHECK(iface != nullptr);
+
+    const size_t kNumIters = state.range(1);
+
+    while (state.KeepRunning()) {
+        std::vector<sp<IBinder>> out;
+        out.resize(kNumIters);
+
+        for (size_t i = 0; i < kNumIters; i++) {
+            Status ret = iface->gimmeBinder(&out[i]);
+            CHECK(ret.isOk()) << ret;
+        }
+
+        out.clear();
+
+        // we are using a thread up to wait, so make a call to
+        // force all refcounts to be updated first - current
+        // binder behavior means we really don't need to wait,
+        // so code which is waiting is really there to protect
+        // against any future changes that could delay destruction
+        android::IInterface::asBinder(iface)->pingBinder();
+
+        iface->waitGimmesDestroyed();
+    }
+
+    SetLabel(state);
+}
+BENCHMARK(BM_collectProxies)->ArgsProduct({kTransportList, {10, 100, 1000, 5000, 10000, 20000}});
 
 void BM_repeatBinder(benchmark::State& state) {
     sp<IBinder> binder = getBinderForOptions(state);
@@ -199,6 +296,8 @@ void BM_repeatBinder(benchmark::State& state) {
         Status ret = iface->repeatBinder(binder, &out);
         CHECK(ret.isOk()) << ret;
     }
+
+    SetLabel(state);
 }
 BENCHMARK(BM_repeatBinder)->ArgsProduct({kTransportList});
 
@@ -226,11 +325,6 @@ int main(int argc, char** argv) {
     ::benchmark::Initialize(&argc, argv);
     if (::benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
 
-    std::cerr << "Tests suffixes:" << std::endl;
-    std::cerr << "\t.../" << Transport::KERNEL << " is KERNEL" << std::endl;
-    std::cerr << "\t.../" << Transport::RPC << " is RPC" << std::endl;
-    std::cerr << "\t.../" << Transport::RPC_TLS << " is RPC with TLS" << std::endl;
-
 #ifdef __BIONIC__
     if (0 == fork()) {
         prctl(PR_SET_PDEATHSIG, SIGHUP); // racey, okay
@@ -254,11 +348,13 @@ int main(int argc, char** argv) {
     (void)unlink(addr.c_str());
     forkRpcServer(addr.c_str(), RpcServer::make(RpcTransportCtxFactoryRaw::make()));
     setupClient(gSession, addr.c_str());
+    gRpcBinder = gSession->getRootObject();
 
     std::string tlsAddr = tmp + "/binderRpcTlsBenchmark";
     (void)unlink(tlsAddr.c_str());
     forkRpcServer(tlsAddr.c_str(), RpcServer::make(makeFactoryTls()));
     setupClient(gSessionTls, tlsAddr.c_str());
+    gRpcTlsBinder = gSessionTls->getRootObject();
 
     ::benchmark::RunSpecifiedBenchmarks();
     return 0;

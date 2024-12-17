@@ -17,10 +17,12 @@
 #define LOG_TAG "BufferItemConsumer_test"
 //#define LOG_NDEBUG 0
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <gui/BufferItemConsumer.h>
 #include <gui/IProducerListener.h>
 #include <gui/Surface.h>
+#include <ui/GraphicBuffer.h>
 
 namespace android {
 
@@ -42,16 +44,26 @@ class BufferItemConsumerTest : public ::testing::Test {
         BufferItemConsumerTest* mTest;
     };
 
+    struct TrackingProducerListener : public BnProducerListener {
+        TrackingProducerListener(BufferItemConsumerTest* test) : mTest(test) {}
+
+        virtual void onBufferReleased() override {}
+        virtual bool needsReleaseNotify() override { return true; }
+        virtual void onBuffersDiscarded(const std::vector<int32_t>&) override {}
+        virtual void onBufferDetached(int slot) override { mTest->HandleBufferDetached(slot); }
+
+        BufferItemConsumerTest* mTest;
+    };
+
     void SetUp() override {
-        BufferQueue::createBufferQueue(&mProducer, &mConsumer);
-        mBIC =
-            new BufferItemConsumer(mConsumer, kFormat, kMaxLockedBuffers, true);
+        mBIC = new BufferItemConsumer(kFormat, kMaxLockedBuffers, true);
         String8 name("BufferItemConsumer_Under_Test");
         mBIC->setName(name);
         mBFL = new BufferFreedListener(this);
         mBIC->setBufferFreedListener(mBFL);
 
-        sp<IProducerListener> producerListener = new StubProducerListener();
+        sp<IProducerListener> producerListener = new TrackingProducerListener(this);
+        mProducer = mBIC->getSurface()->getIGraphicBufferProducer();
         IGraphicBufferProducer::QueueBufferOutput bufferOutput;
         ASSERT_EQ(NO_ERROR,
                   mProducer->connect(producerListener, NATIVE_WINDOW_API_CPU,
@@ -68,7 +80,14 @@ class BufferItemConsumerTest : public ::testing::Test {
     void HandleBufferFreed() {
         std::lock_guard<std::mutex> lock(mMutex);
         mFreedBufferCount++;
-        ALOGV("HandleBufferFreed, mFreedBufferCount=%d", mFreedBufferCount);
+        ALOGD("HandleBufferFreed, mFreedBufferCount=%d", mFreedBufferCount);
+    }
+
+    void HandleBufferDetached(int slot) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mDetachedBufferSlots.push_back(slot);
+        ALOGD("HandleBufferDetached, slot=%d mDetachedBufferSlots-count=%zu", slot,
+              mDetachedBufferSlots.size());
     }
 
     void DequeueBuffer(int* outSlot) {
@@ -80,7 +99,7 @@ class BufferItemConsumerTest : public ::testing::Test {
                                                 nullptr, nullptr);
         ASSERT_GE(ret, 0);
 
-        ALOGV("dequeueBuffer: slot=%d", slot);
+        ALOGD("dequeueBuffer: slot=%d", slot);
         if (ret & IGraphicBufferProducer::BUFFER_NEEDS_REALLOCATION) {
             ret = mProducer->requestBuffer(slot, &mBuffers[slot]);
             ASSERT_EQ(NO_ERROR, ret);
@@ -89,7 +108,7 @@ class BufferItemConsumerTest : public ::testing::Test {
     }
 
     void QueueBuffer(int slot) {
-        ALOGV("enqueueBuffer: slot=%d", slot);
+        ALOGD("enqueueBuffer: slot=%d", slot);
         IGraphicBufferProducer::QueueBufferInput bufferInput(
             0ULL, true, HAL_DATASPACE_UNKNOWN, Rect::INVALID_RECT,
             NATIVE_WINDOW_SCALING_MODE_FREEZE, 0, Fence::NO_FENCE);
@@ -104,12 +123,12 @@ class BufferItemConsumerTest : public ::testing::Test {
         status_t ret = mBIC->acquireBuffer(&buffer, 0, false);
         ASSERT_EQ(NO_ERROR, ret);
 
-        ALOGV("acquireBuffer: slot=%d", buffer.mSlot);
+        ALOGD("acquireBuffer: slot=%d", buffer.mSlot);
         *outSlot = buffer.mSlot;
     }
 
     void ReleaseBuffer(int slot) {
-        ALOGV("releaseBuffer: slot=%d", slot);
+        ALOGD("releaseBuffer: slot=%d", slot);
         BufferItem buffer;
         buffer.mSlot = slot;
         buffer.mGraphicBuffer = mBuffers[slot];
@@ -120,6 +139,7 @@ class BufferItemConsumerTest : public ::testing::Test {
 
     std::mutex mMutex;
     int mFreedBufferCount{0};
+    std::vector<int> mDetachedBufferSlots = {};
 
     sp<BufferItemConsumer> mBIC;
     sp<BufferFreedListener> mBFL;
@@ -202,5 +222,20 @@ TEST_F(BufferItemConsumerTest, TriggerBufferFreed_DeleteBufferItemConsumer) {
     usleep(kFrameSleepUs);
     ASSERT_EQ(1, GetFreedBufferCount());
 }
+
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_PLATFORM_API_IMPROVEMENTS)
+// Test that delete BufferItemConsumer triggers onBufferFreed.
+TEST_F(BufferItemConsumerTest, DetachBufferWithBuffer) {
+    int slot;
+    // Let buffer go through the cycle at least once.
+    DequeueBuffer(&slot);
+    QueueBuffer(slot);
+    AcquireBuffer(&slot);
+
+    sp<GraphicBuffer> buffer = mBuffers[slot];
+    EXPECT_EQ(OK, mBIC->detachBuffer(buffer));
+    EXPECT_THAT(mDetachedBufferSlots, testing::ElementsAre(slot));
+}
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_PLATFORM_API_IMPROVEMENTS)
 
 }  // namespace android

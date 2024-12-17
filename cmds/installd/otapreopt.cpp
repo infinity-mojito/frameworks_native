@@ -14,20 +14,21 @@
  ** limitations under the License.
  */
 
-#include <algorithm>
 #include <inttypes.h>
-#include <limits>
-#include <random>
-#include <regex>
 #include <selinux/android.h>
 #include <selinux/avc.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/capability.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
-#include <sys/mman.h>
 #include <sys/wait.h>
+#include <algorithm>
+#include <iterator>
+#include <limits>
+#include <random>
+#include <regex>
 
 #include <android-base/logging.h>
 #include <android-base/macros.h>
@@ -47,6 +48,7 @@
 #include "otapreopt_parameters.h"
 #include "otapreopt_utils.h"
 #include "system_properties.h"
+#include "unique_file.h"
 #include "utils.h"
 
 #ifndef LOG_TAG
@@ -87,6 +89,9 @@ static_assert(DEXOPT_GENERATE_APP_IMAGE == 1 << 12, "DEXOPT_GENERATE_APP_IMAGE u
 static_assert(DEXOPT_MASK           == (0x3dfe | DEXOPT_IDLE_BACKGROUND_JOB),
               "DEXOPT_MASK unexpected.");
 
+constexpr const char* kAotCompilerFilters[]{
+        "space-profile", "space", "speed-profile", "speed", "everything-profile", "everything",
+};
 
 template<typename T>
 static constexpr bool IsPowerOfTwo(T x) {
@@ -308,7 +313,7 @@ private:
         // This is different from the normal installd. We only do the base
         // directory, the rest will be created on demand when each app is compiled.
         if (access(GetOtaDirectoryPrefix().c_str(), R_OK) < 0) {
-            LOG(ERROR) << "Could not access " << GetOtaDirectoryPrefix();
+            PLOG(ERROR) << "Could not access " << GetOtaDirectoryPrefix();
             return false;
         }
 
@@ -415,6 +420,36 @@ private:
         return (strcmp(arg, "!") == 0) ? nullptr : arg;
     }
 
+    bool IsAotCompilation() const {
+        if (std::find(std::begin(kAotCompilerFilters), std::end(kAotCompilerFilters),
+                      std::string_view(parameters_.compiler_filter)) ==
+            std::end(kAotCompilerFilters)) {
+            return false;
+        }
+
+        int dexopt_flags = parameters_.dexopt_flags;
+        bool profile_guided = (dexopt_flags & DEXOPT_PROFILE_GUIDED) != 0;
+        bool is_secondary_dex = (dexopt_flags & DEXOPT_SECONDARY_DEX) != 0;
+        bool is_public = (dexopt_flags & DEXOPT_PUBLIC) != 0;
+
+        if (profile_guided) {
+            UniqueFile reference_profile =
+                    maybe_open_reference_profile(parameters_.pkgName, parameters_.apk_path,
+                                                 parameters_.profile_name, profile_guided,
+                                                 is_public, parameters_.uid, is_secondary_dex);
+            // `maybe_open_reference_profile` installs a hook that clears the profile on
+            // destruction. Disable it.
+            reference_profile.DisableCleanup();
+            struct stat sbuf;
+            if (reference_profile.fd() == -1 ||
+                (fstat(reference_profile.fd(), &sbuf) != -1 && sbuf.st_size == 0)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     bool ShouldSkipPreopt() const {
         // There's one thing we have to be careful about: we may/will be asked to compile an app
         // living in the system image. This may be a valid request - if the app wasn't compiled,
@@ -439,9 +474,12 @@ private:
         //       (This is ugly as it's the only thing where we need to understand the contents
         //        of parameters_, but it beats postponing the decision or using the call-
         //        backs to do weird things.)
+
+        // In addition, no need to preopt for "verify". The existing vdex files in the OTA package
+        // and the /data partition will still be usable after the OTA update is applied.
         const char* apk_path = parameters_.apk_path;
         CHECK(apk_path != nullptr);
-        if (StartsWith(apk_path, android_root_)) {
+        if (StartsWith(apk_path, android_root_) || !IsAotCompilation()) {
             const char* last_slash = strrchr(apk_path, '/');
             if (last_slash != nullptr) {
                 std::string path(apk_path, last_slash - apk_path + 1);
@@ -460,7 +498,7 @@ private:
         // this tool will wipe the OTA artifact cache and try again (for robustness after
         // a failed OTA with remaining cache artifacts).
         if (access(apk_path, F_OK) != 0) {
-            LOG(WARNING) << "Skipping A/B OTA preopt of non-existing package " << apk_path;
+            PLOG(WARNING) << "Skipping A/B OTA preopt of non-existing package " << apk_path;
             return true;
         }
 
@@ -471,13 +509,20 @@ private:
     // TODO(calin): embed the profile name in the parameters.
     int Dexopt() {
         std::string error;
+
+        int dexopt_flags = parameters_.dexopt_flags;
+        // Make sure dex2oat is run with background priority.
+        dexopt_flags |= DEXOPT_BOOTCOMPLETE | DEXOPT_IDLE_BACKGROUND_JOB;
+
+        parameters_.compilation_reason = "ab-ota";
+
         int res = dexopt(parameters_.apk_path,
                          parameters_.uid,
                          parameters_.pkgName,
                          parameters_.instruction_set,
                          parameters_.dexopt_needed,
                          parameters_.oat_dir,
-                         parameters_.dexopt_flags,
+                         dexopt_flags,
                          parameters_.compiler_filter,
                          parameters_.volume_uuid,
                          parameters_.shared_libraries,
@@ -519,61 +564,6 @@ private:
         LOG(WARNING) << "Downgrading compiler filter in an attempt to progress compilation";
         parameters_.dexopt_flags &= ~DEXOPT_PROFILE_GUIDED;
         return Dexopt();
-    }
-
-    ////////////////////////////////////
-    // Helpers, mostly taken from ART //
-    ////////////////////////////////////
-
-    // Choose a random relocation offset. Taken from art/runtime/gc/image_space.cc.
-    static int32_t ChooseRelocationOffsetDelta(int32_t min_delta, int32_t max_delta) {
-        constexpr size_t kPageSize = PAGE_SIZE;
-        static_assert(IsPowerOfTwo(kPageSize), "page size must be power of two");
-        CHECK_EQ(min_delta % kPageSize, 0u);
-        CHECK_EQ(max_delta % kPageSize, 0u);
-        CHECK_LT(min_delta, max_delta);
-
-        std::default_random_engine generator;
-        generator.seed(GetSeed());
-        std::uniform_int_distribution<int32_t> distribution(min_delta, max_delta);
-        int32_t r = distribution(generator);
-        if (r % 2 == 0) {
-            r = RoundUp(r, kPageSize);
-        } else {
-            r = RoundDown(r, kPageSize);
-        }
-        CHECK_LE(min_delta, r);
-        CHECK_GE(max_delta, r);
-        CHECK_EQ(r % kPageSize, 0u);
-        return r;
-    }
-
-    static uint64_t GetSeed() {
-#ifdef __BIONIC__
-        // Bionic exposes arc4random, use it.
-        uint64_t random_data;
-        arc4random_buf(&random_data, sizeof(random_data));
-        return random_data;
-#else
-#error "This is only supposed to run with bionic. Otherwise, implement..."
-#endif
-    }
-
-    void AddCompilerOptionFromSystemProperty(const char* system_property,
-            const char* prefix,
-            bool runtime,
-            std::vector<std::string>& out) const {
-        const std::string* value = system_properties_.GetProperty(system_property);
-        if (value != nullptr) {
-            if (runtime) {
-                out.push_back("--runtime-arg");
-            }
-            if (prefix != nullptr) {
-                out.push_back(StringPrintf("%s%s", prefix, value->c_str()));
-            } else {
-                out.push_back(*value);
-            }
-        }
     }
 
     static constexpr const char* kBootClassPathPropertyName = "BOOTCLASSPATH";
@@ -708,6 +698,11 @@ bool create_cache_path(char path[PKG_PATH_MAX],
     }
     strcpy(path, assembled_path.c_str());
 
+    return true;
+}
+
+bool force_compile_without_image() {
+    // We don't have a boot image anyway. Compile without a boot image.
     return true;
 }
 

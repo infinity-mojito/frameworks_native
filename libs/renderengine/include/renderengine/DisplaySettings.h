@@ -22,10 +22,13 @@
 
 #include <math/mat4.h>
 #include <renderengine/PrintMatrix.h>
+#include <ui/DisplayId.h>
 #include <ui/GraphicTypes.h>
 #include <ui/Rect.h>
 #include <ui/Region.h>
 #include <ui/Transform.h>
+
+#include <optional>
 
 namespace android {
 namespace renderengine {
@@ -33,6 +36,10 @@ namespace renderengine {
 // DisplaySettings contains the settings that are applicable when drawing all
 // layers for a given display.
 struct DisplaySettings {
+    // A string containing the name of the display, along with its id, if it has
+    // one.
+    std::string namePlusId;
+
     // Rectangle describing the physical display. We will project from the
     // logical clip onto this rectangle.
     Rect physicalDisplay = Rect::INVALID_RECT;
@@ -79,11 +86,30 @@ struct DisplaySettings {
     // Configures the rendering intent of the output display. This is used for tonemapping.
     aidl::android::hardware::graphics::composer3::RenderIntent renderIntent =
             aidl::android::hardware::graphics::composer3::RenderIntent::TONE_MAP_COLORIMETRIC;
+
+    // Tonemapping strategy to use for each layer. This is only used for tonemapping HDR source
+    // content
+    enum class TonemapStrategy {
+        // Use a tonemapper defined by libtonemap. This may be OEM-defined as of Android 13, aka
+        // undefined.
+        // This is typically a global tonemapper, designed to match what is on screen.
+        Libtonemap,
+        // Use a local tonemapper. Because local tonemapping uses large intermediate allocations,
+        // this
+        // method is primarily recommended for infrequent rendering that does not need to exactly
+        // match
+        // pixels that are on-screen.
+        Local,
+    };
+    TonemapStrategy tonemapStrategy = TonemapStrategy::Libtonemap;
+
+    // For now, meaningful primarily when the TonemappingStrategy is Local
+    float targetHdrSdrRatio = 1.f;
 };
 
 static inline bool operator==(const DisplaySettings& lhs, const DisplaySettings& rhs) {
-    return lhs.physicalDisplay == rhs.physicalDisplay && lhs.clip == rhs.clip &&
-            lhs.maxLuminance == rhs.maxLuminance &&
+    return lhs.namePlusId == rhs.namePlusId && lhs.physicalDisplay == rhs.physicalDisplay &&
+            lhs.clip == rhs.clip && lhs.maxLuminance == rhs.maxLuminance &&
             lhs.currentLuminanceNits == rhs.currentLuminanceNits &&
             lhs.outputDataspace == rhs.outputDataspace &&
             lhs.colorTransform == rhs.colorTransform &&
@@ -117,6 +143,7 @@ static const char* orientation_to_string(uint32_t orientation) {
 
 static inline void PrintTo(const DisplaySettings& settings, ::std::ostream* os) {
     *os << "DisplaySettings {";
+    *os << "\n    .display = " << settings.namePlusId;
     *os << "\n    .physicalDisplay = ";
     PrintTo(settings.physicalDisplay, os);
     *os << "\n    .clip = ";

@@ -14,17 +14,17 @@
  * limitations under the License.
  */
 
-#include <android-base/hex.h>
-#include <android-base/logging.h>
-#include <android-base/macros.h>
-#include <android-base/properties.h>
-#include <android-base/strings.h>
 #include <binder/Parcel.h>
 #include <binder/RpcSession.h>
 #include <binder/Status.h>
 #include <gtest/gtest.h>
 
+#ifdef __ANDROID__
+#include <android-base/properties.h>
+#endif
+
 #include "../Debug.h"
+#include "../Utils.h"
 
 namespace android {
 
@@ -70,8 +70,8 @@ static const std::vector<std::function<void(Parcel* p)>> kFillFuns {
     [](Parcel* p) { ASSERT_EQ(OK, p->writeString16(String16(u"a"))); },
     [](Parcel* p) { ASSERT_EQ(OK, p->writeString16(String16(u"baba"))); },
     [](Parcel* p) { ASSERT_EQ(OK, p->writeStrongBinder(nullptr)); },
-    [](Parcel* p) { ASSERT_EQ(OK, p->writeInt32Array(arraysize(kInt32Array), kInt32Array)); },
-    [](Parcel* p) { ASSERT_EQ(OK, p->writeByteArray(arraysize(kByteArray), kByteArray)); },
+    [](Parcel* p) { ASSERT_EQ(OK, p->writeInt32Array(countof(kInt32Array), kInt32Array)); },
+    [](Parcel* p) { ASSERT_EQ(OK, p->writeByteArray(countof(kByteArray), kByteArray)); },
     [](Parcel* p) { ASSERT_EQ(OK, p->writeBool(true)); },
     [](Parcel* p) { ASSERT_EQ(OK, p->writeBool(false)); },
     [](Parcel* p) { ASSERT_EQ(OK, p->writeChar('a')); },
@@ -163,8 +163,8 @@ static const std::vector<std::function<void(Parcel* p)>> kFillFuns {
 
 static void setParcelForRpc(Parcel* p, uint32_t version) {
     auto session = RpcSession::make();
-    CHECK(session->setProtocolVersion(version));
-    CHECK_EQ(OK, session->addNullDebuggingClient());
+    EXPECT_TRUE(session->setProtocolVersion(version));
+    EXPECT_EQ(OK, session->addNullDebuggingClient());
     p->markForRpc(session);
 }
 
@@ -176,18 +176,30 @@ static std::string buildRepr(uint32_t version) {
         setParcelForRpc(&p, version);
         kFillFuns[i](&p);
 
-        result += base::HexString(p.data(), p.dataSize());
+        result += HexString(p.data(), p.dataSize());
     }
     return result;
+}
+
+// To be replaced with std::views::split (and std::views::zip) once C++ compilers catch up.
+static std::vector<std::string> split(std::string_view s, char delimiter) {
+    std::vector<std::string> result;
+    size_t pos = 0;
+    while (true) {
+        const auto found = s.find(delimiter, pos);
+        result.emplace_back(s.substr(pos, found - pos));
+        if (found == s.npos) return result;
+        pos = found + 1;
+    }
 }
 
 static void checkRepr(const std::string& repr, uint32_t version) {
     const std::string actualRepr = buildRepr(version);
 
-    auto expected = base::Split(repr, "|");
+    auto expected = split(repr, '|');
     ASSERT_EQ(expected.size(), kFillFuns.size());
 
-    auto actual = base::Split(actualRepr, "|");
+    auto actual = split(actualRepr, '|');
     ASSERT_EQ(actual.size(), kFillFuns.size());
 
     for (size_t i = 0; i < kFillFuns.size(); i++) {
@@ -237,31 +249,35 @@ TEST(RpcWire, V0) {
     checkRepr(kCurrentRepr, 0);
 }
 
+TEST(RpcWire, V1) {
+    checkRepr(kCurrentRepr, 1);
+}
+
 TEST(RpcWire, CurrentVersion) {
     checkRepr(kCurrentRepr, RPC_WIRE_PROTOCOL_VERSION);
 }
 
-static_assert(RPC_WIRE_PROTOCOL_VERSION == RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL,
+static_assert(RPC_WIRE_PROTOCOL_VERSION == 1,
               "If the binder wire protocol is updated, this test should test additional versions. "
               "The binder wire protocol should only be updated on upstream AOSP.");
 
-TEST(RpcWire, ReleaseBranchHasFrozenRpcWireProtocol) {
-    if (RPC_WIRE_PROTOCOL_VERSION == RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL) {
-        EXPECT_FALSE(base::GetProperty("ro.build.version.codename", "") == "REL")
-                << "Binder RPC wire protocol must be frozen on a release branch!";
+TEST(RpcWire, NextIsPlusOneReminder) {
+    if (RPC_WIRE_PROTOCOL_VERSION != RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL) {
+        EXPECT_EQ(RPC_WIRE_PROTOCOL_VERSION + 1, RPC_WIRE_PROTOCOL_VERSION_NEXT)
+                << "Make sure to note what the next version should be.";
     }
 }
 
-TEST(RpcWire, IfNotExperimentalCodeHasNoExperimentalFeatures) {
+TEST(RpcWire, ReleaseBranchHasFrozenRpcWireProtocol) {
     if (RPC_WIRE_PROTOCOL_VERSION == RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL) {
-        GTEST_SKIP() << "Version is experimental, so experimental features are okay.";
+#ifdef __ANDROID__
+        bool isRelease = base::GetProperty("ro.build.version.codename", "") == "REL";
+#else
+        bool isRelease = true;
+#endif
+        EXPECT_FALSE(isRelease)
+                << "Binder RPC wire protocol must be frozen in release configuration!";
     }
-
-    // if we set the wire protocol version to experimental, none of the code
-    // should introduce a difference (if this fails, it means we have features
-    // which are enabled under experimental mode, but we aren't actually using
-    // or testing them!)
-    checkRepr(kCurrentRepr, RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL);
 }
 
 } // namespace android

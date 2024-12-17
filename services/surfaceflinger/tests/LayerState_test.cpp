@@ -28,75 +28,12 @@ using gui::ScreenCaptureResults;
 
 namespace test {
 
-TEST(LayerStateTest, ParcellingDisplayCaptureArgs) {
-    DisplayCaptureArgs args;
-    args.pixelFormat = ui::PixelFormat::RGB_565;
-    args.sourceCrop = Rect(0, 0, 500, 200);
-    args.frameScaleX = 2;
-    args.frameScaleY = 4;
-    args.captureSecureLayers = true;
-    args.displayToken = new BBinder();
-    args.width = 10;
-    args.height = 20;
-    args.useIdentityTransform = true;
-    args.grayscale = true;
-
-    Parcel p;
-    args.writeToParcel(&p);
-    p.setDataPosition(0);
-
-    DisplayCaptureArgs args2;
-    args2.readFromParcel(&p);
-
-    ASSERT_EQ(args.pixelFormat, args2.pixelFormat);
-    ASSERT_EQ(args.sourceCrop, args2.sourceCrop);
-    ASSERT_EQ(args.frameScaleX, args2.frameScaleX);
-    ASSERT_EQ(args.frameScaleY, args2.frameScaleY);
-    ASSERT_EQ(args.captureSecureLayers, args2.captureSecureLayers);
-    ASSERT_EQ(args.displayToken, args2.displayToken);
-    ASSERT_EQ(args.width, args2.width);
-    ASSERT_EQ(args.height, args2.height);
-    ASSERT_EQ(args.useIdentityTransform, args2.useIdentityTransform);
-    ASSERT_EQ(args.grayscale, args2.grayscale);
-}
-
-TEST(LayerStateTest, ParcellingLayerCaptureArgs) {
-    LayerCaptureArgs args;
-    args.pixelFormat = ui::PixelFormat::RGB_565;
-    args.sourceCrop = Rect(0, 0, 500, 200);
-    args.frameScaleX = 2;
-    args.frameScaleY = 4;
-    args.captureSecureLayers = true;
-    args.layerHandle = new BBinder();
-    args.excludeHandles = {new BBinder(), new BBinder()};
-    args.childrenOnly = false;
-    args.grayscale = true;
-
-    Parcel p;
-    args.writeToParcel(&p);
-    p.setDataPosition(0);
-
-    LayerCaptureArgs args2;
-    args2.readFromParcel(&p);
-
-    ASSERT_EQ(args.pixelFormat, args2.pixelFormat);
-    ASSERT_EQ(args.sourceCrop, args2.sourceCrop);
-    ASSERT_EQ(args.frameScaleX, args2.frameScaleX);
-    ASSERT_EQ(args.frameScaleY, args2.frameScaleY);
-    ASSERT_EQ(args.captureSecureLayers, args2.captureSecureLayers);
-    ASSERT_EQ(args.layerHandle, args2.layerHandle);
-    ASSERT_EQ(args.excludeHandles, args2.excludeHandles);
-    ASSERT_EQ(args.childrenOnly, args2.childrenOnly);
-    ASSERT_EQ(args.grayscale, args2.grayscale);
-}
-
-TEST(LayerStateTest, ParcellingScreenCaptureResults) {
+TEST(LayerStateTest, ParcellingScreenCaptureResultsWithFence) {
     ScreenCaptureResults results;
-    results.buffer = new GraphicBuffer(100, 200, PIXEL_FORMAT_RGBA_8888, 1, 0);
-    results.fence = new Fence(dup(fileno(tmpfile())));
+    results.buffer = sp<GraphicBuffer>::make(100u, 200u, PIXEL_FORMAT_RGBA_8888, 1u, 0u);
+    results.fenceResult = sp<Fence>::make(dup(fileno(tmpfile())));
     results.capturedSecureLayers = true;
     results.capturedDataspace = ui::Dataspace::DISPLAY_P3;
-    results.result = BAD_VALUE;
 
     Parcel p;
     results.writeToParcel(&p);
@@ -110,10 +47,41 @@ TEST(LayerStateTest, ParcellingScreenCaptureResults) {
     ASSERT_EQ(results.buffer->getWidth(), results2.buffer->getWidth());
     ASSERT_EQ(results.buffer->getHeight(), results2.buffer->getHeight());
     ASSERT_EQ(results.buffer->getPixelFormat(), results2.buffer->getPixelFormat());
-    ASSERT_EQ(results.fence->isValid(), results2.fence->isValid());
+    ASSERT_TRUE(results.fenceResult.ok());
+    ASSERT_TRUE(results2.fenceResult.ok());
+    ASSERT_EQ(results.fenceResult.value()->isValid(), results2.fenceResult.value()->isValid());
     ASSERT_EQ(results.capturedSecureLayers, results2.capturedSecureLayers);
     ASSERT_EQ(results.capturedDataspace, results2.capturedDataspace);
-    ASSERT_EQ(results.result, results2.result);
+}
+
+TEST(LayerStateTest, ParcellingScreenCaptureResultsWithNoFenceOrError) {
+    ScreenCaptureResults results;
+
+    Parcel p;
+    results.writeToParcel(&p);
+    p.setDataPosition(0);
+
+    ScreenCaptureResults results2;
+    results2.readFromParcel(&p);
+
+    ASSERT_TRUE(results2.fenceResult.ok());
+    ASSERT_EQ(results2.fenceResult.value(), Fence::NO_FENCE);
+}
+
+TEST(LayerStateTest, ParcellingScreenCaptureResultsWithFenceError) {
+    ScreenCaptureResults results;
+    results.fenceResult = base::unexpected(BAD_VALUE);
+
+    Parcel p;
+    results.writeToParcel(&p);
+    p.setDataPosition(0);
+
+    ScreenCaptureResults results2;
+    results2.readFromParcel(&p);
+
+    ASSERT_FALSE(results.fenceResult.ok());
+    ASSERT_FALSE(results2.fenceResult.ok());
+    ASSERT_EQ(results.fenceResult.error(), results2.fenceResult.error());
 }
 
 } // namespace test

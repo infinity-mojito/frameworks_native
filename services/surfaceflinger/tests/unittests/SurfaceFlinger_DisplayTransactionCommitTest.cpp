@@ -90,15 +90,12 @@ void DisplayTransactionCommitTest::setupCommonCallExpectationsForConnectProcessi
     Case::HdrSupport::setupComposerCallExpectations(this);
     Case::PerFrameMetadataSupport::setupComposerCallExpectations(this);
 
-    EXPECT_CALL(*mSurfaceInterceptor, saveDisplayCreation(_)).Times(1);
     expectHotplugReceived<Case, true>(mEventThread);
     expectHotplugReceived<Case, true>(mSFEventThread);
 }
 
 template <typename Case>
 void DisplayTransactionCommitTest::setupCommonCallExpectationsForDisconnectProcessing() {
-    EXPECT_CALL(*mSurfaceInterceptor, saveDisplayDeletion(_)).Times(1);
-
     expectHotplugReceived<Case, false>(mEventThread);
     expectHotplugReceived<Case, false>(mSFEventThread);
 }
@@ -113,14 +110,12 @@ void DisplayTransactionCommitTest::verifyDisplayIsConnected(const sp<IBinder>& d
     EXPECT_EQ(static_cast<bool>(Case::Display::PRIMARY), display.isPrimary());
 
     std::optional<DisplayDeviceState::Physical> expectedPhysical;
-    if (const auto connectionType = Case::Display::CONNECTION_TYPE::value) {
+    if (Case::Display::CONNECTION_TYPE::value) {
         const auto displayId = PhysicalDisplayId::tryCast(Case::Display::DISPLAY_ID::get());
         ASSERT_TRUE(displayId);
         const auto hwcDisplayId = Case::Display::HWC_DISPLAY_ID_OPT::value;
         ASSERT_TRUE(hwcDisplayId);
-        expectedPhysical = {.id = *displayId,
-                            .type = *connectionType,
-                            .hwcDisplayId = *hwcDisplayId};
+        expectedPhysical = {.id = *displayId, .hwcDisplayId = *hwcDisplayId};
     }
 
     // The display should have been set up in the current display state
@@ -145,10 +140,13 @@ void DisplayTransactionCommitTest::verifyPhysicalDisplayIsConnected() {
     const auto displayId = Case::Display::DISPLAY_ID::get();
     ASSERT_TRUE(PhysicalDisplayId::tryCast(displayId));
 
-    const auto displayTokenOpt = mFlinger.mutablePhysicalDisplayTokens().get(displayId);
-    ASSERT_TRUE(displayTokenOpt);
+    const auto displayOpt = mFlinger.mutablePhysicalDisplays().get(displayId);
+    ASSERT_TRUE(displayOpt);
 
-    verifyDisplayIsConnected<Case>(displayTokenOpt->get());
+    const auto& display = displayOpt->get();
+    EXPECT_EQ(Case::Display::CONNECTION_TYPE::value, display.snapshot().connectionType());
+
+    verifyDisplayIsConnected<Case>(display.token());
 }
 
 void DisplayTransactionCommitTest::verifyDisplayIsNotConnected(const sp<IBinder>& displayToken) {
@@ -175,7 +173,7 @@ void DisplayTransactionCommitTest::processesHotplugConnectCommon() {
     // --------------------------------------------------------------------
     // Invocation
 
-    mFlinger.commitTransactionsLocked(eDisplayTransactionNeeded);
+    mFlinger.configureAndCommit();
 
     // --------------------------------------------------------------------
     // Postconditions
@@ -204,7 +202,7 @@ void DisplayTransactionCommitTest::ignoresHotplugConnectCommon() {
     // --------------------------------------------------------------------
     // Invocation
 
-    mFlinger.commitTransactionsLocked(eDisplayTransactionNeeded);
+    mFlinger.configureAndCommit();
 
     // --------------------------------------------------------------------
     // Postconditions
@@ -239,7 +237,7 @@ void DisplayTransactionCommitTest::processesHotplugDisconnectCommon() {
     // --------------------------------------------------------------------
     // Invocation
 
-    mFlinger.commitTransactionsLocked(eDisplayTransactionNeeded);
+    mFlinger.configureAndCommit();
 
     // --------------------------------------------------------------------
     // Postconditions
@@ -247,10 +245,10 @@ void DisplayTransactionCommitTest::processesHotplugDisconnectCommon() {
     // HWComposer should not have an entry for the display
     EXPECT_FALSE(hasPhysicalHwcDisplay(Case::Display::HWC_DISPLAY_ID));
 
-    // SF should not have a display token.
+    // SF should not have a PhysicalDisplay.
     const auto displayId = Case::Display::DISPLAY_ID::get();
     ASSERT_TRUE(PhysicalDisplayId::tryCast(displayId));
-    ASSERT_FALSE(mFlinger.mutablePhysicalDisplayTokens().contains(displayId));
+    ASSERT_FALSE(mFlinger.mutablePhysicalDisplays().contains(displayId));
 
     // The existing token should have been removed.
     verifyDisplayIsNotConnected(existing.token());
@@ -267,6 +265,13 @@ TEST_F(DisplayTransactionCommitTest, processesHotplugConnectExternalDisplay) {
     processesHotplugConnectCommon<SimpleExternalDisplayCase>();
 }
 
+TEST_F(DisplayTransactionCommitTest, processesHotplugConnectNonSecureExternalDisplay) {
+    // Inject a primary display.
+    PrimaryDisplayVariant::injectHwcDisplay(this);
+
+    processesHotplugConnectCommon<SimpleExternalDisplayNonSecureCase>();
+}
+
 TEST_F(DisplayTransactionCommitTest, ignoresHotplugConnectIfPrimaryAndExternalAlreadyConnected) {
     // Inject both a primary and external display.
     PrimaryDisplayVariant::injectHwcDisplay(this);
@@ -275,11 +280,27 @@ TEST_F(DisplayTransactionCommitTest, ignoresHotplugConnectIfPrimaryAndExternalAl
     // TODO: This is an unnecessary call.
     EXPECT_CALL(*mComposer,
                 getDisplayIdentificationData(TertiaryDisplayVariant::HWC_DISPLAY_ID, _, _))
-            .WillOnce(DoAll(SetArgPointee<1>(TertiaryDisplay::PORT),
-                            SetArgPointee<2>(TertiaryDisplay::GET_IDENTIFICATION_DATA()),
+            .WillOnce(DoAll(SetArgPointee<1>(TertiaryDisplay<kSecure>::PORT),
+                            SetArgPointee<2>(TertiaryDisplay<kSecure>::GET_IDENTIFICATION_DATA()),
                             Return(Error::NONE)));
 
     ignoresHotplugConnectCommon<SimpleTertiaryDisplayCase>();
+}
+
+TEST_F(DisplayTransactionCommitTest,
+       ignoresHotplugConnectNonSecureIfPrimaryAndExternalAlreadyConnected) {
+    // Inject both a primary and external display.
+    PrimaryDisplayVariant::injectHwcDisplay(this);
+    ExternalDisplayVariant::injectHwcDisplay(this);
+
+    // TODO: This is an unnecessary call.
+    EXPECT_CALL(*mComposer,
+                getDisplayIdentificationData(TertiaryDisplayVariant::HWC_DISPLAY_ID, _, _))
+            .WillOnce(DoAll(SetArgPointee<1>(TertiaryDisplay<kSecure>::PORT),
+                            SetArgPointee<2>(TertiaryDisplay<kSecure>::GET_IDENTIFICATION_DATA()),
+                            Return(Error::NONE)));
+
+    ignoresHotplugConnectCommon<SimpleTertiaryDisplayNonSecureCase>();
 }
 
 TEST_F(DisplayTransactionCommitTest, processesHotplugDisconnectPrimaryDisplay) {
@@ -289,6 +310,10 @@ TEST_F(DisplayTransactionCommitTest, processesHotplugDisconnectPrimaryDisplay) {
 
 TEST_F(DisplayTransactionCommitTest, processesHotplugDisconnectExternalDisplay) {
     processesHotplugDisconnectCommon<SimpleExternalDisplayCase>();
+}
+
+TEST_F(DisplayTransactionCommitTest, processesHotplugDisconnectNonSecureExternalDisplay) {
+    processesHotplugDisconnectCommon<SimpleExternalDisplayNonSecureCase>();
 }
 
 TEST_F(DisplayTransactionCommitTest, processesHotplugConnectThenDisconnectPrimary) {
@@ -321,7 +346,7 @@ TEST_F(DisplayTransactionCommitTest, processesHotplugConnectThenDisconnectPrimar
                 // --------------------------------------------------------------------
                 // Invocation
 
-                mFlinger.commitTransactionsLocked(eDisplayTransactionNeeded);
+                mFlinger.configureAndCommit();
 
                 // --------------------------------------------------------------------
                 // Postconditions
@@ -329,10 +354,10 @@ TEST_F(DisplayTransactionCommitTest, processesHotplugConnectThenDisconnectPrimar
                 // HWComposer should not have an entry for the display
                 EXPECT_FALSE(hasPhysicalHwcDisplay(Case::Display::HWC_DISPLAY_ID));
 
-                // SF should not have a display token.
+                // SF should not have a PhysicalDisplay.
                 const auto displayId = Case::Display::DISPLAY_ID::get();
                 ASSERT_TRUE(PhysicalDisplayId::tryCast(displayId));
-                ASSERT_FALSE(mFlinger.mutablePhysicalDisplayTokens().contains(displayId));
+                ASSERT_FALSE(mFlinger.mutablePhysicalDisplays().contains(displayId));
             }(),
             testing::KilledBySignal(SIGABRT), "Primary display cannot be disconnected.");
 }
@@ -366,7 +391,7 @@ TEST_F(DisplayTransactionCommitTest, processesHotplugDisconnectThenConnectPrimar
                 // --------------------------------------------------------------------
                 // Invocation
 
-                mFlinger.commitTransactionsLocked(eDisplayTransactionNeeded);
+                mFlinger.configureAndCommit();
 
                 // --------------------------------------------------------------------
                 // Postconditions
@@ -376,9 +401,9 @@ TEST_F(DisplayTransactionCommitTest, processesHotplugDisconnectThenConnectPrimar
                 const auto displayId = Case::Display::DISPLAY_ID::get();
                 ASSERT_TRUE(PhysicalDisplayId::tryCast(displayId));
 
-                const auto displayTokenOpt = mFlinger.mutablePhysicalDisplayTokens().get(displayId);
-                ASSERT_TRUE(displayTokenOpt);
-                EXPECT_NE(existing.token(), displayTokenOpt->get());
+                const auto displayOpt = mFlinger.mutablePhysicalDisplays().get(displayId);
+                ASSERT_TRUE(displayOpt);
+                EXPECT_NE(existing.token(), displayOpt->get().token());
 
                 // A new display should be connected in its place.
                 verifyPhysicalDisplayIsConnected<Case>();
@@ -408,12 +433,12 @@ TEST_F(DisplayTransactionCommitTest, processesVirtualDisplayAdded) {
 
     // A virtual display was added to the current state, and it has a
     // surface(producer)
-    sp<BBinder> displayToken = new BBinder();
+    sp<BBinder> displayToken = sp<BBinder>::make();
 
     DisplayDeviceState state;
     state.isSecure = static_cast<bool>(Case::Display::SECURE);
 
-    sp<mock::GraphicBufferProducer> surface{new mock::GraphicBufferProducer()};
+    sp<mock::GraphicBufferProducer> surface{sp<mock::GraphicBufferProducer>::make()};
     state.surface = surface;
     mFlinger.mutableCurrentState().displays.add(displayToken, state);
 
@@ -479,7 +504,7 @@ TEST_F(DisplayTransactionCommitTest, processesVirtualDisplayAddedWithNoSurface) 
 
     // A virtual display was added to the current state, but it does not have a
     // surface.
-    sp<BBinder> displayToken = new BBinder();
+    sp<BBinder> displayToken = sp<BBinder>::make();
 
     DisplayDeviceState state;
     state.isSecure = static_cast<bool>(Case::Display::SECURE);
@@ -656,9 +681,11 @@ TEST_F(DisplayTransactionCommitTest, processesDisplayWidthChanges) {
     // Preconditions
 
     // A display is set up
-    auto nativeWindow = new mock::NativeWindow();
-    auto displaySurface = new compositionengine::mock::DisplaySurface();
-    sp<GraphicBuffer> buf = new GraphicBuffer();
+    auto nativeWindow = sp<mock::NativeWindow>::make();
+    auto displaySurface = sp<compositionengine::mock::DisplaySurface>::make();
+    sp<GraphicBuffer> buf =
+
+            sp<GraphicBuffer>::make();
     auto display = Case::Display::makeFakeExistingDisplayInjector(this);
     display.setNativeWindow(nativeWindow);
     display.setDisplaySurface(displaySurface);
@@ -701,9 +728,9 @@ TEST_F(DisplayTransactionCommitTest, processesDisplayHeightChanges) {
     // Preconditions
 
     // A display is set up
-    auto nativeWindow = new mock::NativeWindow();
-    auto displaySurface = new compositionengine::mock::DisplaySurface();
-    sp<GraphicBuffer> buf = new GraphicBuffer();
+    auto nativeWindow = sp<mock::NativeWindow>::make();
+    auto displaySurface = sp<compositionengine::mock::DisplaySurface>::make();
+    sp<GraphicBuffer> buf = sp<GraphicBuffer>::make();
     auto display = Case::Display::makeFakeExistingDisplayInjector(this);
     display.setNativeWindow(nativeWindow);
     display.setDisplaySurface(displaySurface);
@@ -750,9 +777,9 @@ TEST_F(DisplayTransactionCommitTest, processesDisplaySizeDisplayRectAndLayerStac
     // Preconditions
 
     // A display is set up
-    auto nativeWindow = new mock::NativeWindow();
-    auto displaySurface = new compositionengine::mock::DisplaySurface();
-    sp<GraphicBuffer> buf = new GraphicBuffer();
+    auto nativeWindow = sp<mock::NativeWindow>::make();
+    auto displaySurface = sp<compositionengine::mock::DisplaySurface>::make();
+    sp<GraphicBuffer> buf = sp<GraphicBuffer>::make();
     auto display = Case::Display::makeFakeExistingDisplayInjector(this);
     display.setNativeWindow(nativeWindow);
     display.setDisplaySurface(displaySurface);

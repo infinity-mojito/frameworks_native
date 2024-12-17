@@ -32,77 +32,34 @@
 #include <linux/android/binder.h>
 #include <sys/ioctl.h>
 
-#ifndef BR_FROZEN_REPLY
-// Temporary definition of BR_FROZEN_REPLY. For production
-// this will come from UAPI binder.h
-#define BR_FROZEN_REPLY _IO('r', 18)
-#endif // BR_FROZEN_REPLY
-
-#ifndef BINDER_FREEZE
-/*
- * Temporary definitions for freeze support. For the final version
- * these will be defined in the UAPI binder.h file from upstream kernel.
- */
-#define BINDER_FREEZE _IOW('b', 14, struct binder_freeze_info)
-
-struct binder_freeze_info {
-    //
-    // Group-leader PID of process to be frozen
-    //
-    uint32_t pid;
-    //
-    // Enable(1) / Disable(0) freeze for given PID
-    //
-    uint32_t enable;
-    //
-    // Timeout to wait for transactions to drain.
-    // 0: don't wait (ioctl will return EAGAIN if not drained)
-    // N: number of ms to wait
-    uint32_t timeout_ms;
+struct binder_frozen_state_info {
+    binder_uintptr_t cookie;
+    __u32 is_frozen;
 };
-#endif // BINDER_FREEZE
 
-#ifndef BINDER_GET_FROZEN_INFO
+#ifndef BR_FROZEN_BINDER
+// Temporary definition of BR_FROZEN_BINDER until UAPI binder.h includes it.
+#define BR_FROZEN_BINDER _IOR('r', 21, struct binder_frozen_state_info)
+#endif // BR_FROZEN_BINDER
 
-#define BINDER_GET_FROZEN_INFO _IOWR('b', 15, struct binder_frozen_status_info)
+#ifndef BR_CLEAR_FREEZE_NOTIFICATION_DONE
+// Temporary definition of BR_CLEAR_FREEZE_NOTIFICATION_DONE until UAPI binder.h includes it.
+#define BR_CLEAR_FREEZE_NOTIFICATION_DONE _IOR('r', 22, binder_uintptr_t)
+#endif // BR_CLEAR_FREEZE_NOTIFICATION_DONE
 
-struct binder_frozen_status_info {
-    //
-    // Group-leader PID of process to be queried
-    //
-    __u32 pid;
-    //
-    // Indicates whether the process has received any sync calls since last
-    // freeze (cleared at freeze/unfreeze)
-    // bit 0: received sync transaction after being frozen
-    // bit 1: new pending sync transaction during freezing
-    //
-    __u32 sync_recv;
-    //
-    // Indicates whether the process has received any async calls since last
-    // freeze (cleared at freeze/unfreeze)
-    //
-    __u32 async_recv;
-};
-#endif // BINDER_GET_FROZEN_INFO
+#ifndef BC_REQUEST_FREEZE_NOTIFICATION
+// Temporary definition of BC_REQUEST_FREEZE_NOTIFICATION until UAPI binder.h includes it.
+#define BC_REQUEST_FREEZE_NOTIFICATION _IOW('c', 19, struct binder_handle_cookie)
+#endif // BC_REQUEST_FREEZE_NOTIFICATION
 
-#ifndef BR_ONEWAY_SPAM_SUSPECT
-// Temporary definition of BR_ONEWAY_SPAM_SUSPECT. For production
-// this will come from UAPI binder.h
-#define BR_ONEWAY_SPAM_SUSPECT _IO('r', 19)
-#endif // BR_ONEWAY_SPAM_SUSPECT
+#ifndef BC_CLEAR_FREEZE_NOTIFICATION
+// Temporary definition of BC_CLEAR_FREEZE_NOTIFICATION until UAPI binder.h includes it.
+#define BC_CLEAR_FREEZE_NOTIFICATION _IOW('c', 20, struct binder_handle_cookie)
+#endif // BC_CLEAR_FREEZE_NOTIFICATION
 
-#ifndef BINDER_ENABLE_ONEWAY_SPAM_DETECTION
-/*
- * Temporary definitions for oneway spam detection support. For the final version
- * these will be defined in the UAPI binder.h file from upstream kernel.
- */
-#define BINDER_ENABLE_ONEWAY_SPAM_DETECTION _IOW('b', 16, __u32)
-#endif // BINDER_ENABLE_ONEWAY_SPAM_DETECTION
-
-#ifndef BR_TRANSACTION_PENDING_FROZEN
-// Temporary definition of BR_TRANSACTION_PENDING_FROZEN until UAPI binder.h includes it.
-#define BR_TRANSACTION_PENDING_FROZEN _IO('r', 20)
-#endif // BR_TRANSACTION_PENDING_FROZEN
+#ifndef BC_FREEZE_NOTIFICATION_DONE
+// Temporary definition of BC_FREEZE_NOTIFICATION_DONE until UAPI binder.h includes it.
+#define BC_FREEZE_NOTIFICATION_DONE _IOW('c', 21, binder_uintptr_t)
+#endif // BC_FREEZE_NOTIFICATION_DONE
 
 #endif // _BINDER_MODULE_H_

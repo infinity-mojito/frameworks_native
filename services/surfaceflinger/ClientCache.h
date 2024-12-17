@@ -29,16 +29,33 @@
 #include <set>
 #include <unordered_map>
 
-#define BUFFER_CACHE_MAX_SIZE 64
+// 4096 is based on 64 buffers * 64 layers. Once this limit is reached, the least recently used
+// buffer is uncached before the new buffer is cached.
+#define BUFFER_CACHE_MAX_SIZE 4096
 
 namespace android {
 
+// This class manages a cache of buffer handles between SurfaceFlinger clients
+// and the SurfaceFlinger process which optimizes away some of the cost of
+// sending buffer handles across processes.
+//
+// Buffers are explicitly cached and uncached by the SurfaceFlinger client. When
+// a buffer is uncached, it is not only purged from this cache, but the buffer
+// ID is also passed down to CompositionEngine to purge it from a similar cache
+// used between SurfaceFlinger and Composer HAL. The buffer ID used to purge
+// both the SurfaceFlinger side of this other cache, as well as Composer HAL's
+// side of the cache.
+//
 class ClientCache : public Singleton<ClientCache> {
 public:
     ClientCache();
 
-    bool add(const client_cache_t& cacheId, const sp<GraphicBuffer>& buffer);
-    void erase(const client_cache_t& cacheId);
+    enum class AddError { CacheFull, Unspecified };
+
+    base::expected<std::shared_ptr<renderengine::ExternalTexture>, AddError> add(
+            const client_cache_t& cacheId, const sp<GraphicBuffer>& buffer);
+
+    sp<GraphicBuffer> erase(const client_cache_t& cacheId);
 
     std::shared_ptr<renderengine::ExternalTexture> get(const client_cache_t& cacheId);
 

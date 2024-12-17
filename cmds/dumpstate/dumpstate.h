@@ -201,7 +201,18 @@ class Dumpstate {
         BUGREPORT_WEAR = android::os::IDumpstate::BUGREPORT_MODE_WEAR,
         BUGREPORT_TELEPHONY = android::os::IDumpstate::BUGREPORT_MODE_TELEPHONY,
         BUGREPORT_WIFI = android::os::IDumpstate::BUGREPORT_MODE_WIFI,
+        BUGREPORT_ONBOARDING = android::os::IDumpstate::BUGREPORT_MODE_ONBOARDING,
         BUGREPORT_DEFAULT = android::os::IDumpstate::BUGREPORT_MODE_DEFAULT
+    };
+
+    // The flags used to customize bugreport requests.
+    enum BugreportFlag {
+        BUGREPORT_USE_PREDUMPED_UI_DATA =
+          android::os::IDumpstate::BUGREPORT_FLAG_USE_PREDUMPED_UI_DATA,
+        BUGREPORT_FLAG_DEFER_CONSENT =
+          android::os::IDumpstate::BUGREPORT_FLAG_DEFER_CONSENT,
+          BUGREPORT_FLAG_KEEP_BUGREPORT_ON_RETRIEVAL =
+                    android::os::IDumpstate::BUGREPORT_FLAG_KEEP_BUGREPORT_ON_RETRIEVAL
     };
 
     static android::os::dumpstate::CommandOptions DEFAULT_DUMPSYS;
@@ -333,6 +344,12 @@ class Dumpstate {
 
     struct DumpOptions;
 
+    /**
+     * Pre-dump critical UI data, e.g. data stored in short ring buffers that might get lost
+     * by the time the actual bugreport is requested.
+     */
+    void PreDumpUiData();
+
     /*
      * Main entry point for running a complete bugreport.
      *
@@ -340,6 +357,16 @@ class Dumpstate {
      *
      */
     RunStatus Run(int32_t calling_uid, const std::string& calling_package);
+
+    /*
+     * Entry point for retrieving a previous-generated bugreport.
+     *
+     * Initialize() dumpstate before calling this method.
+     */
+    RunStatus Retrieve(int32_t calling_uid, const std::string& calling_package,
+                        const bool keep_bugreport_on_retrieval, const bool skip_user_consent);
+
+
 
     RunStatus ParseCommandlineAndRun(int argc, char* argv[]);
 
@@ -384,10 +411,13 @@ class Dumpstate {
         bool progress_updates_to_socket = false;
         bool do_screenshot = false;
         bool is_screenshot_copied = false;
+        bool is_consent_deferred = false;
+        bool skip_user_consent = false;
         bool is_remote_mode = false;
         bool show_header_only = false;
         bool telephony_only = false;
         bool wifi_only = false;
+        bool onboarding_only = false;
         // Trimmed-down version of dumpstate to only include whitelisted logs.
         bool limited_only = false;
         // Whether progress updates should be published.
@@ -396,6 +426,8 @@ class Dumpstate {
         // TODO(b/148168577) get rid of the AIDL values, replace them with the HAL values instead.
         // The HAL is actually an API surface that can be validated, while the AIDL is not (@hide).
         BugreportMode bugreport_mode = Dumpstate::BugreportMode::BUGREPORT_DEFAULT;
+        // Will use data collected through a previous call to PreDumpUiData().
+        bool use_predumped_ui_data;
         // File descriptor to output zip file. Takes precedence over out_dir.
         android::base::unique_fd bugreport_fd;
         // File descriptor to screenshot file.
@@ -414,9 +446,11 @@ class Dumpstate {
         RunStatus Initialize(int argc, char* argv[]);
 
         /* Initializes options from the requested mode. */
-        void Initialize(BugreportMode bugreport_mode, const android::base::unique_fd& bugreport_fd,
+        void Initialize(BugreportMode bugreport_mode, int bugreport_flags,
+                        const android::base::unique_fd& bugreport_fd,
                         const android::base::unique_fd& screenshot_fd,
-                        bool is_screenshot_requested);
+                        bool is_screenshot_requested,
+                        bool skip_user_consent);
 
         /* Returns true if the options set so far are consistent. */
         bool ValidateOptions() const;
@@ -443,11 +477,6 @@ class Dumpstate {
 
     // Whether it should take an screenshot earlier in the process.
     bool do_early_screenshot_ = false;
-
-    // This is set to true when the trace snapshot request in the early call to
-    // MaybeSnapshotSystemTrace(). When this is true, the later stages of
-    // dumpstate will append the trace to the zip archive.
-    bool has_system_trace_ = false;
 
     std::unique_ptr<Progress> progress_;
 
@@ -499,6 +528,9 @@ class Dumpstate {
     // List of open ANR dump files.
     std::vector<DumpData> anr_data_;
 
+    // List of open Java traces files in the anr directory.
+    std::vector<DumpData> anr_trace_data_;
+
     // List of open shutdown checkpoint files.
     std::vector<DumpData> shutdown_checkpoints_;
 
@@ -533,12 +565,18 @@ class Dumpstate {
 
   private:
     RunStatus RunInternal(int32_t calling_uid, const std::string& calling_package);
+    RunStatus RetrieveInternal(int32_t calling_uid, const std::string& calling_package,
+                                const bool keep_bugreport_on_retrieval,
+                                const bool skip_user_consent);
 
     RunStatus DumpstateDefaultAfterCritical();
+    RunStatus dumpstate();
 
     void MaybeTakeEarlyScreenshot();
-    void MaybeSnapshotSystemTrace();
-    void MaybeSnapshotWinTrace();
+    std::future<std::string> MaybeSnapshotSystemTraceAsync();
+    void MaybeWaitForSnapshotSystemTrace(std::future<std::string> task);
+    void MaybeSnapshotUiTraces();
+    void MaybeAddUiTracesToZip();
 
     void onUiIntensiveBugreportDumpsFinished(int32_t calling_uid);
 
@@ -553,6 +591,8 @@ class Dumpstate {
     void ShutdownDumpPool();
 
     RunStatus HandleUserConsentDenied();
+
+    void HandleRunStatus(RunStatus status);
 
     // Copies bugreport artifacts over to the caller's directories provided there is user consent or
     // called by Shell.

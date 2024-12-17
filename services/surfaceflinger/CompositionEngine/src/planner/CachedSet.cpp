@@ -21,15 +21,14 @@
 
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
+#include <common/trace.h>
 #include <compositionengine/impl/OutputCompositionState.h>
 #include <compositionengine/impl/planner/CachedSet.h>
 #include <math/HashCombine.h>
 #include <renderengine/DisplaySettings.h>
 #include <renderengine/RenderEngine.h>
 #include <ui/DebugUtils.h>
-#include <utils/Trace.h>
-
-#include <utils/Trace.h>
+#include <ui/HdrRenderTypeUtils.h>
 
 namespace android::compositionengine::impl::planner {
 
@@ -161,7 +160,10 @@ void CachedSet::updateAge(std::chrono::steady_clock::time_point now) {
 void CachedSet::render(renderengine::RenderEngine& renderEngine, TexturePool& texturePool,
                        const OutputCompositionState& outputState,
                        bool deviceHandlesColorTransform) {
-    ATRACE_CALL();
+    SFTRACE_CALL();
+    if (outputState.powerCallback) {
+        outputState.powerCallback->notifyCpuLoadUp();
+    }
     const Rect& viewport = outputState.layerStackSpace.getContent();
     const ui::Dataspace& outputDataspace = outputState.dataspace;
     const ui::Transform::RotationFlags orientation =
@@ -177,27 +179,28 @@ void CachedSet::render(renderengine::RenderEngine& renderEngine, TexturePool& te
             .targetLuminanceNits = outputState.displayBrightnessNits,
     };
 
-    LayerFE::ClientCompositionTargetSettings targetSettings{
-            .clip = Region(viewport),
-            .needsFiltering = false,
-            .isSecure = outputState.isSecure,
-            .supportsProtectedContent = false,
-            .viewport = viewport,
-            .dataspace = outputDataspace,
-            .realContentIsVisible = true,
-            .clearContent = false,
-            .blurSetting = LayerFE::ClientCompositionTargetSettings::BlurSetting::Enabled,
-            .whitePointNits = outputState.displayBrightnessNits,
-    };
+    LayerFE::ClientCompositionTargetSettings
+            targetSettings{.clip = Region(viewport),
+                           .needsFiltering = false,
+                           .isSecure = outputState.isSecure,
+                           .isProtected = false,
+                           .viewport = viewport,
+                           .dataspace = outputDataspace,
+                           .realContentIsVisible = true,
+                           .clearContent = false,
+                           .blurSetting =
+                                   LayerFE::ClientCompositionTargetSettings::BlurSetting::Enabled,
+                           .whitePointNits = outputState.displayBrightnessNits,
+                           .treat170mAsSrgb = outputState.treat170mAsSrgb};
 
     std::vector<renderengine::LayerSettings> layerSettings;
     renderengine::LayerSettings highlight;
     for (const auto& layer : mLayers) {
-        const auto clientCompositionList =
-                layer.getState()->getOutputLayer()->getLayerFE().prepareClientCompositionList(
-                        targetSettings);
-        layerSettings.insert(layerSettings.end(), clientCompositionList.cbegin(),
-                             clientCompositionList.cend());
+        if (auto clientCompositionSettings =
+                    layer.getState()->getOutputLayer()->getLayerFE().prepareClientComposition(
+                            targetSettings)) {
+            layerSettings.push_back(std::move(*clientCompositionSettings));
+        }
     }
 
     renderengine::LayerSettings blurLayerSettings;
@@ -205,43 +208,40 @@ void CachedSet::render(renderengine::RenderEngine& renderEngine, TexturePool& te
         auto blurSettings = targetSettings;
         blurSettings.blurSetting =
                 LayerFE::ClientCompositionTargetSettings::BlurSetting::BackgroundBlurOnly;
-        auto clientCompositionList =
-                mBlurLayer->getOutputLayer()->getLayerFE().prepareClientCompositionList(
-                        blurSettings);
-        blurLayerSettings = clientCompositionList.back();
+
+        auto blurLayerSettings =
+                mBlurLayer->getOutputLayer()->getLayerFE().prepareClientComposition(blurSettings);
         // This mimics Layer::prepareClearClientComposition
-        blurLayerSettings.skipContentDraw = true;
-        blurLayerSettings.name = std::string("blur layer");
+        blurLayerSettings->skipContentDraw = true;
+        blurLayerSettings->name = std::string("blur layer");
         // Clear out the shadow settings
-        blurLayerSettings.shadow = {};
-        layerSettings.push_back(blurLayerSettings);
+        blurLayerSettings->shadow = {};
+        layerSettings.push_back(std::move(*blurLayerSettings));
     }
 
-    renderengine::LayerSettings holePunchSettings;
-    renderengine::LayerSettings holePunchBackgroundSettings;
     if (mHolePunchLayer) {
         auto& layerFE = mHolePunchLayer->getOutputLayer()->getLayerFE();
-        auto clientCompositionList = layerFE.prepareClientCompositionList(targetSettings);
-        // Assume that the final layer contains the buffer that we want to
-        // replace with a hole punch.
-        holePunchSettings = clientCompositionList.back();
+
+        auto holePunchSettings = layerFE.prepareClientComposition(targetSettings);
         // This mimics Layer::prepareClearClientComposition
-        holePunchSettings.source.buffer.buffer = nullptr;
-        holePunchSettings.source.solidColor = half3(0.0f, 0.0f, 0.0f);
-        holePunchSettings.disableBlending = true;
-        holePunchSettings.alpha = 0.0f;
-        holePunchSettings.name =
+        holePunchSettings->source.buffer.buffer = nullptr;
+        holePunchSettings->source.solidColor = half3(0.0f, 0.0f, 0.0f);
+        holePunchSettings->disableBlending = true;
+        holePunchSettings->alpha = 0.0f;
+        holePunchSettings->name =
                 android::base::StringPrintf("hole punch layer for %s", layerFE.getDebugName());
-        layerSettings.push_back(holePunchSettings);
 
         // Add a solid background as the first layer in case there is no opaque
         // buffer behind the punch hole
+        renderengine::LayerSettings holePunchBackgroundSettings;
         holePunchBackgroundSettings.alpha = 1.0f;
         holePunchBackgroundSettings.name = std::string("holePunchBackground");
-        holePunchBackgroundSettings.geometry.boundaries = holePunchSettings.geometry.boundaries;
+        holePunchBackgroundSettings.geometry.boundaries = holePunchSettings->geometry.boundaries;
         holePunchBackgroundSettings.geometry.positionTransform =
-                holePunchSettings.geometry.positionTransform;
-        layerSettings.emplace(layerSettings.begin(), holePunchBackgroundSettings);
+                holePunchSettings->geometry.positionTransform;
+        layerSettings.emplace(layerSettings.begin(), std::move(holePunchBackgroundSettings));
+
+        layerSettings.push_back(std::move(*holePunchSettings));
     }
 
     if (sDebugHighlighLayers) {
@@ -274,13 +274,10 @@ void CachedSet::render(renderengine::RenderEngine& renderEngine, TexturePool& te
         bufferFence.reset(texture->getReadyFence()->dup());
     }
 
-    constexpr bool kUseFramebufferCache = false;
-
-    auto fenceResult =
-            toFenceResult(renderEngine
-                                  .drawLayers(displaySettings, layerSettings, texture->get(),
-                                              kUseFramebufferCache, std::move(bufferFence))
-                                  .get());
+    auto fenceResult = renderEngine
+                               .drawLayers(displaySettings, layerSettings, texture->get(),
+                                           std::move(bufferFence))
+                               .get();
 
     if (fenceStatus(fenceResult) == NO_ERROR) {
         mDrawFence = std::move(fenceResult).value_or(Fence::NO_FENCE);
@@ -308,7 +305,7 @@ bool CachedSet::requiresHolePunch() const {
         return false;
     }
 
-    if (hasUnsupportedDataspace()) {
+    if (hasKnownColorShift()) {
         return false;
     }
 
@@ -368,12 +365,21 @@ compositionengine::OutputLayer* CachedSet::getBlurLayer() const {
     return mBlurLayer ? mBlurLayer->getOutputLayer() : nullptr;
 }
 
-bool CachedSet::hasUnsupportedDataspace() const {
+bool CachedSet::hasKnownColorShift() const {
     return std::any_of(mLayers.cbegin(), mLayers.cend(), [](const Layer& layer) {
         auto dataspace = layer.getState()->getDataspace();
-        const auto transfer = static_cast<ui::Dataspace>(dataspace & ui::Dataspace::TRANSFER_MASK);
-        if (transfer == ui::Dataspace::TRANSFER_ST2084 || transfer == ui::Dataspace::TRANSFER_HLG) {
-            // Skip HDR.
+
+        // Layers are never dimmed when rendering a cached set, meaning that we may ask HWC to
+        // dim a cached set. But this means that we can never cache any HDR layers so that we
+        // don't accidentally dim those layers.
+        const auto hdrType = getHdrRenderType(dataspace, layer.getState()->getPixelFormat(),
+                                              layer.getState()->getHdrSdrRatio());
+        if (hdrType != HdrRenderType::SDR) {
+            return true;
+        }
+
+        // Layers that have dimming disabled pretend that they're HDR.
+        if (!layer.getState()->isDimmingEnabled()) {
             return true;
         }
 
@@ -391,10 +397,16 @@ bool CachedSet::hasProtectedLayers() const {
                        [](const Layer& layer) { return layer.getState()->isProtected(); });
 }
 
-bool CachedSet::hasSolidColorLayers() const {
-    return std::any_of(mLayers.cbegin(), mLayers.cend(), [](const Layer& layer) {
-        return layer.getState()->hasSolidColorCompositionType();
-    });
+bool CachedSet::cachingHintExcludesLayers() const {
+    const bool shouldExcludeLayers =
+            std::any_of(mLayers.cbegin(), mLayers.cend(), [](const Layer& layer) {
+                return layer.getState()->getCachingHint() == gui::CachingHint::Disabled;
+            });
+
+    LOG_ALWAYS_FATAL_IF(shouldExcludeLayers && getLayerCount() > 1,
+                        "CachedSet is invalid: should be excluded but contains %zu layers",
+                        getLayerCount());
+    return shouldExcludeLayers;
 }
 
 void CachedSet::dump(std::string& result) const {
@@ -415,8 +427,8 @@ void CachedSet::dump(std::string& result) const {
 
     if (mLayers.size() == 1) {
         base::StringAppendF(&result, "    Layer [%s]\n", mLayers[0].getName().c_str());
-        if (auto* buffer = mLayers[0].getBuffer().get()) {
-            base::StringAppendF(&result, "    Buffer %p", buffer);
+        if (const sp<GraphicBuffer> buffer = mLayers[0].getState()->getBuffer().promote()) {
+            base::StringAppendF(&result, "    Buffer %p", buffer.get());
             base::StringAppendF(&result, "    Format %s",
                                 decodePixelFormat(buffer->getPixelFormat()).c_str());
         }
@@ -426,8 +438,8 @@ void CachedSet::dump(std::string& result) const {
         result.append("    Cached set of:\n");
         for (const Layer& layer : mLayers) {
             base::StringAppendF(&result, "      Layer [%s]\n", layer.getName().c_str());
-            if (auto* buffer = layer.getBuffer().get()) {
-                base::StringAppendF(&result, "       Buffer %p", buffer);
+            if (const sp<GraphicBuffer> buffer = layer.getState()->getBuffer().promote()) {
+                base::StringAppendF(&result, "       Buffer %p", buffer.get());
                 base::StringAppendF(&result, "    Format[%s]",
                                     decodePixelFormat(buffer->getPixelFormat()).c_str());
             }

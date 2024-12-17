@@ -19,17 +19,20 @@ package {
     // to get the below license kinds:
     //   SPDX-license-identifier-Apache-2.0
     default_applicable_licenses: ["frameworks_native_license"],
+    default_team: "trendy_team_android_core_graphics_stack",
 }
 
 cc_library_static {
     name: "libtonemap",
+    defaults: [
+        "android.hardware.graphics.common-ndk_shared",
+        "android.hardware.graphics.composer3-ndk_shared",
+    ],
     vendor_available: true,
 
     local_include_dirs: ["include"],
 
     shared_libs: [
-        "android.hardware.graphics.common-V4-ndk",
-        "android.hardware.graphics.composer3-V1-ndk",
         "liblog",
         "libnativewindow",
     ],

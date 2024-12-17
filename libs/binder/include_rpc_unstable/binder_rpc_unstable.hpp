@@ -40,12 +40,13 @@ enum class ARpcSession_FileDescriptorTransportMode {
 [[nodiscard]] ARpcServer* ARpcServer_newVsock(AIBinder* service, unsigned int cid,
                                               unsigned int port);
 
-// Starts a Unix domain RPC server with a given init-managed Unix domain `name`
+// Starts a Unix domain RPC server with an open raw socket file descriptor
 // and a given root IBinder object.
-// The socket should be created in init.rc with the same `name`.
+// The socket should be created and bound to an address.
 // Returns an opaque handle to the running server instance, or null if the server
 // could not be started.
-[[nodiscard]] ARpcServer* ARpcServer_newInitUnixDomain(AIBinder* service, const char* name);
+// The socket will be closed by the server once the server goes out of scope.
+[[nodiscard]] ARpcServer* ARpcServer_newBoundSocket(AIBinder* service, int socketFd);
 
 // Starts an RPC server that bootstraps sessions using an existing Unix domain
 // socket pair, with a given root IBinder object.
@@ -57,11 +58,31 @@ enum class ARpcSession_FileDescriptorTransportMode {
 // could not be started.
 [[nodiscard]] ARpcServer* ARpcServer_newUnixDomainBootstrap(AIBinder* service, int bootstrapFd);
 
+// Starts an RPC server on a given IP address+port and a given IBinder object.
+// Returns an opaque handle to the running server instance, or null if the server
+// could not be started.
+// Does not take ownership of `service`.
+// Returns an opaque handle to the running service instance, or null if the server
+// could not be started.
+[[nodiscard]] ARpcServer* ARpcServer_newInet(AIBinder* service, const char* address,
+                                             unsigned int port);
+
 // Sets the list of supported file descriptor transport modes of this RPC server.
 void ARpcServer_setSupportedFileDescriptorTransportModes(
         ARpcServer* handle,
         const ARpcSession_FileDescriptorTransportMode modes[],
         size_t modes_len);
+
+// Sets the maximum number of threads that the Server will use for
+// incoming client connections.
+//
+// This must be called before adding a client session. This corresponds
+// to the number of incoming connections to RpcSession objects in the
+// server, which will correspond to the number of outgoing connections
+// in client RpcSession objects.
+//
+// If this is not specified, this will be a single-threaded server.
+void ARpcServer_setMaxThreads(ARpcServer* server, size_t threads);
 
 // Runs ARpcServer_join() in a background thread. Immediately returns.
 void ARpcServer_start(ARpcServer* server);
@@ -98,6 +119,10 @@ AIBinder* ARpcSession_setupUnixDomainClient(ARpcSession* session, const char* na
 AIBinder* ARpcSession_setupUnixDomainBootstrapClient(ARpcSession* session,
                                                      int bootstrapFd);
 
+// Connects to an RPC server over an INET socket at a given IP address on a given port.
+// Returns the root Binder object of the server.
+AIBinder* ARpcSession_setupInet(ARpcSession* session, const char* address, unsigned int port);
+
 // Connects to an RPC server with preconnected file descriptors.
 //
 // requestFd should connect to the server and return a valid file descriptor, or
@@ -113,11 +138,11 @@ AIBinder* ARpcSession_setupPreconnectedClient(ARpcSession* session,
 void ARpcSession_setFileDescriptorTransportMode(ARpcSession* session,
                                                 ARpcSession_FileDescriptorTransportMode mode);
 
-// Sets the maximum number of incoming threads.
+// Sets the maximum number of incoming threads, to service connections.
 void ARpcSession_setMaxIncomingThreads(ARpcSession* session, size_t threads);
 
-// Sets the maximum number of outgoing threads.
-void ARpcSession_setMaxOutgoingThreads(ARpcSession* session, size_t threads);
+// Sets the maximum number of outgoing connections.
+void ARpcSession_setMaxOutgoingConnections(ARpcSession* session, size_t connections);
 
 // Decrements the refcount of the underlying RpcSession object.
 void ARpcSession_free(ARpcSession* session);

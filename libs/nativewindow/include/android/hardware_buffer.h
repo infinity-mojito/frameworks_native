@@ -46,8 +46,15 @@
 #define ANDROID_HARDWARE_BUFFER_H
 
 #include <android/rect.h>
+#define ADATASPACE_SKIP_LEGACY_DEFINES
+#include <android/data_space.h>
+#undef ADATASPACE_SKIP_LEGACY_DEFINES
 #include <inttypes.h>
 #include <sys/cdefs.h>
+
+#if !defined(__INTRODUCED_IN)
+#define __INTRODUCED_IN(__api_level) /* nothing */
+#endif
 
 __BEGIN_DECLS
 
@@ -177,14 +184,14 @@ enum AHardwareBuffer_Format {
     /**
      * Corresponding formats:
      *   Vulkan: VK_FORMAT_R16_UINT
-     *   OpenGL ES: GR_GL_R16UI
+     *   OpenGL ES: GL_R16UI
      */
     AHARDWAREBUFFER_FORMAT_R16_UINT                 = 0x39,
 
     /**
      * Corresponding formats:
      *   Vulkan: VK_FORMAT_R16G16_UINT
-     *   OpenGL ES: GR_GL_RG16UI
+     *   OpenGL ES: GL_RG16UI
      */
     AHARDWAREBUFFER_FORMAT_R16G16_UINT              = 0x3a,
 
@@ -310,6 +317,16 @@ enum AHardwareBuffer_UsageFlags {
      * the extension GL_EXT_EGL_image_storage instead of GL_KHR_EGL_image.
      */
     AHARDWAREBUFFER_USAGE_GPU_MIPMAP_COMPLETE   = 1UL << 26,
+
+    /**
+     * Usage: The buffer is used for front-buffer rendering. When
+     * front-buffering rendering is specified, different usages may adjust their
+     * behavior as a result. For example, when used as GPU_COLOR_OUTPUT the buffer
+     * will behave similar to a single-buffered window. When used with
+     * COMPOSER_OVERLAY, the system will try to prioritize the buffer receiving
+     * an overlay plane & avoid caching it in intermediate composition buffers.
+     */
+    AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL << 32,
 
     AHARDWAREBUFFER_USAGE_VENDOR_0  = 1ULL << 28,
     AHARDWAREBUFFER_USAGE_VENDOR_1  = 1ULL << 29,

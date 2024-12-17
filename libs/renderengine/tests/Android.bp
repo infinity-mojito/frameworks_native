@@ -19,12 +19,14 @@ package {
     // to get the below license kinds:
     //   SPDX-license-identifier-Apache-2.0
     default_applicable_licenses: ["frameworks_native_license"],
+    default_team: "trendy_team_android_core_graphics_stack",
 }
 
 cc_test {
     name: "librenderengine_test",
     defaults: [
-        "skia_deps",
+        "android.hardware.graphics.composer3-ndk_shared",
+        "librenderengine_deps",
         "surfaceflinger_defaults",
     ],
     test_suites: ["device-tests"],
@@ -43,13 +45,14 @@ cc_test {
         "librenderengine_mocks",
         "libshaders",
         "libtonemap",
+        "libsurfaceflinger_common",
+        "libsurfaceflingerflags",
     ],
     header_libs: [
         "libtonemap_headers",
     ],
 
     shared_libs: [
-        "android.hardware.graphics.composer3-V1-ndk",
         "libbase",
         "libcutils",
         "libEGL",
@@ -61,5 +64,8 @@ cc_test {
         "libsync",
         "libui",
         "libutils",
+        "server_configurable_flags",
+        "libaconfig_storage_read_api_cc",
+        "libtracing_perfetto",
     ],
 }

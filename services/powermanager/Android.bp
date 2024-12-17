@@ -9,7 +9,7 @@ package {
 
 cc_library_shared {
     name: "libpowermanager",
-
+    defaults: ["android.hardware.power-ndk_export_shared"],
     srcs: [
         "BatterySaverPolicyConfig.cpp",
         "CoolingDevice.cpp",
@@ -17,6 +17,7 @@ cc_library_shared {
         "PowerHalController.cpp",
         "PowerHalLoader.cpp",
         "PowerHalWrapper.cpp",
+        "PowerHintSessionWrapper.cpp",
         "PowerSaveState.cpp",
         "Temperature.cpp",
         "WorkSource.cpp",
@@ -33,12 +34,25 @@ cc_library_shared {
 
     shared_libs: [
         "libbinder",
+        "libbinder_ndk",
         "libhidlbase",
         "liblog",
         "libutils",
         "android.hardware.power@1.0",
         "android.hardware.power@1.1",
-        "android.hardware.power-V3-cpp",
+        "android.hardware.power@1.2",
+        "android.hardware.power@1.3",
+    ],
+
+    export_shared_lib_headers: [
+        "android.hardware.power@1.0",
+        "android.hardware.power@1.1",
+        "android.hardware.power@1.2",
+        "android.hardware.power@1.3",
+    ],
+
+    whole_static_libs: [
+        "android.os.hintmanager_aidl-ndk",
     ],
 
     cflags: [

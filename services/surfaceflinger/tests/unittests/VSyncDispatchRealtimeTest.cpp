@@ -19,6 +19,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <scheduler/FrameTime.h>
 #include <scheduler/Timer.h>
 
 #include "Scheduler/VSyncDispatchTimerQueue.h"
@@ -34,39 +35,51 @@ constexpr nsecs_t toNs(std::chrono::duration<Rep, Per> const& tp) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(tp).count();
 }
 
-class FixedRateIdealStubTracker : public VSyncTracker {
+class StubTracker : public VSyncTracker {
 public:
-    FixedRateIdealStubTracker() : mPeriod{toNs(3ms)} {}
+    StubTracker(nsecs_t period) : mPeriod(period) {}
 
     bool addVsyncTimestamp(nsecs_t) final { return true; }
 
-    nsecs_t nextAnticipatedVSyncTimeFrom(nsecs_t timePoint) const final {
+    nsecs_t currentPeriod() const final {
+        std::lock_guard lock(mMutex);
+        return mPeriod;
+    }
+
+    Period minFramePeriod() const final { return Period::fromNs(currentPeriod()); }
+    void resetModel() final {}
+    bool needsMoreSamples() const final { return false; }
+    bool isVSyncInPhase(nsecs_t, Fps) final { return false; }
+    void setDisplayModePtr(ftl::NonNull<DisplayModePtr>) final {}
+    void setRenderRate(Fps, bool) final {}
+    void onFrameBegin(TimePoint, scheduler::FrameTime) final {}
+    void onFrameMissed(TimePoint) final {}
+    void dump(std::string&) const final {}
+    bool isCurrentMode(const ftl::NonNull<DisplayModePtr>&) const final { return false; };
+
+protected:
+    std::mutex mutable mMutex;
+    nsecs_t mPeriod;
+};
+
+class FixedRateIdealStubTracker : public StubTracker {
+public:
+    FixedRateIdealStubTracker() : StubTracker{toNs(3ms)} {}
+
+    nsecs_t nextAnticipatedVSyncTimeFrom(nsecs_t timePoint, std::optional<nsecs_t>) final {
         auto const floor = timePoint % mPeriod;
         if (floor == 0) {
             return timePoint;
         }
         return timePoint - floor + mPeriod;
     }
-
-    nsecs_t currentPeriod() const final { return mPeriod; }
-
-    void setPeriod(nsecs_t) final {}
-    void resetModel() final {}
-    bool needsMoreSamples() const final { return false; }
-    bool isVSyncInPhase(nsecs_t, Fps) const final { return false; }
-    void dump(std::string&) const final {}
-
-private:
-    nsecs_t const mPeriod;
 };
 
-class VRRStubTracker : public VSyncTracker {
+class VRRStubTracker : public StubTracker {
 public:
-    VRRStubTracker(nsecs_t period) : mPeriod{period} {}
+    VRRStubTracker(nsecs_t period) : StubTracker(period) {}
 
-    bool addVsyncTimestamp(nsecs_t) final { return true; }
-
-    nsecs_t nextAnticipatedVSyncTimeFrom(nsecs_t time_point) const final {
+    nsecs_t nextAnticipatedVSyncTimeFrom(nsecs_t time_point, std::optional<nsecs_t>) final {
         std::lock_guard lock(mMutex);
         auto const normalized_to_base = time_point - mBase;
         auto const floor = (normalized_to_base) % mPeriod;
@@ -82,20 +95,7 @@ public:
         mBase = last_known;
     }
 
-    nsecs_t currentPeriod() const final {
-        std::lock_guard lock(mMutex);
-        return mPeriod;
-    }
-
-    void setPeriod(nsecs_t) final {}
-    void resetModel() final {}
-    bool needsMoreSamples() const final { return false; }
-    bool isVSyncInPhase(nsecs_t, Fps) const final { return false; }
-    void dump(std::string&) const final {}
-
 private:
-    std::mutex mutable mMutex;
-    nsecs_t mPeriod;
     nsecs_t mBase = 0;
 };
 
@@ -107,7 +107,8 @@ struct VSyncDispatchRealtimeTest : testing::Test {
 
 class RepeatingCallbackReceiver {
 public:
-    RepeatingCallbackReceiver(VSyncDispatch& dispatch, nsecs_t workload, nsecs_t readyDuration)
+    RepeatingCallbackReceiver(std::shared_ptr<VSyncDispatch> dispatch, nsecs_t workload,
+                              nsecs_t readyDuration)
           : mWorkload(workload),
             mReadyDuration(readyDuration),
             mCallback(
@@ -118,7 +119,7 @@ public:
         mCallback.schedule(
                 {.workDuration = mWorkload,
                  .readyDuration = mReadyDuration,
-                 .earliestVsync = systemTime(SYSTEM_TIME_MONOTONIC) + mWorkload + mReadyDuration});
+                 .lastVsync = systemTime(SYSTEM_TIME_MONOTONIC) + mWorkload + mReadyDuration});
 
         for (auto i = 0u; i < iterations - 1; i++) {
             std::unique_lock lock(mMutex);
@@ -131,7 +132,7 @@ public:
 
             mCallback.schedule({.workDuration = mWorkload,
                                 .readyDuration = mReadyDuration,
-                                .earliestVsync = last + mWorkload + mReadyDuration});
+                                .lastVsync = last + mWorkload + mReadyDuration});
         }
 
         // wait for the last callback.
@@ -164,9 +165,10 @@ private:
 };
 
 TEST_F(VSyncDispatchRealtimeTest, triple_alarm) {
-    FixedRateIdealStubTracker tracker;
-    VSyncDispatchTimerQueue dispatch(std::make_unique<Timer>(), tracker, mDispatchGroupThreshold,
-                                     mVsyncMoveThreshold);
+    auto tracker = std::make_shared<FixedRateIdealStubTracker>();
+    auto dispatch =
+            std::make_shared<VSyncDispatchTimerQueue>(std::make_unique<Timer>(), tracker,
+                                                      mDispatchGroupThreshold, mVsyncMoveThreshold);
 
     static size_t constexpr num_clients = 3;
     std::array<RepeatingCallbackReceiver, num_clients>
@@ -193,14 +195,15 @@ TEST_F(VSyncDispatchRealtimeTest, triple_alarm) {
 // starts at 333hz, slides down to 43hz
 TEST_F(VSyncDispatchRealtimeTest, vascillating_vrr) {
     auto next_vsync_interval = toNs(3ms);
-    VRRStubTracker tracker(next_vsync_interval);
-    VSyncDispatchTimerQueue dispatch(std::make_unique<Timer>(), tracker, mDispatchGroupThreshold,
-                                     mVsyncMoveThreshold);
+    auto tracker = std::make_shared<VRRStubTracker>(next_vsync_interval);
+    auto dispatch =
+            std::make_shared<VSyncDispatchTimerQueue>(std::make_unique<Timer>(), tracker,
+                                                      mDispatchGroupThreshold, mVsyncMoveThreshold);
 
     RepeatingCallbackReceiver cb_receiver(dispatch, toNs(1ms), toNs(5ms));
 
     auto const on_each_frame = [&](nsecs_t last_known) {
-        tracker.set_interval(next_vsync_interval += toNs(1ms), last_known);
+        tracker->set_interval(next_vsync_interval += toNs(1ms), last_known);
     };
 
     std::thread eventThread([&] { cb_receiver.repeatedly_schedule(mIterations, on_each_frame); });
@@ -211,9 +214,10 @@ TEST_F(VSyncDispatchRealtimeTest, vascillating_vrr) {
 
 // starts at 333hz, jumps to 200hz at frame 10
 TEST_F(VSyncDispatchRealtimeTest, fixed_jump) {
-    VRRStubTracker tracker(toNs(3ms));
-    VSyncDispatchTimerQueue dispatch(std::make_unique<Timer>(), tracker, mDispatchGroupThreshold,
-                                     mVsyncMoveThreshold);
+    auto tracker = std::make_shared<VRRStubTracker>(toNs(3ms));
+    auto dispatch =
+            std::make_shared<VSyncDispatchTimerQueue>(std::make_unique<Timer>(), tracker,
+                                                      mDispatchGroupThreshold, mVsyncMoveThreshold);
 
     RepeatingCallbackReceiver cb_receiver(dispatch, toNs(1ms), toNs(5ms));
 
@@ -221,7 +225,7 @@ TEST_F(VSyncDispatchRealtimeTest, fixed_jump) {
     auto constexpr jump_frame_at = 10u;
     auto const on_each_frame = [&](nsecs_t last_known) {
         if (jump_frame_counter++ == jump_frame_at) {
-            tracker.set_interval(toNs(5ms), last_known);
+            tracker->set_interval(toNs(5ms), last_known);
         }
     };
     std::thread eventThread([&] { cb_receiver.repeatedly_schedule(mIterations, on_each_frame); });

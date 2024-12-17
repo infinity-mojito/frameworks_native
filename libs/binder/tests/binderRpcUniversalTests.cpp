@@ -48,10 +48,13 @@ TEST(BinderRpc, CannotUseNextWireVersion) {
     EXPECT_FALSE(session->setProtocolVersion(RPC_WIRE_PROTOCOL_VERSION_NEXT + 15));
 }
 
+#ifndef BINDER_RPC_TO_TRUSTY_TEST
 TEST(BinderRpc, CanUseExperimentalWireVersion) {
     auto session = RpcSession::make();
-    EXPECT_TRUE(session->setProtocolVersion(RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL));
+    EXPECT_EQ(hasExperimentalRpc(),
+              session->setProtocolVersion(RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL));
 }
+#endif
 
 TEST_P(BinderRpc, Ping) {
     auto proc = createRpcTestSocketServerProcess({});
@@ -84,7 +87,7 @@ TEST_P(BinderRpc, SeparateRootObject) {
         GTEST_SKIP() << "This test requires a multi-threaded service";
     }
 
-    SocketType type = std::get<0>(GetParam());
+    SocketType type = GetParam().type;
     if (type == SocketType::PRECONNECTED || type == SocketType::UNIX ||
         type == SocketType::UNIX_BOOTSTRAP || type == SocketType::UNIX_RAW) {
         // we can't get port numbers for unix sockets
@@ -113,6 +116,10 @@ TEST_P(BinderRpc, TransactionsMustBeMarkedRpc) {
 }
 
 TEST_P(BinderRpc, AppendSeparateFormats) {
+    if (socketType() == SocketType::TIPC) {
+        GTEST_SKIP() << "Trusty does not support multiple server processes";
+    }
+
     auto proc1 = createRpcTestSocketServerProcess({});
     auto proc2 = createRpcTestSocketServerProcess({});
 
@@ -155,7 +162,9 @@ TEST_P(BinderRpc, SendAndGetResultBack) {
 
 TEST_P(BinderRpc, SendAndGetResultBackBig) {
     auto proc = createRpcTestSocketServerProcess({});
-    std::string single = std::string(1024, 'a');
+    // Trusty has a limit of 4096 bytes for the entire RPC Binder message
+    size_t singleLen = socketType() == SocketType::TIPC ? 512 : 4096;
+    std::string single = std::string(singleLen, 'a');
     std::string doubled;
     EXPECT_OK(proc.rootIface->doubleString(single, &doubled));
     EXPECT_EQ(single + single, doubled);
@@ -259,6 +268,10 @@ TEST_P(BinderRpc, HoldBinder) {
 // aren't supported.
 
 TEST_P(BinderRpc, CannotMixBindersBetweenUnrelatedSocketSessions) {
+    if (socketType() == SocketType::TIPC) {
+        GTEST_SKIP() << "Trusty does not support multiple server processes";
+    }
+
     auto proc1 = createRpcTestSocketServerProcess({});
     auto proc2 = createRpcTestSocketServerProcess({});
 
@@ -288,7 +301,8 @@ TEST_P(BinderRpc, CannotSendRegularBinderOverSocketBinder) {
 
     auto proc = createRpcTestSocketServerProcess({});
 
-    sp<IBinder> someRealBinder = IInterface::asBinder(defaultServiceManager());
+    sp<IBinder> someRealBinder = defaultServiceManager()->getService(String16("activity"));
+    ASSERT_NE(someRealBinder, nullptr);
     sp<IBinder> outBinder;
     EXPECT_EQ(INVALID_OPERATION,
               proc.rootIface->repeatBinder(someRealBinder, &outBinder).transactionError());
@@ -310,6 +324,22 @@ TEST_P(BinderRpc, CannotSendSocketBinderOverRegularBinder) {
 
 // END TESTS FOR LIMITATIONS OF SOCKET BINDER
 
+class TestFrozenStateChangeCallback : public IBinder::FrozenStateChangeCallback {
+public:
+    virtual void onStateChanged(const wp<IBinder>&, State) {}
+};
+
+TEST_P(BinderRpc, RpcBinderShouldFailOnFrozenStateCallbacks) {
+    auto proc = createRpcTestSocketServerProcess({});
+
+    sp<IBinder> a;
+    sp<TestFrozenStateChangeCallback> callback = sp<TestFrozenStateChangeCallback>::make();
+    EXPECT_OK(proc.rootIface->alwaysGiveMeTheSameBinder(&a));
+    EXPECT_DEATH_IF_SUPPORTED(
+            { std::ignore = a->addFrozenStateChangeCallback(callback); },
+            "addFrozenStateChangeCallback\\(\\) is not supported for RPC Binder.");
+}
+
 TEST_P(BinderRpc, RepeatRootObject) {
     auto proc = createRpcTestSocketServerProcess({});
 
@@ -319,15 +349,19 @@ TEST_P(BinderRpc, RepeatRootObject) {
 }
 
 TEST_P(BinderRpc, NestedTransactions) {
+    auto fileDescriptorTransportMode = RpcSession::FileDescriptorTransportMode::UNIX;
+    if (socketType() == SocketType::TIPC) {
+        // TIPC does not support file descriptors yet
+        fileDescriptorTransportMode = RpcSession::FileDescriptorTransportMode::NONE;
+    }
     auto proc = createRpcTestSocketServerProcess({
             // Enable FD support because it uses more stack space and so represents
             // something closer to a worst case scenario.
-            .clientFileDescriptorTransportMode = RpcSession::FileDescriptorTransportMode::UNIX,
-            .serverSupportedFileDescriptorTransportModes =
-                    {RpcSession::FileDescriptorTransportMode::UNIX},
+            .clientFileDescriptorTransportMode = fileDescriptorTransportMode,
+            .serverSupportedFileDescriptorTransportModes = {fileDescriptorTransportMode},
     });
 
-    auto nastyNester = sp<MyBinderRpcTest>::make();
+    auto nastyNester = sp<MyBinderRpcTestDefault>::make();
     EXPECT_OK(proc.rootIface->nestMe(nastyNester, 10));
 
     wp<IBinder> weak = nastyNester;
@@ -372,11 +406,11 @@ TEST_P(BinderRpc, SameBinderEqualityWeak) {
     EXPECT_EQ(b, weak.promote());
 }
 
-#define expectSessions(expected, iface)                   \
+#define EXPECT_SESSIONS(expected, iface)                  \
     do {                                                  \
         int session;                                      \
         EXPECT_OK((iface)->getNumOpenSessions(&session)); \
-        EXPECT_EQ(expected, session);                     \
+        EXPECT_EQ(static_cast<int>(expected), session);   \
     } while (false)
 
 TEST_P(BinderRpc, SingleSession) {
@@ -388,9 +422,9 @@ TEST_P(BinderRpc, SingleSession) {
     EXPECT_OK(session->getName(&out));
     EXPECT_EQ("aoeu", out);
 
-    expectSessions(1, proc.rootIface);
+    EXPECT_SESSIONS(1, proc.rootIface);
     session = nullptr;
-    expectSessions(0, proc.rootIface);
+    EXPECT_SESSIONS(0, proc.rootIface);
 }
 
 TEST_P(BinderRpc, ManySessions) {
@@ -399,24 +433,24 @@ TEST_P(BinderRpc, ManySessions) {
     std::vector<sp<IBinderRpcSession>> sessions;
 
     for (size_t i = 0; i < 15; i++) {
-        expectSessions(i, proc.rootIface);
+        EXPECT_SESSIONS(i, proc.rootIface);
         sp<IBinderRpcSession> session;
         EXPECT_OK(proc.rootIface->openSession(std::to_string(i), &session));
         sessions.push_back(session);
     }
-    expectSessions(sessions.size(), proc.rootIface);
+    EXPECT_SESSIONS(sessions.size(), proc.rootIface);
     for (size_t i = 0; i < sessions.size(); i++) {
         std::string out;
         EXPECT_OK(sessions.at(i)->getName(&out));
         EXPECT_EQ(std::to_string(i), out);
     }
-    expectSessions(sessions.size(), proc.rootIface);
+    EXPECT_SESSIONS(sessions.size(), proc.rootIface);
 
     while (!sessions.empty()) {
         sessions.pop_back();
-        expectSessions(sessions.size(), proc.rootIface);
+        EXPECT_SESSIONS(sessions.size(), proc.rootIface);
     }
-    expectSessions(0, proc.rootIface);
+    EXPECT_SESSIONS(0, proc.rootIface);
 }
 
 TEST_P(BinderRpc, OnewayCallDoesNotWait) {
@@ -449,7 +483,7 @@ TEST_P(BinderRpc, Callbacks) {
                 auto proc = createRpcTestSocketServerProcess(
                         {.numThreads = 1,
                          .numSessions = 1,
-                         .numIncomingConnections = numIncomingConnections});
+                         .numIncomingConnectionsBySession = {numIncomingConnections}});
                 auto cb = sp<MyBinderRpcCallback>::make();
 
                 if (callIsOneway) {
@@ -469,7 +503,7 @@ TEST_P(BinderRpc, Callbacks) {
                     cb->mCv.wait_for(_l, 1s, [&] { return !cb->mValues.empty(); });
                 }
 
-                EXPECT_EQ(cb->mValues.size(), 1)
+                EXPECT_EQ(cb->mValues.size(), 1UL)
                         << "callIsOneway: " << callIsOneway
                         << " callbackIsOneway: " << callbackIsOneway << " delayed: " << delayed;
                 if (cb->mValues.empty()) continue;
@@ -477,16 +511,7 @@ TEST_P(BinderRpc, Callbacks) {
                         << "callIsOneway: " << callIsOneway
                         << " callbackIsOneway: " << callbackIsOneway << " delayed: " << delayed;
 
-                // since we are severing the connection, we need to go ahead and
-                // tell the server to shutdown and exit so that waitpid won't hang
-                if (auto status = proc.rootIface->scheduleShutdown(); !status.isOk()) {
-                    EXPECT_EQ(DEAD_OBJECT, status.transactionError()) << status;
-                }
-
-                // since this session has an incoming connection w/ a threadpool, we
-                // need to manually shut it down
-                EXPECT_TRUE(proc.proc->sessions.at(0).session->shutdownAndWait(true));
-                proc.expectAlreadyShutdown = true;
+                proc.forceShutdown();
             }
         }
     }

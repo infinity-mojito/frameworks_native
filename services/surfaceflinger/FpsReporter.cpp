@@ -26,13 +26,12 @@
 
 namespace android {
 
-FpsReporter::FpsReporter(frametimeline::FrameTimeline& frameTimeline, SurfaceFlinger& flinger,
-                         std::unique_ptr<Clock> clock)
-      : mFrameTimeline(frameTimeline), mFlinger(flinger), mClock(std::move(clock)) {
+FpsReporter::FpsReporter(frametimeline::FrameTimeline& frameTimeline, std::unique_ptr<Clock> clock)
+      : mFrameTimeline(frameTimeline), mClock(std::move(clock)) {
     LOG_ALWAYS_FATAL_IF(mClock == nullptr, "Passed in null clock when constructing FpsReporter!");
 }
 
-void FpsReporter::dispatchLayerFps() {
+void FpsReporter::dispatchLayerFps(const frontend::LayerHierarchy& layerHierarchy) {
     const auto now = mClock->now();
     if (now - mLastDispatch < kMinDispatchDuration) {
         return;
@@ -52,30 +51,42 @@ void FpsReporter::dispatchLayerFps() {
     }
 
     std::unordered_set<int32_t> seenTasks;
-    std::vector<std::pair<TrackedListener, sp<Layer>>> listenersAndLayersToReport;
+    std::vector<std::pair<TrackedListener, const frontend::LayerHierarchy*>>
+            listenersAndLayersToReport;
 
-    mFlinger.mCurrentState.traverse([&](Layer* layer) {
-        auto& currentState = layer->getDrawingState();
-        if (currentState.metadata.has(METADATA_TASK_ID)) {
-            int32_t taskId = currentState.metadata.getInt32(METADATA_TASK_ID, 0);
+    layerHierarchy.traverse([&](const frontend::LayerHierarchy& hierarchy,
+                                const frontend::LayerHierarchy::TraversalPath& traversalPath) {
+        if (traversalPath.variant == frontend::LayerHierarchy::Variant::Detached) {
+            return false;
+        }
+        const auto& metadata = hierarchy.getLayer()->metadata;
+        if (metadata.has(gui::METADATA_TASK_ID)) {
+            int32_t taskId = metadata.getInt32(gui::METADATA_TASK_ID, 0);
             if (seenTasks.count(taskId) == 0) {
                 // localListeners is expected to be tiny
                 for (TrackedListener& listener : localListeners) {
                     if (listener.taskId == taskId) {
                         seenTasks.insert(taskId);
-                        listenersAndLayersToReport.push_back({listener, sp<Layer>(layer)});
+                        listenersAndLayersToReport.push_back({listener, &hierarchy});
                         break;
                     }
                 }
             }
         }
+        return true;
     });
 
-    for (const auto& [listener, layer] : listenersAndLayersToReport) {
+    for (const auto& [listener, hierarchy] : listenersAndLayersToReport) {
         std::unordered_set<int32_t> layerIds;
 
-        layer->traverse(LayerVector::StateSet::Current,
-                        [&](Layer* layer) { layerIds.insert(layer->getSequence()); });
+        hierarchy->traverse([&](const frontend::LayerHierarchy& hierarchy,
+                                const frontend::LayerHierarchy::TraversalPath& traversalPath) {
+            if (traversalPath.variant == frontend::LayerHierarchy::Variant::Detached) {
+                return false;
+            }
+            layerIds.insert(static_cast<int32_t>(hierarchy.getLayer()->id));
+            return true;
+        });
 
         listener.listener->onFpsReported(mFrameTimeline.computeFps(layerIds));
     }
@@ -90,7 +101,7 @@ void FpsReporter::binderDied(const wp<IBinder>& who) {
 
 void FpsReporter::addListener(const sp<gui::IFpsListener>& listener, int32_t taskId) {
     sp<IBinder> asBinder = IInterface::asBinder(listener);
-    asBinder->linkToDeath(this);
+    asBinder->linkToDeath(sp<DeathRecipient>::fromExisting(this));
     std::lock_guard lock(mMutex);
     mListeners.emplace(wp<IBinder>(asBinder), TrackedListener{listener, taskId});
 }

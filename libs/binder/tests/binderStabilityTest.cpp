@@ -27,8 +27,9 @@
 
 #include <sys/prctl.h>
 
-#include "aidl/BnBinderStabilityTest.h"
+#include "../Utils.h"
 #include "BnBinderStabilityTest.h"
+#include "aidl/BnBinderStabilityTest.h"
 
 using namespace android;
 using namespace ndk;
@@ -155,7 +156,9 @@ TEST(BinderStability, NdkForceDowngradeToLocalStability) {
 }
 
 TEST(BinderStability, ForceDowngradeToVendorStability) {
+    LIBBINDER_IGNORE("-Wdeprecated-declarations")
     sp<IBinder> serverBinder = android::defaultServiceManager()->getService(kSystemStabilityServer);
+    LIBBINDER_IGNORE_END()
     auto server = interface_cast<IBinderStabilityTest>(serverBinder);
 
     ASSERT_NE(nullptr, server.get());
@@ -206,7 +209,9 @@ TEST(BinderStability, ConnectionInfoRequiresManifestEntries) {
     EXPECT_EQ(connectionInfo, std::nullopt);
 }
 TEST(BinderStability, CantCallVendorBinderInSystemContext) {
+    LIBBINDER_IGNORE("-Wdeprecated-declarations")
     sp<IBinder> serverBinder = android::defaultServiceManager()->getService(kSystemStabilityServer);
+    LIBBINDER_IGNORE_END()
     auto server = interface_cast<IBinderStabilityTest>(serverBinder);
 
     ASSERT_NE(nullptr, server.get());
@@ -310,8 +315,10 @@ static AIBinder_Class* kNdkBadStableBinder =
 extern "C" void AIBinder_markVendorStability(AIBinder* binder); // <- BAD DO NOT COPY
 
 TEST(BinderStability, NdkCantCallVendorBinderInSystemContext) {
+    LIBBINDER_IGNORE("-Wdeprecated-declarations")
     SpAIBinder binder = SpAIBinder(AServiceManager_getService(
         String8(kSystemStabilityServer).c_str()));
+    LIBBINDER_IGNORE_END()
 
     std::shared_ptr<aidl::IBinderStabilityTest> remoteServer =
         aidl::IBinderStabilityTest::fromBinder(binder);

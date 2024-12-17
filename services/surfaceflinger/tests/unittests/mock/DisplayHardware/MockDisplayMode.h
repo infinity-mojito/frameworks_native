@@ -20,17 +20,57 @@
 
 namespace android::mock {
 
+inline DisplayMode::Builder createDisplayModeBuilder(
+        DisplayModeId modeId, Fps displayRefreshRate, int32_t group = 0,
+        ui::Size resolution = ui::Size(1920, 1080),
+        PhysicalDisplayId displayId = PhysicalDisplayId::fromPort(0)) {
+    return DisplayMode::Builder(hal::HWConfigId(ftl::to_underlying(modeId)))
+            .setId(modeId)
+            .setPhysicalDisplayId(displayId)
+            .setVsyncPeriod(displayRefreshRate.getPeriodNsecs())
+            .setGroup(group)
+            .setResolution(resolution);
+}
+
 inline DisplayModePtr createDisplayMode(
         DisplayModeId modeId, Fps refreshRate, int32_t group = 0,
         ui::Size resolution = ui::Size(1920, 1080),
         PhysicalDisplayId displayId = PhysicalDisplayId::fromPort(0)) {
-    return DisplayMode::Builder(hal::HWConfigId(modeId.value()))
-            .setId(modeId)
-            .setPhysicalDisplayId(displayId)
-            .setVsyncPeriod(refreshRate.getPeriodNsecs())
-            .setGroup(group)
-            .setResolution(resolution)
+    return createDisplayModeBuilder(modeId, refreshRate, group, resolution, displayId).build();
+}
+
+inline DisplayModePtr createDisplayMode(PhysicalDisplayId displayId, DisplayModeId modeId,
+                                        Fps refreshRate) {
+    return createDisplayMode(modeId, refreshRate, {}, {}, displayId);
+}
+
+inline DisplayModePtr createVrrDisplayMode(
+        DisplayModeId modeId, Fps displayRefreshRate, std::optional<hal::VrrConfig> vrrConfig,
+        int32_t group = 0, ui::Size resolution = ui::Size(1920, 1080),
+        PhysicalDisplayId displayId = PhysicalDisplayId::fromPort(0)) {
+    return createDisplayModeBuilder(modeId, displayRefreshRate, group, resolution, displayId)
+            .setVrrConfig(std::move(vrrConfig))
             .build();
+}
+
+inline DisplayModePtr cloneForDisplay(PhysicalDisplayId displayId, const DisplayModePtr& modePtr) {
+    return DisplayMode::Builder(modePtr->getHwcId())
+            .setId(modePtr->getId())
+            .setPhysicalDisplayId(displayId)
+            .setVsyncPeriod(modePtr->getVsyncRate().getPeriodNsecs())
+            .setGroup(modePtr->getGroup())
+            .setResolution(modePtr->getResolution())
+            .build();
+}
+
+inline DisplayModes cloneForDisplay(PhysicalDisplayId displayId, const DisplayModes& modes) {
+    DisplayModes clones;
+
+    for (const auto& [id, modePtr] : modes) {
+        clones.try_emplace(id, cloneForDisplay(displayId, modePtr));
+    }
+
+    return clones;
 }
 
 } // namespace android::mock

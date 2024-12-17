@@ -16,7 +16,10 @@
 
 #define LOG_TAG "PropertyMap"
 
+#include <cstdlib>
+
 #include <input/PropertyMap.h>
+#include <log/log.h>
 
 // Enables debug output for the parser.
 #define DEBUG_PARSER 0
@@ -39,71 +42,85 @@ void PropertyMap::clear() {
     mProperties.clear();
 }
 
-void PropertyMap::addProperty(const String8& key, const String8& value) {
-    mProperties.add(key, value);
+void PropertyMap::addProperty(const std::string& key, const std::string& value) {
+    mProperties.emplace(key, value);
 }
 
-bool PropertyMap::hasProperty(const String8& key) const {
-    return mProperties.indexOfKey(key) >= 0;
-}
-
-bool PropertyMap::tryGetProperty(const String8& key, String8& outValue) const {
-    ssize_t index = mProperties.indexOfKey(key);
-    if (index < 0) {
-        return false;
+std::unordered_set<std::string> PropertyMap::getKeysWithPrefix(const std::string& prefix) const {
+    std::unordered_set<std::string> keys;
+    for (const auto& [key, _] : mProperties) {
+        if (key.starts_with(prefix)) {
+            keys.insert(key);
+        }
     }
-
-    outValue = mProperties.valueAt(index);
-    return true;
+    return keys;
 }
 
-bool PropertyMap::tryGetProperty(const String8& key, bool& outValue) const {
-    int32_t intValue;
-    if (!tryGetProperty(key, intValue)) {
-        return false;
-    }
-
-    outValue = intValue;
-    return true;
+bool PropertyMap::hasProperty(const std::string& key) const {
+    return mProperties.find(key) != mProperties.end();
 }
 
-bool PropertyMap::tryGetProperty(const String8& key, int32_t& outValue) const {
-    String8 stringValue;
-    if (!tryGetProperty(key, stringValue) || stringValue.length() == 0) {
-        return false;
+std::optional<std::string> PropertyMap::getString(const std::string& key) const {
+    auto it = mProperties.find(key);
+    return it != mProperties.end() ? std::make_optional(it->second) : std::nullopt;
+}
+
+std::optional<bool> PropertyMap::getBool(const std::string& key) const {
+    std::optional<int32_t> intValue = getInt(key);
+    return intValue.has_value() ? std::make_optional(*intValue != 0) : std::nullopt;
+}
+
+std::optional<int32_t> PropertyMap::getInt(const std::string& key) const {
+    std::optional<std::string> stringValue = getString(key);
+    if (!stringValue.has_value() || stringValue->length() == 0) {
+        return std::nullopt;
     }
 
     char* end;
-    int value = strtol(stringValue.string(), &end, 10);
+    int32_t value = static_cast<int32_t>(strtol(stringValue->c_str(), &end, 10));
     if (*end != '\0') {
-        ALOGW("Property key '%s' has invalid value '%s'.  Expected an integer.", key.string(),
-              stringValue.string());
-        return false;
+        ALOGW("Property key '%s' has invalid value '%s'.  Expected an integer.", key.c_str(),
+              stringValue->c_str());
+        return std::nullopt;
     }
-    outValue = value;
-    return true;
+    return value;
 }
 
-bool PropertyMap::tryGetProperty(const String8& key, float& outValue) const {
-    String8 stringValue;
-    if (!tryGetProperty(key, stringValue) || stringValue.length() == 0) {
-        return false;
+std::optional<float> PropertyMap::getFloat(const std::string& key) const {
+    std::optional<std::string> stringValue = getString(key);
+    if (!stringValue.has_value() || stringValue->length() == 0) {
+        return std::nullopt;
     }
 
     char* end;
-    float value = strtof(stringValue.string(), &end);
+    float value = strtof(stringValue->c_str(), &end);
     if (*end != '\0') {
-        ALOGW("Property key '%s' has invalid value '%s'.  Expected a float.", key.string(),
-              stringValue.string());
-        return false;
+        ALOGW("Property key '%s' has invalid value '%s'.  Expected a float.", key.c_str(),
+              stringValue->c_str());
+        return std::nullopt;
     }
-    outValue = value;
-    return true;
+    return value;
+}
+
+std::optional<double> PropertyMap::getDouble(const std::string& key) const {
+    std::optional<std::string> stringValue = getString(key);
+    if (!stringValue.has_value() || stringValue->length() == 0) {
+        return std::nullopt;
+    }
+
+    char* end;
+    double value = strtod(stringValue->c_str(), &end);
+    if (*end != '\0') {
+        ALOGW("Property key '%s' has invalid value '%s'.  Expected a double.", key.c_str(),
+              stringValue->c_str());
+        return std::nullopt;
+    }
+    return value;
 }
 
 void PropertyMap::addAll(const PropertyMap* map) {
-    for (size_t i = 0; i < map->mProperties.size(); i++) {
-        mProperties.add(map->mProperties.keyAt(i), map->mProperties.valueAt(i));
+    for (const auto& [key, value] : map->mProperties) {
+        mProperties.emplace(key, value);
     }
 }
 
@@ -115,25 +132,24 @@ android::base::Result<std::unique_ptr<PropertyMap>> PropertyMap::load(const char
 
     Tokenizer* rawTokenizer;
     status_t status = Tokenizer::open(String8(filename), &rawTokenizer);
-    std::unique_ptr<Tokenizer> tokenizer(rawTokenizer);
     if (status) {
-        ALOGE("Error %d opening property file %s.", status, filename);
-    } else {
-#if DEBUG_PARSER_PERFORMANCE
-            nsecs_t startTime = systemTime(SYSTEM_TIME_MONOTONIC);
-#endif
-            Parser parser(outMap.get(), tokenizer.get());
-            status = parser.parse();
-#if DEBUG_PARSER_PERFORMANCE
-            nsecs_t elapsedTime = systemTime(SYSTEM_TIME_MONOTONIC) - startTime;
-            ALOGD("Parsed property file '%s' %d lines in %0.3fms.",
-                  tokenizer->getFilename().string(), tokenizer->getLineNumber(),
-                  elapsedTime / 1000000.0);
-#endif
-            if (status) {
-                return android::base::Error(BAD_VALUE) << "Could not parse " << filename;
-            }
+        return android::base::Error(-status) << "Could not open file: " << filename;
     }
+#if DEBUG_PARSER_PERFORMANCE
+    nsecs_t startTime = systemTime(SYSTEM_TIME_MONOTONIC);
+#endif
+    std::unique_ptr<Tokenizer> tokenizer(rawTokenizer);
+    Parser parser(outMap.get(), tokenizer.get());
+    status = parser.parse();
+#if DEBUG_PARSER_PERFORMANCE
+    nsecs_t elapsedTime = systemTime(SYSTEM_TIME_MONOTONIC) - startTime;
+    ALOGD("Parsed property file '%s' %d lines in %0.3fms.", tokenizer->getFilename().string(),
+          tokenizer->getLineNumber(), elapsedTime / 1000000.0);
+#endif
+    if (status) {
+        return android::base::Error(BAD_VALUE) << "Could not parse " << filename;
+    }
+
     return std::move(outMap);
 }
 
@@ -147,16 +163,16 @@ PropertyMap::Parser::~Parser() {}
 status_t PropertyMap::Parser::parse() {
     while (!mTokenizer->isEof()) {
 #if DEBUG_PARSER
-        ALOGD("Parsing %s: '%s'.", mTokenizer->getLocation().string(),
-              mTokenizer->peekRemainderOfLine().string());
+        ALOGD("Parsing %s: '%s'.", mTokenizer->getLocation().c_str(),
+              mTokenizer->peekRemainderOfLine().c_str());
 #endif
 
         mTokenizer->skipDelimiters(WHITESPACE);
 
         if (!mTokenizer->isEol() && mTokenizer->peekChar() != '#') {
             String8 keyToken = mTokenizer->nextToken(WHITESPACE_OR_PROPERTY_DELIMITER);
-            if (keyToken.isEmpty()) {
-                ALOGE("%s: Expected non-empty property key.", mTokenizer->getLocation().string());
+            if (keyToken.empty()) {
+                ALOGE("%s: Expected non-empty property key.", mTokenizer->getLocation().c_str());
                 return BAD_VALUE;
             }
 
@@ -164,7 +180,7 @@ status_t PropertyMap::Parser::parse() {
 
             if (mTokenizer->nextChar() != '=') {
                 ALOGE("%s: Expected '=' between property key and value.",
-                      mTokenizer->getLocation().string());
+                      mTokenizer->getLocation().c_str());
                 return BAD_VALUE;
             }
 
@@ -173,24 +189,24 @@ status_t PropertyMap::Parser::parse() {
             String8 valueToken = mTokenizer->nextToken(WHITESPACE);
             if (valueToken.find("\\", 0) >= 0 || valueToken.find("\"", 0) >= 0) {
                 ALOGE("%s: Found reserved character '\\' or '\"' in property value.",
-                      mTokenizer->getLocation().string());
+                      mTokenizer->getLocation().c_str());
                 return BAD_VALUE;
             }
 
             mTokenizer->skipDelimiters(WHITESPACE);
             if (!mTokenizer->isEol()) {
-                ALOGE("%s: Expected end of line, got '%s'.", mTokenizer->getLocation().string(),
-                      mTokenizer->peekRemainderOfLine().string());
+                ALOGE("%s: Expected end of line, got '%s'.", mTokenizer->getLocation().c_str(),
+                      mTokenizer->peekRemainderOfLine().c_str());
                 return BAD_VALUE;
             }
 
-            if (mMap->hasProperty(keyToken)) {
+            if (mMap->hasProperty(keyToken.c_str())) {
                 ALOGE("%s: Duplicate property value for key '%s'.",
-                      mTokenizer->getLocation().string(), keyToken.string());
+                      mTokenizer->getLocation().c_str(), keyToken.c_str());
                 return BAD_VALUE;
             }
 
-            mMap->addProperty(keyToken, valueToken);
+            mMap->addProperty(keyToken.c_str(), valueToken.c_str());
         }
 
         mTokenizer->nextLine();

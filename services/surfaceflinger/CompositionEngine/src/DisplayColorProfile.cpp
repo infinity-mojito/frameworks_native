@@ -220,17 +220,6 @@ DisplayColorProfile::DisplayColorProfile(const DisplayColorProfileCreationArgs& 
     minLuminance = minLuminance <= 0.0 ? sDefaultMinLumiance : minLuminance;
     maxLuminance = maxLuminance <= 0.0 ? sDefaultMaxLumiance : maxLuminance;
     maxAverageLuminance = maxAverageLuminance <= 0.0 ? sDefaultMaxLumiance : maxAverageLuminance;
-    if (args.hasWideColorGamut) {
-        // insert HDR10/HLG as we will force client composition for HDR10/HLG
-        // layers
-        if (!hasHDR10Support()) {
-            types.push_back(ui::Hdr::HDR10);
-        }
-
-        if (!hasHLGSupport()) {
-            types.push_back(ui::Hdr::HLG);
-        }
-    }
 
     mHdrCapabilities = HdrCapabilities(types, maxLuminance, maxAverageLuminance, minLuminance);
 }
@@ -271,10 +260,6 @@ const HdrCapabilities& DisplayColorProfile::getHdrCapabilities() const {
 
 void DisplayColorProfile::populateColorModes(
         const DisplayColorProfileCreationArgs::HwcColorModes& hwcColorModes) {
-    if (!hasWideColorGamut()) {
-        return;
-    }
-
     // collect all known SDR render intents
     std::unordered_set<RenderIntent> sdrRenderIntents(sSdrRenderIntents.begin(),
                                                       sSdrRenderIntents.end());
@@ -363,13 +348,9 @@ void DisplayColorProfile::getBestColorMode(Dataspace dataspace, RenderIntent int
         *outMode = iter->second.colorMode;
         *outIntent = iter->second.renderIntent;
     } else {
-        // this is unexpected on a WCG display
-        if (hasWideColorGamut()) {
-            ALOGE("map unknown (%s)/(%s) to default color mode",
-                  dataspaceDetails(static_cast<android_dataspace_t>(dataspace)).c_str(),
-                  decodeRenderIntent(intent).c_str());
-        }
-
+        ALOGI("map unknown (%s)/(%s) to default color mode",
+              dataspaceDetails(static_cast<android_dataspace_t>(dataspace)).c_str(),
+              decodeRenderIntent(intent).c_str());
         *outDataspace = Dataspace::UNKNOWN;
         *outMode = ColorMode::NATIVE;
         *outIntent = RenderIntent::COLORIMETRIC;
@@ -391,17 +372,6 @@ bool DisplayColorProfile::isDataspaceSupported(Dataspace dataspace) const {
     }
 }
 
-ui::Dataspace DisplayColorProfile::getTargetDataspace(ColorMode mode, Dataspace dataspace,
-                                                      Dataspace colorSpaceAgnosticDataspace) const {
-    if (isHdrColorMode(mode)) {
-        return Dataspace::UNKNOWN;
-    }
-    if (colorSpaceAgnosticDataspace != ui::Dataspace::UNKNOWN) {
-        return colorSpaceAgnosticDataspace;
-    }
-    return dataspace;
-}
-
 void DisplayColorProfile::dump(std::string& out) const {
     out.append("   Composition Display Color State:");
 
@@ -414,6 +384,10 @@ void DisplayColorProfile::dump(std::string& out) const {
     dumpVal(out, "dv", hasDolbyVisionSupport());
     dumpVal(out, "metadata", getSupportedPerFrameMetadata());
 
+    out.append("\n   Hdr Luminance Info:");
+    dumpVal(out, "desiredMinLuminance", mHdrCapabilities.getDesiredMinLuminance());
+    dumpVal(out, "desiredMaxLuminance", mHdrCapabilities.getDesiredMaxLuminance());
+    dumpVal(out, "desiredMaxAverageLuminance", mHdrCapabilities.getDesiredMaxAverageLuminance());
     out.append("\n");
 }
 

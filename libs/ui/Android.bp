@@ -14,6 +14,7 @@
 
 package {
     default_applicable_licenses: ["frameworks_native_libs_ui_license"],
+    default_team: "trendy_team_android_core_graphics_stack",
 }
 
 // Added automatically by a large-scale-change
@@ -48,7 +49,6 @@ cc_defaults {
         integer_overflow: true,
         misc_undefined: ["bounds"],
     },
-
 }
 
 cc_library_static {
@@ -105,9 +105,6 @@ cc_library_static {
 cc_library_shared {
     name: "libui",
     vendor_available: true,
-    vndk: {
-        enabled: true,
-    },
     double_loadable: true,
 
     cflags: [
@@ -127,7 +124,6 @@ cc_library_shared {
         "DebugUtils.cpp",
         "DeviceProductInfo.cpp",
         "DisplayIdentification.cpp",
-        "DisplayMode.cpp",
         "DynamicDisplayInfo.cpp",
         "Fence.cpp",
         "FenceTime.cpp",
@@ -136,14 +132,13 @@ cc_library_shared {
         "Gralloc2.cpp",
         "Gralloc3.cpp",
         "Gralloc4.cpp",
+        "Gralloc5.cpp",
         "GraphicBuffer.cpp",
         "GraphicBufferAllocator.cpp",
         "GraphicBufferMapper.cpp",
-        "HdrCapabilities.cpp",
         "PixelFormat.cpp",
         "PublicFormat.cpp",
         "StaticAsserts.cpp",
-        "StaticDisplayInfo.cpp",
     ],
 
     include_dirs: [
@@ -179,6 +174,7 @@ cc_library_shared {
         "libsync",
         "libutils",
         "liblog",
+        "libvndksupport",
     ],
 
     export_shared_lib_headers: [
@@ -217,6 +213,8 @@ cc_library_shared {
         "libnativewindow_headers",
         "libhardware_headers",
         "libui_headers",
+        "libimapper_stablec",
+        "libimapper_providerutils",
     ],
 
     export_static_lib_headers: [
@@ -240,10 +238,6 @@ cc_library_shared {
     ],
 
     afdo: true,
-
-    header_abi_checker: {
-        diff_flags: ["-allow-adding-removing-weak-symbols"],
-    },
 }
 
 cc_library_headers {
@@ -283,13 +277,3 @@ subdirs = [
     "tests",
     "tools",
 ]
-
-filegroup {
-    name: "libui_host_common",
-    srcs: [
-        "Rect.cpp",
-        "Region.cpp",
-        "PixelFormat.cpp",
-        "Transform.cpp",
-    ],
-}

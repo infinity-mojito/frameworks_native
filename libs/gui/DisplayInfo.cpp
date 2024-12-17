@@ -20,7 +20,12 @@
 #include <gui/DisplayInfo.h>
 #include <private/gui/ParcelUtils.h>
 
+#include <android-base/stringprintf.h>
 #include <log/log.h>
+
+#include <inttypes.h>
+
+#define INDENT "  "
 
 namespace android::gui {
 
@@ -32,8 +37,9 @@ status_t DisplayInfo::readFromParcel(const android::Parcel* parcel) {
         return BAD_VALUE;
     }
 
+    int32_t displayIdInt;
     float dsdx, dtdx, tx, dtdy, dsdy, ty;
-    SAFE_PARCEL(parcel->readInt32, &displayId);
+    SAFE_PARCEL(parcel->readInt32, &displayIdInt);
     SAFE_PARCEL(parcel->readInt32, &logicalWidth);
     SAFE_PARCEL(parcel->readInt32, &logicalHeight);
     SAFE_PARCEL(parcel->readFloat, &dsdx);
@@ -43,6 +49,7 @@ status_t DisplayInfo::readFromParcel(const android::Parcel* parcel) {
     SAFE_PARCEL(parcel->readFloat, &dsdy);
     SAFE_PARCEL(parcel->readFloat, &ty);
 
+    displayId = ui::LogicalDisplayId{displayIdInt};
     transform.set({dsdx, dtdx, tx, dtdy, dsdy, ty, 0, 0, 1});
 
     return OK;
@@ -54,7 +61,7 @@ status_t DisplayInfo::writeToParcel(android::Parcel* parcel) const {
         return BAD_VALUE;
     }
 
-    SAFE_PARCEL(parcel->writeInt32, displayId);
+    SAFE_PARCEL(parcel->writeInt32, displayId.val());
     SAFE_PARCEL(parcel->writeInt32, logicalWidth);
     SAFE_PARCEL(parcel->writeInt32, logicalHeight);
     SAFE_PARCEL(parcel->writeFloat, transform.dsdx());
@@ -65,6 +72,19 @@ status_t DisplayInfo::writeToParcel(android::Parcel* parcel) const {
     SAFE_PARCEL(parcel->writeFloat, transform.ty());
 
     return OK;
+}
+
+void DisplayInfo::dump(std::string& out, const char* prefix) const {
+    using android::base::StringAppendF;
+
+    out += prefix;
+    StringAppendF(&out, "DisplayViewport[id=%s]\n", displayId.toString().c_str());
+    out += prefix;
+    StringAppendF(&out, INDENT "Width=%" PRId32 ", Height=%" PRId32 "\n", logicalWidth,
+                  logicalHeight);
+    std::string transformPrefix(prefix);
+    transformPrefix.append(INDENT);
+    transform.dump(out, "Transform", transformPrefix.c_str());
 }
 
 } // namespace android::gui

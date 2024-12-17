@@ -52,7 +52,6 @@ void OutputCompositionState::dump(std::string& out) const {
     dumpVal(out, "colorMode", toString(colorMode), colorMode);
     dumpVal(out, "renderIntent", toString(renderIntent), renderIntent);
     dumpVal(out, "dataspace", toString(dataspace), dataspace);
-    dumpVal(out, "targetDataspace", toString(targetDataspace), targetDataspace);
 
     out.append("\n   ");
     dumpVal(out, "colorTransformMatrix", colorTransformMatrix);
@@ -62,14 +61,13 @@ void OutputCompositionState::dump(std::string& out) const {
     dumpVal(out, "sdrWhitePointNits", sdrWhitePointNits);
     dumpVal(out, "clientTargetBrightness", clientTargetBrightness);
     dumpVal(out, "displayBrightness", displayBrightness);
-
     out.append("\n   ");
     dumpVal(out, "compositionStrategyPredictionState", ftl::enum_string(strategyPrediction));
+    out.append("\n   ");
 
     out.append("\n   ");
-    dumpVal(out, "treate170mAsSrgb", treat170mAsSrgb);
-
-    out += '\n';
+    dumpVal(out, "treat170mAsSrgb", treat170mAsSrgb);
+    out.append("\n");
 }
 
 } // namespace android::compositionengine::impl

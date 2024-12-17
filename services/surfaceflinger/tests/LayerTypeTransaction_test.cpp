@@ -18,6 +18,7 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wconversion"
 
+#include <gui/AidlUtil.h>
 #include <gui/BufferItemConsumer.h>
 #include <private/android_filesystem_config.h>
 #include "TransactionTestHarnesses.h"
@@ -64,7 +65,7 @@ TEST_P(LayerTypeTransactionTest, SetRelativeZNegative) {
     // only layerB is in this range
     LayerCaptureArgs captureArgs;
     captureArgs.layerHandle = parent->getHandle();
-    captureArgs.sourceCrop = {0, 0, 32, 32};
+    captureArgs.captureArgs.sourceCrop = gui::aidl_utils::toARect(32, 32);
     ScreenCapture::captureLayers(&screenshot, captureArgs);
     screenshot->expectColor(Rect(0, 0, 32, 32), Color::BLUE);
 }
@@ -167,18 +168,18 @@ TEST_P(LayerTypeTransactionTest, SetFlagsSecure) {
             .setFlags(layer, layer_state_t::eLayerSecure, layer_state_t::eLayerSecure)
             .apply(true);
 
-    DisplayCaptureArgs args;
-    args.displayToken = mDisplay;
+    LayerCaptureArgs args;
+    args.layerHandle = layer->getHandle();
 
     ScreenCaptureResults captureResults;
     {
         // Ensure the UID is not root because root has all permissions
         UIDFaker f(AID_APP_START);
-        ASSERT_EQ(PERMISSION_DENIED, ScreenCapture::captureDisplay(args, captureResults));
+        ASSERT_EQ(PERMISSION_DENIED, ScreenCapture::captureLayers(args, captureResults));
     }
 
     Transaction().setFlags(layer, 0, layer_state_t::eLayerSecure).apply(true);
-    ASSERT_EQ(NO_ERROR, ScreenCapture::captureDisplay(args, captureResults));
+    ASSERT_EQ(NO_ERROR, ScreenCapture::captureLayers(args, captureResults));
 }
 
 TEST_P(LayerTypeTransactionTest, RefreshRateIsInitialized) {

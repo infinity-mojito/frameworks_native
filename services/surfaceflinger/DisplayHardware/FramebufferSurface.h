@@ -20,8 +20,9 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#include <com_android_graphics_libgui_flags.h>
 #include <compositionengine/DisplaySurface.h>
-#include <compositionengine/impl/HwcBufferCache.h>
+#include <gui/BufferQueue.h>
 #include <gui/ConsumerBase.h>
 #include <ui/DisplayId.h>
 #include <ui/Size.h>
@@ -40,13 +41,20 @@ class HWComposer;
 
 class FramebufferSurface : public ConsumerBase, public compositionengine::DisplaySurface {
 public:
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    FramebufferSurface(HWComposer& hwc, PhysicalDisplayId displayId,
+                       const sp<IGraphicBufferProducer>& producer,
+                       const sp<IGraphicBufferConsumer>& consumer, const ui::Size& size,
+                       const ui::Size& maxSize);
+#else
     FramebufferSurface(HWComposer& hwc, PhysicalDisplayId displayId,
                        const sp<IGraphicBufferConsumer>& consumer, const ui::Size& size,
                        const ui::Size& maxSize);
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
     virtual status_t beginFrame(bool mustRecompose);
     virtual status_t prepareFrame(CompositionType compositionType);
-    virtual status_t advanceFrame();
+    virtual status_t advanceFrame(float hdrSdrRatio);
     virtual void onFrameCommitted();
     virtual void dumpAsString(String8& result) const;
 
@@ -69,12 +77,6 @@ private:
 
     virtual void dumpLocked(String8& result, const char* prefix) const;
 
-    // nextBuffer waits for and then latches the next buffer from the
-    // BufferQueue and releases the previously latched buffer to the
-    // BufferQueue.  The new buffer is returned in the 'buffer' argument.
-    status_t nextBuffer(uint32_t& outSlot, sp<GraphicBuffer>& outBuffer,
-            sp<Fence>& outFence, ui::Dataspace& outDataspace);
-
     const PhysicalDisplayId mDisplayId;
 
     // Framebuffer size has a dimension limitation in pixels based on the graphics capabilities of
@@ -91,7 +93,7 @@ private:
     // compositing. Otherwise it will display the dataspace of the buffer
     // use for compositing which can change as wide-color content is
     // on/off.
-    ui::Dataspace mDataSpace;
+    ui::Dataspace mDataspace;
 
     // mCurrentBuffer is the current buffer or nullptr to indicate that there is
     // no current buffer.
@@ -103,7 +105,9 @@ private:
     // Hardware composer, owned by SurfaceFlinger.
     HWComposer& mHwc;
 
-    compositionengine::impl::HwcBufferCache mHwcBufferCache;
+    // Buffers that HWC has seen before, indexed by slot number.
+    // NOTE: The BufferQueue slot number is the same as the HWC slot number.
+    uint64_t mHwcBufferIds[BufferQueue::NUM_BUFFER_SLOTS];
 
     // Previous buffer to release after getting an updated retire fence
     bool mHasPendingRelease;

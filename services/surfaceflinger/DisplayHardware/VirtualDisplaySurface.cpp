@@ -22,6 +22,7 @@
 
 #include <cinttypes>
 
+#include <com_android_graphics_libgui_flags.h>
 #include <ftl/enum.h>
 #include <ftl/flags.h>
 #include <gui/BufferItem.h>
@@ -51,7 +52,11 @@ VirtualDisplaySurface::VirtualDisplaySurface(HWComposer& hwc, VirtualDisplayId d
                                              const sp<IGraphicBufferProducer>& bqProducer,
                                              const sp<IGraphicBufferConsumer>& bqConsumer,
                                              const std::string& name)
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+      : ConsumerBase(bqProducer, bqConsumer),
+#else
       : ConsumerBase(bqConsumer),
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
         mHwc(hwc),
         mDisplayId(displayId),
         mDisplayName(name),
@@ -103,6 +108,10 @@ VirtualDisplaySurface::VirtualDisplaySurface(HWComposer& hwc, VirtualDisplayId d
     sink->setAsyncMode(true);
     IGraphicBufferProducer::QueueBufferOutput output;
     mSource[SOURCE_SCRATCH]->connect(nullptr, NATIVE_WINDOW_API_EGL, false, &output);
+
+    for (size_t i = 0; i < sizeof(mHwcBufferIds) / sizeof(mHwcBufferIds[0]); ++i) {
+        mHwcBufferIds[i] = UINT64_MAX;
+    }
 }
 
 VirtualDisplaySurface::~VirtualDisplaySurface() {
@@ -171,7 +180,7 @@ status_t VirtualDisplaySurface::prepareFrame(CompositionType compositionType) {
     return NO_ERROR;
 }
 
-status_t VirtualDisplaySurface::advanceFrame() {
+status_t VirtualDisplaySurface::advanceFrame(float hdrSdrRatio) {
     if (GpuVirtualDisplayId::tryCast(mDisplayId)) {
         return NO_ERROR;
     }
@@ -197,9 +206,9 @@ status_t VirtualDisplaySurface::advanceFrame() {
         return NO_MEMORY;
     }
 
-    sp<GraphicBuffer> fbBuffer = mFbProducerSlot >= 0 ?
-            mProducerBuffers[mFbProducerSlot] : sp<GraphicBuffer>(nullptr);
-    sp<GraphicBuffer> outBuffer = mProducerBuffers[mOutputProducerSlot];
+    sp<GraphicBuffer> const& fbBuffer =
+            mFbProducerSlot >= 0 ? mProducerBuffers[mFbProducerSlot] : sp<GraphicBuffer>(nullptr);
+    sp<GraphicBuffer> const& outBuffer = mProducerBuffers[mOutputProducerSlot];
     VDS_LOGV("%s: fb=%d(%p) out=%d(%p)", __func__, mFbProducerSlot, fbBuffer.get(),
              mOutputProducerSlot, outBuffer.get());
 
@@ -211,13 +220,15 @@ status_t VirtualDisplaySurface::advanceFrame() {
 
     status_t result = NO_ERROR;
     if (fbBuffer != nullptr) {
-        uint32_t hwcSlot = 0;
-        sp<GraphicBuffer> hwcBuffer;
-        mHwcBufferCache.getHwcBuffer(mFbProducerSlot, fbBuffer, &hwcSlot, &hwcBuffer);
-
+        // assume that HWC has previously seen the buffer in this slot
+        sp<GraphicBuffer> hwcBuffer = sp<GraphicBuffer>(nullptr);
+        if (fbBuffer->getId() != mHwcBufferIds[mFbProducerSlot]) {
+            mHwcBufferIds[mFbProducerSlot] = fbBuffer->getId();
+            hwcBuffer = fbBuffer; // HWC hasn't previously seen this buffer in this slot
+        }
         // TODO: Correctly propagate the dataspace from GL composition
-        result = mHwc.setClientTarget(*halDisplayId, hwcSlot, mFbFence, hwcBuffer,
-                                      ui::Dataspace::UNKNOWN);
+        result = mHwc.setClientTarget(*halDisplayId, mFbProducerSlot, mFbFence, hwcBuffer,
+                                      ui::Dataspace::UNKNOWN, hdrSdrRatio);
     }
 
     return result;

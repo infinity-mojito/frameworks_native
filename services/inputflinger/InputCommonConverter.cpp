@@ -20,6 +20,9 @@ using namespace ::aidl::android::hardware::input;
 
 namespace android {
 
+const static ui::Transform kIdentityTransform;
+const static std::array<uint8_t, 32> kInvalidHmac{};
+
 static common::Source getSource(uint32_t source) {
     static_assert(static_cast<common::Source>(AINPUT_SOURCE_UNKNOWN) == common::Source::UNKNOWN,
                   "SOURCE_UNKNOWN mismatch");
@@ -200,17 +203,12 @@ static common::Button getButtonState(int32_t buttonState) {
     return static_cast<common::Button>(buttonState);
 }
 
-static common::ToolType getToolType(int32_t toolType) {
-    static_assert(static_cast<common::ToolType>(AMOTION_EVENT_TOOL_TYPE_UNKNOWN) ==
-                  common::ToolType::UNKNOWN);
-    static_assert(static_cast<common::ToolType>(AMOTION_EVENT_TOOL_TYPE_FINGER) ==
-                  common::ToolType::FINGER);
-    static_assert(static_cast<common::ToolType>(AMOTION_EVENT_TOOL_TYPE_STYLUS) ==
-                  common::ToolType::STYLUS);
-    static_assert(static_cast<common::ToolType>(AMOTION_EVENT_TOOL_TYPE_MOUSE) ==
-                  common::ToolType::MOUSE);
-    static_assert(static_cast<common::ToolType>(AMOTION_EVENT_TOOL_TYPE_ERASER) ==
-                  common::ToolType::ERASER);
+static common::ToolType getToolType(ToolType toolType) {
+    static_assert(static_cast<common::ToolType>(ToolType::UNKNOWN) == common::ToolType::UNKNOWN);
+    static_assert(static_cast<common::ToolType>(ToolType::FINGER) == common::ToolType::FINGER);
+    static_assert(static_cast<common::ToolType>(ToolType::STYLUS) == common::ToolType::STYLUS);
+    static_assert(static_cast<common::ToolType>(ToolType::MOUSE) == common::ToolType::MOUSE);
+    static_assert(static_cast<common::ToolType>(ToolType::ERASER) == common::ToolType::ERASER);
     return static_cast<common::ToolType>(toolType);
 }
 
@@ -263,6 +261,12 @@ static_assert(static_cast<common::Axis>(AMOTION_EVENT_AXIS_GENERIC_13) == common
 static_assert(static_cast<common::Axis>(AMOTION_EVENT_AXIS_GENERIC_14) == common::Axis::GENERIC_14);
 static_assert(static_cast<common::Axis>(AMOTION_EVENT_AXIS_GENERIC_15) == common::Axis::GENERIC_15);
 static_assert(static_cast<common::Axis>(AMOTION_EVENT_AXIS_GENERIC_16) == common::Axis::GENERIC_16);
+// TODO(b/251196347): add GESTURE_{X,Y}_OFFSET, GESTURE_SCROLL_{X,Y}_DISTANCE,
+// GESTURE_PINCH_SCALE_FACTOR, and GESTURE_SWIPE_FINGER_COUNT.
+// If you added a new axis, consider whether this should also be exposed as a HAL axis. Update the
+// static_assert below and add the new axis here, or leave a comment summarizing your decision.
+static_assert(static_cast<common::Axis>(AMOTION_EVENT_MAXIMUM_VALID_AXIS_VALUE) ==
+              static_cast<common::Axis>(AMOTION_EVENT_AXIS_GESTURE_SWIPE_FINGER_COUNT));
 
 static common::VideoFrame getHalVideoFrame(const TouchVideoFrame& frame) {
     common::VideoFrame out;
@@ -288,9 +292,9 @@ static std::vector<common::VideoFrame> convertVideoFrames(
 static void getHalPropertiesAndCoords(const NotifyMotionArgs& args,
                                       std::vector<common::PointerProperties>& outPointerProperties,
                                       std::vector<common::PointerCoords>& outPointerCoords) {
-    outPointerProperties.reserve(args.pointerCount);
-    outPointerCoords.reserve(args.pointerCount);
-    for (size_t i = 0; i < args.pointerCount; i++) {
+    outPointerProperties.reserve(args.getPointerCount());
+    outPointerCoords.reserve(args.getPointerCount());
+    for (size_t i = 0; i < args.getPointerCount(); i++) {
         common::PointerProperties properties;
         properties.id = args.pointerProperties[i].id;
         properties.toolType = getToolType(args.pointerProperties[i].toolType);
@@ -299,8 +303,8 @@ static void getHalPropertiesAndCoords(const NotifyMotionArgs& args,
         common::PointerCoords coords;
         // OK to copy bits because we have static_assert for pointerCoords axes
         coords.bits = args.pointerCoords[i].bits;
-        coords.values = std::vector<float>(args.pointerCoords[i].values,
-                                           args.pointerCoords[i].values +
+        coords.values = std::vector<float>(args.pointerCoords[i].values.cbegin(),
+                                           args.pointerCoords[i].values.cbegin() +
                                                    BitSet64::count(args.pointerCoords[i].bits));
         outPointerCoords.push_back(coords);
     }
@@ -310,7 +314,7 @@ common::MotionEvent notifyMotionArgsToHalMotionEvent(const NotifyMotionArgs& arg
     common::MotionEvent event;
     event.deviceId = args.deviceId;
     event.source = getSource(args.source);
-    event.displayId = args.displayId;
+    event.displayId = args.displayId.val();
     event.downTime = args.downTime;
     event.eventTime = args.eventTime;
     event.deviceTimestamp = 0;
@@ -333,6 +337,33 @@ common::MotionEvent notifyMotionArgsToHalMotionEvent(const NotifyMotionArgs& arg
 
     event.frames = convertVideoFrames(args.videoFrames);
 
+    return event;
+}
+
+MotionEvent toMotionEvent(const NotifyMotionArgs& args, const ui::Transform* transform,
+                          const ui::Transform* rawTransform, const std::array<uint8_t, 32>* hmac) {
+    if (transform == nullptr) transform = &kIdentityTransform;
+    if (rawTransform == nullptr) rawTransform = &kIdentityTransform;
+    if (hmac == nullptr) hmac = &kInvalidHmac;
+
+    MotionEvent event;
+    event.initialize(args.id, args.deviceId, args.source, args.displayId, *hmac, args.action,
+                     args.actionButton, args.flags, args.edgeFlags, args.metaState,
+                     args.buttonState, args.classification, *transform, args.xPrecision,
+                     args.yPrecision, args.xCursorPosition, args.yCursorPosition, *rawTransform,
+                     args.downTime, args.eventTime, args.getPointerCount(),
+                     args.pointerProperties.data(), args.pointerCoords.data());
+    return event;
+}
+
+KeyEvent toKeyEvent(const NotifyKeyArgs& args, int32_t repeatCount,
+                    const std::array<uint8_t, 32>* hmac) {
+    if (hmac == nullptr) hmac = &kInvalidHmac;
+
+    KeyEvent event;
+    event.initialize(args.id, args.deviceId, args.source, args.displayId, *hmac, args.action,
+                     args.flags, args.keyCode, args.scanCode, args.metaState, repeatCount,
+                     args.downTime, args.eventTime);
     return event;
 }
 

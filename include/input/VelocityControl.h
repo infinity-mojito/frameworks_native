@@ -14,12 +14,17 @@
  * limitations under the License.
  */
 
-#ifndef _LIBINPUT_VELOCITY_CONTROL_H
-#define _LIBINPUT_VELOCITY_CONTROL_H
+#pragma once
 
+#include <vector>
+
+#include <android-base/stringprintf.h>
+#include <input/AccelerationCurve.h>
 #include <input/Input.h>
 #include <input/VelocityTracker.h>
 #include <utils/Timers.h>
+
+using android::base::StringPrintf;
 
 namespace android {
 
@@ -70,6 +75,12 @@ struct VelocityControlParameters {
             scale(scale), lowThreshold(lowThreshold),
             highThreshold(highThreshold), acceleration(acceleration) {
     }
+
+    std::string dump() const {
+        return StringPrintf("scale=%0.3f, lowThreshold=%0.3f, highThreshold=%0.3f, "
+                            "acceleration=%0.3f\n",
+                            scale, lowThreshold, highThreshold, acceleration);
+    }
 };
 
 /*
@@ -78,9 +89,7 @@ struct VelocityControlParameters {
 class VelocityControl {
 public:
     VelocityControl();
-
-    /* Sets the various parameters. */
-    void setParameters(const VelocityControlParameters& parameters);
+    virtual ~VelocityControl() {}
 
     /* Resets the current movement counters to zero.
      * This has the effect of nullifying any acceleration. */
@@ -90,18 +99,55 @@ public:
      * scaled / accelerated delta based on the current velocity. */
     void move(nsecs_t eventTime, float* deltaX, float* deltaY);
 
-private:
+protected:
+    virtual void scaleDeltas(float* deltaX, float* deltaY) = 0;
+
     // If no movements are received within this amount of time,
     // we assume the movement has stopped and reset the movement counters.
     static const nsecs_t STOP_TIME = 500 * 1000000; // 500 ms
 
-    VelocityControlParameters mParameters;
-
     nsecs_t mLastMovementTime;
-    VelocityTracker::Position mRawPosition;
+    float mRawPositionX, mRawPositionY;
     VelocityTracker mVelocityTracker;
 };
 
-} // namespace android
+/**
+ * Velocity control using a simple acceleration curve where the acceleration factor increases
+ * linearly with movement speed, subject to minimum and maximum values.
+ */
+class SimpleVelocityControl : public VelocityControl {
+public:
+    /** Gets the various parameters. */
+    const VelocityControlParameters& getParameters() const;
 
-#endif // _LIBINPUT_VELOCITY_CONTROL_H
+    /** Sets the various parameters. */
+    void setParameters(const VelocityControlParameters& parameters);
+
+protected:
+    virtual void scaleDeltas(float* deltaX, float* deltaY) override;
+
+private:
+    VelocityControlParameters mParameters;
+};
+
+/** Velocity control using a curve made up of multiple reciprocal segments. */
+class CurvedVelocityControl : public VelocityControl {
+public:
+    CurvedVelocityControl();
+
+    /** Sets the curve to be used for acceleration. */
+    void setCurve(const std::vector<AccelerationCurveSegment>& curve);
+
+    void setAccelerationEnabled(bool enabled);
+
+protected:
+    virtual void scaleDeltas(float* deltaX, float* deltaY) override;
+
+private:
+    const AccelerationCurveSegment& segmentForSpeed(float speedMmPerS);
+
+    bool mAccelerationEnabled = true;
+    std::vector<AccelerationCurveSegment> mCurveSegments;
+};
+
+} // namespace android

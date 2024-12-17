@@ -29,21 +29,16 @@ class DisplayRenderArea : public RenderArea {
 public:
     static std::unique_ptr<RenderArea> create(wp<const DisplayDevice>, const Rect& sourceCrop,
                                               ui::Size reqSize, ui::Dataspace,
-                                              bool useIdentityTransform,
-                                              bool allowSecureLayers = true);
+                                              ftl::Flags<Options> options);
 
     const ui::Transform& getTransform() const override;
-    Rect getBounds() const override;
-    int getHeight() const override;
-    int getWidth() const override;
     bool isSecure() const override;
     sp<const DisplayDevice> getDisplayDevice() const override;
-    bool needsFiltering() const override;
     Rect getSourceCrop() const override;
 
 private:
     DisplayRenderArea(sp<const DisplayDevice>, const Rect& sourceCrop, ui::Size reqSize,
-                      ui::Dataspace, bool useIdentityTransform, bool allowSecureLayers = true);
+                      ui::Dataspace, ftl::Flags<Options> options);
 
     const sp<const DisplayDevice> mDisplay;
     const Rect mSourceCrop;

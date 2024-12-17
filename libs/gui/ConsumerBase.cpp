@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include <inttypes.h>
-
 #define LOG_TAG "ConsumerBase"
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 //#define LOG_NDEBUG 0
@@ -29,23 +27,29 @@
 
 #include <cutils/atomic.h>
 
+#include <com_android_graphics_libgui_flags.h>
 #include <gui/BufferItem.h>
-#include <gui/ISurfaceComposer.h>
-#include <gui/SurfaceComposerClient.h>
+#include <gui/BufferQueue.h>
 #include <gui/ConsumerBase.h>
+#include <gui/ISurfaceComposer.h>
+#include <gui/Surface.h>
+#include <gui/SurfaceComposerClient.h>
 
 #include <private/gui/ComposerService.h>
 
+#include <log/log.h>
 #include <utils/Log.h>
 #include <utils/String8.h>
 #include <utils/Trace.h>
 
+#include <inttypes.h>
+
 // Macros for including the ConsumerBase name in log messages
-#define CB_LOGV(x, ...) ALOGV("[%s] " x, mName.string(), ##__VA_ARGS__)
-//#define CB_LOGD(x, ...) ALOGD("[%s] " x, mName.string(), ##__VA_ARGS__)
-//#define CB_LOGI(x, ...) ALOGI("[%s] " x, mName.string(), ##__VA_ARGS__)
-//#define CB_LOGW(x, ...) ALOGW("[%s] " x, mName.string(), ##__VA_ARGS__)
-#define CB_LOGE(x, ...) ALOGE("[%s] " x, mName.string(), ##__VA_ARGS__)
+#define CB_LOGV(x, ...) ALOGV("[%s] " x, mName.c_str(), ##__VA_ARGS__)
+// #define CB_LOGD(x, ...) ALOGD("[%s] " x, mName.c_str(), ##__VA_ARGS__)
+// #define CB_LOGI(x, ...) ALOGI("[%s] " x, mName.c_str(), ##__VA_ARGS__)
+// #define CB_LOGW(x, ...) ALOGW("[%s] " x, mName.c_str(), ##__VA_ARGS__)
+#define CB_LOGE(x, ...) ALOGE("[%s] " x, mName.c_str(), ##__VA_ARGS__)
 
 namespace android {
 
@@ -59,6 +63,30 @@ ConsumerBase::ConsumerBase(const sp<IGraphicBufferConsumer>& bufferQueue, bool c
         mAbandoned(false),
         mConsumer(bufferQueue),
         mPrevFinalReleaseFence(Fence::NO_FENCE) {
+    initialize(controlledByApp);
+}
+
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+ConsumerBase::ConsumerBase(bool controlledByApp, bool consumerIsSurfaceFlinger)
+      : mAbandoned(false), mPrevFinalReleaseFence(Fence::NO_FENCE) {
+    sp<IGraphicBufferProducer> producer;
+    BufferQueue::createBufferQueue(&producer, &mConsumer, consumerIsSurfaceFlinger);
+    mSurface = sp<Surface>::make(producer, controlledByApp);
+    initialize(controlledByApp);
+}
+
+ConsumerBase::ConsumerBase(const sp<IGraphicBufferProducer>& producer,
+                           const sp<IGraphicBufferConsumer>& consumer, bool controlledByApp)
+      : mAbandoned(false),
+        mConsumer(consumer),
+        mSurface(sp<Surface>::make(producer, controlledByApp)),
+        mPrevFinalReleaseFence(Fence::NO_FENCE) {
+    initialize(controlledByApp);
+}
+
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+
+void ConsumerBase::initialize(bool controlledByApp) {
     // Choose a name using the PID and a process-unique ID.
     mName = String8::format("unnamed-%d-%d", getpid(), createProcessUniqueId());
 
@@ -86,12 +114,43 @@ ConsumerBase::~ConsumerBase() {
     // be done by ConsumerBase::onLastStrongRef(), but it's possible for a
     // derived class to override that method and not call
     // ConsumerBase::onLastStrongRef().
-    LOG_ALWAYS_FATAL_IF(!mAbandoned, "[%s] ~ConsumerBase was called, but the "
-        "consumer is not abandoned!", mName.string());
+    LOG_ALWAYS_FATAL_IF(!mAbandoned,
+                        "[%s] ~ConsumerBase was called, but the "
+                        "consumer is not abandoned!",
+                        mName.c_str());
 }
 
 void ConsumerBase::onLastStrongRef(const void* id __attribute__((unused))) {
     abandon();
+}
+
+int ConsumerBase::getSlotForBufferLocked(const sp<GraphicBuffer>& buffer) {
+    if (!buffer) {
+        return BufferQueue::INVALID_BUFFER_SLOT;
+    }
+
+    uint64_t id = buffer->getId();
+    for (int i = 0; i < BufferQueueDefs::NUM_BUFFER_SLOTS; i++) {
+        auto& slot = mSlots[i];
+        if (slot.mGraphicBuffer && slot.mGraphicBuffer->getId() == id) {
+            return i;
+        }
+    }
+
+    return BufferQueue::INVALID_BUFFER_SLOT;
+}
+
+status_t ConsumerBase::detachBufferLocked(int slotIndex) {
+    status_t result = mConsumer->detachBuffer(slotIndex);
+
+    if (result != NO_ERROR) {
+        CB_LOGE("Failed to detach buffer: %d", result);
+        return result;
+    }
+
+    freeBufferLocked(slotIndex);
+
+    return result;
 }
 
 void ConsumerBase::freeBufferLocked(int slotIndex) {
@@ -250,16 +309,30 @@ status_t ConsumerBase::detachBuffer(int slot) {
         return NO_INIT;
     }
 
-    status_t result = mConsumer->detachBuffer(slot);
-    if (result != NO_ERROR) {
-        CB_LOGE("Failed to detach buffer: %d", result);
-        return result;
+    return detachBufferLocked(slot);
+}
+
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_PLATFORM_API_IMPROVEMENTS)
+status_t ConsumerBase::detachBuffer(const sp<GraphicBuffer>& buffer) {
+    CB_LOGV("detachBuffer");
+    Mutex::Autolock lock(mMutex);
+
+    if (mAbandoned) {
+        CB_LOGE("detachBuffer: ConsumerBase is abandoned!");
+        return NO_INIT;
+    }
+    if (buffer == nullptr) {
+        return BAD_VALUE;
     }
 
-    freeBufferLocked(slot);
+    int slotIndex = getSlotForBufferLocked(buffer);
+    if (slotIndex == BufferQueue::INVALID_BUFFER_SLOT) {
+        return BAD_VALUE;
+    }
 
-    return result;
+    return detachBufferLocked(slotIndex);
 }
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_PLATFORM_API_IMPROVEMENTS)
 
 status_t ConsumerBase::setDefaultBufferSize(uint32_t width, uint32_t height) {
     Mutex::Autolock _l(mMutex);
@@ -307,6 +380,17 @@ status_t ConsumerBase::setTransformHint(uint32_t hint) {
     return mConsumer->setTransformHint(hint);
 }
 
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+status_t ConsumerBase::setMaxBufferCount(int bufferCount) {
+    Mutex::Autolock lock(mMutex);
+    if (mAbandoned) {
+        CB_LOGE("setMaxBufferCount: ConsumerBase is abandoned!");
+        return NO_INIT;
+    }
+    return mConsumer->setMaxBufferCount(bufferCount);
+}
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+
 status_t ConsumerBase::setMaxAcquiredBufferCount(int maxAcquiredBuffers) {
     Mutex::Autolock lock(mMutex);
     if (mAbandoned) {
@@ -315,6 +399,17 @@ status_t ConsumerBase::setMaxAcquiredBufferCount(int maxAcquiredBuffers) {
     }
     return mConsumer->setMaxAcquiredBufferCount(maxAcquiredBuffers);
 }
+
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+status_t ConsumerBase::setConsumerIsProtected(bool isProtected) {
+    Mutex::Autolock lock(mMutex);
+    if (mAbandoned) {
+        CB_LOGE("setConsumerIsProtected: ConsumerBase is abandoned!");
+        return NO_INIT;
+    }
+    return mConsumer->setConsumerIsProtected(isProtected);
+}
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
 sp<NativeHandle> ConsumerBase::getSidebandStream() const {
     Mutex::Autolock _l(mMutex);
@@ -381,6 +476,19 @@ void ConsumerBase::dumpLocked(String8& result, const char* prefix) const {
         result.append(consumerState);
     }
 }
+
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+sp<Surface> ConsumerBase::getSurface() const {
+    LOG_ALWAYS_FATAL_IF(mSurface == nullptr,
+                        "It's illegal to get the surface of a Consumer that does not own it. This "
+                        "should be impossible once the old CTOR is removed.");
+    return mSurface;
+}
+
+sp<IGraphicBufferConsumer> ConsumerBase::getIGraphicBufferConsumer() const {
+    return mConsumer;
+}
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
 status_t ConsumerBase::acquireBufferLocked(BufferItem *item,
         nsecs_t presentWhen, uint64_t maxFrameNumber) {
@@ -451,7 +559,7 @@ status_t ConsumerBase::addReleaseFenceLocked(int slot,
     // them to get an accurate timestamp.
     if (currentStatus == incomingStatus) {
         char fenceName[32] = {};
-        snprintf(fenceName, 32, "%.28s:%d", mName.string(), slot);
+        snprintf(fenceName, 32, "%.28s:%d", mName.c_str(), slot);
         sp<Fence> mergedFence = Fence::merge(
                 fenceName, mSlots[slot].mFence, fence);
         if (!mergedFence.get()) {

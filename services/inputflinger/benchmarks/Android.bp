@@ -1,4 +1,5 @@
 package {
+    default_team: "trendy_team_input_framework",
     // See: http://go/android-license-faq
     // A large-scale-change added 'default_applicable_licenses' to import
     // all of the 'license_kinds' from "frameworks_native_license"
@@ -10,6 +11,7 @@ package {
 cc_benchmark {
     name: "inputflinger_benchmarks",
     srcs: [
+        ":inputdispatcher_common_test_sources",
         "InputDispatcher_benchmarks.cpp",
     ],
     defaults: [
@@ -19,18 +21,19 @@ cc_benchmark {
     shared_libs: [
         "libbase",
         "libbinder",
+        "libbinder_ndk",
         "libcrypto",
         "libcutils",
-        "libinput",
         "libinputflinger_base",
         "libinputreporter",
         "liblog",
         "libstatslog",
-        "libui",
         "libutils",
     ],
     static_libs: [
         "libattestation",
+        "libgmock",
+        "libgtest",
         "libinputdispatcher",
     ],
 }

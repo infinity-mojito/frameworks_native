@@ -18,6 +18,7 @@
 
 #include <android-base/stringprintf.h>
 #include <android/native_window.h>
+#include <common/trace.h>
 #include <compositionengine/CompositionEngine.h>
 #include <compositionengine/Display.h>
 #include <compositionengine/DisplaySurface.h>
@@ -32,7 +33,6 @@
 #include <system/window.h>
 #include <ui/GraphicBuffer.h>
 #include <ui/Rect.h>
-#include <utils/Trace.h>
 
 // TODO(b/129481165): remove the #pragma below and fix conversion issues
 #pragma clang diagnostic push
@@ -149,7 +149,7 @@ void RenderSurface::prepareFrame(bool usesClientComposition, bool usesDeviceComp
 
 std::shared_ptr<renderengine::ExternalTexture> RenderSurface::dequeueBuffer(
         base::unique_fd* bufferFence) {
-    ATRACE_CALL();
+    SFTRACE_CALL();
     int fd = -1;
     ANativeWindowBuffer* buffer = nullptr;
 
@@ -198,7 +198,7 @@ std::shared_ptr<renderengine::ExternalTexture> RenderSurface::dequeueBuffer(
     return mTexture;
 }
 
-void RenderSurface::queueBuffer(base::unique_fd readyFence) {
+void RenderSurface::queueBuffer(base::unique_fd readyFence, float hdrSdrRatio) {
     auto& state = mDisplay.getState();
 
     if (state.usesClientComposition || state.flipClientTarget) {
@@ -241,7 +241,7 @@ void RenderSurface::queueBuffer(base::unique_fd readyFence) {
         }
     }
 
-    status_t result = mDisplaySurface->advanceFrame();
+    status_t result = mDisplaySurface->advanceFrame(hdrSdrRatio);
     if (result != NO_ERROR) {
         ALOGE("[%s] failed pushing new frame to HWC: %d", mDisplay.getName().c_str(), result);
     }
@@ -249,10 +249,6 @@ void RenderSurface::queueBuffer(base::unique_fd readyFence) {
 
 void RenderSurface::onPresentDisplayCompleted() {
     mDisplaySurface->onFrameCommitted();
-}
-
-void RenderSurface::flip() {
-    mPageFlipCount++;
 }
 
 void RenderSurface::dump(std::string& out) const {
@@ -265,20 +261,11 @@ void RenderSurface::dump(std::string& out) const {
     dumpVal(out, "size", mSize);
     StringAppendF(&out, "ANativeWindow=%p (format %d) ", mNativeWindow.get(),
                   ANativeWindow_getFormat(mNativeWindow.get()));
-    dumpVal(out, "flips", mPageFlipCount);
     out.append("\n");
 
     String8 surfaceDump;
     mDisplaySurface->dumpAsString(surfaceDump);
     out.append(surfaceDump);
-}
-
-std::uint32_t RenderSurface::getPageFlipCount() const {
-    return mPageFlipCount;
-}
-
-void RenderSurface::setPageFlipCountForTest(std::uint32_t count) {
-    mPageFlipCount = count;
 }
 
 void RenderSurface::setSizeForTest(const ui::Size& size) {

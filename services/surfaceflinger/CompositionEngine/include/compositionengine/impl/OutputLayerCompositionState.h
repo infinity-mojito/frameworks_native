@@ -63,8 +63,14 @@ struct OutputLayerCompositionState {
     // The portion of the layer that is not obscured and is also opaque
     Region visibleNonTransparentRegion;
 
-    // The portion of the layer that is obscured by opaque layers on top
+    // The portion of the layer that is obscured by all layers on top. This includes transparent and
+    // opaque.
     Region coveredRegion;
+
+    // The portion of the layer that is obscured by all layers on top excluding display overlays.
+    // This only has a value if there's something needing it, like when a
+    // TrustedPresentationListener is set.
+    std::optional<Region> coveredRegionExcludingDisplayOverlays;
 
     // The visibleRegion transformed to output space
     Region outputSpaceVisibleRegion;
@@ -84,7 +90,7 @@ struct OutputLayerCompositionState {
     // The source crop for this layer on this output
     FloatRect sourceCrop;
 
-    // The buffer transform to use for this layer o on this output.
+    // The buffer transform to use for this layer on this output.
     Hwc2::Transform bufferTransform{static_cast<Hwc2::Transform>(0)};
 
     // The dataspace for this layer
@@ -135,6 +141,10 @@ struct OutputLayerCompositionState {
         // The buffer cache for this layer. This is used to lower the
         // cost of sending reused buffers to the HWC.
         HwcBufferCache hwcBufferCache;
+
+        // The previously-active buffer for this layer.
+        uint64_t activeBufferId;
+        uint32_t activeBufferSlot;
 
         // Set to true when overridden info has been sent to HW composer
         bool stateOverridden = false;

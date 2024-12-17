@@ -147,8 +147,9 @@ TEST_F(SurfaceTextureGLTest, TexturingFromCpuFilledYV12BufferWithCrop) {
 
     for (int i = 0; i < 5; i++) {
         const android_native_rect_t& crop(crops[i]);
-        SCOPED_TRACE(String8::format("rect{ l: %d t: %d r: %d b: %d }",
-                crop.left, crop.top, crop.right, crop.bottom).string());
+        SCOPED_TRACE(String8::format("rect{ l: %d t: %d r: %d b: %d }", crop.left, crop.top,
+                                     crop.right, crop.bottom)
+                             .c_str());
 
         ASSERT_EQ(NO_ERROR, native_window_set_crop(mANW.get(), &crop));
 
@@ -308,7 +309,7 @@ TEST_F(SurfaceTextureGLTest, TexturingFromCpuFilledYV12BuffersRepeatedly) {
     mFW->waitForFrame();
 
     for (int i = 0; i < numFrames; i++) {
-        SCOPED_TRACE(String8::format("frame %d", i).string());
+        SCOPED_TRACE(String8::format("frame %d", i).c_str());
 
         // We must wait for each frame to come in because if we ever do an
         // updateTexImage call that doesn't consume a newly available buffer
@@ -479,8 +480,8 @@ TEST_F(SurfaceTextureGLTest, DisconnectStressTest) {
     };
 
     sp<DisconnectWaiter> dw(new DisconnectWaiter());
-    mConsumer->consumerConnect(dw, false);
-
+    sp<IGraphicBufferConsumer> consumer = mST->getIGraphicBufferConsumer();
+    consumer->consumerConnect(dw, false);
 
     sp<Thread> pt(new ProducerThread(mANW));
     pt->run("ProducerThread");

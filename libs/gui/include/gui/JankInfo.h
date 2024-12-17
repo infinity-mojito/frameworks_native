@@ -18,15 +18,15 @@
 
 namespace android {
 
-// Jank information tracked by SurfaceFlinger(SF) for perfetto tracing and telemetry.
+// Jank type tracked by SurfaceFlinger(SF) for Perfetto tracing and telemetry.
 enum JankType {
     // No Jank
     None = 0x0,
     // Jank that occurs in the layers below SurfaceFlinger
     DisplayHAL = 0x1,
-    // SF took too long on the CPU
+    // SF took too long on the CPU; deadline missed during HWC
     SurfaceFlingerCpuDeadlineMissed = 0x2,
-    // SF took too long on the GPU
+    // SF took too long on the GPU; deadline missed during GPU composition
     SurfaceFlingerGpuDeadlineMissed = 0x4,
     // Either App or GPU took too long on the frame
     AppDeadlineMissed = 0x8,
@@ -46,6 +46,20 @@ enum JankType {
     // where the previous frame was presented in the current frame's expected vsync. This pushes the
     // current frame to the next vsync. The behavior is similar to BufferStuffing.
     SurfaceFlingerStuffing = 0x100,
+    // Frame was dropped, as a newer frame was ready and replaced this frame.
+    Dropped = 0x200,
+};
+
+// Jank severity type tracked by SurfaceFlinger(SF) for Perfetto tracing and telemetry.
+enum class JankSeverityType {
+    // Unknown: not enough information to classify the severity of a jank
+    Unknown = 0,
+    // None: no jank
+    None = 1,
+    // Partial: jank caused by missing the deadline by less than the app's frame interval
+    Partial = 2,
+    // Full: jank caused by missing the deadline by more than the app's frame interval
+    Full = 3,
 };
 
 } // namespace android

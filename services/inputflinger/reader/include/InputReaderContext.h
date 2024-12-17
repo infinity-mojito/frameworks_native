@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUTREADER_INPUT_READER_CONTEXT_H
-#define _UI_INPUTREADER_INPUT_READER_CONTEXT_H
+#pragma once
 
 #include <input/InputDevice.h>
+#include <input/KeyboardClassifier.h>
+#include "NotifyArgs.h"
 
 #include <vector>
 
@@ -28,7 +29,6 @@ class InputDevice;
 class InputListenerInterface;
 class InputMapper;
 class InputReaderPolicyInterface;
-class PointerControllerInterface;
 struct StylusState;
 
 /* Internal interface used by individual input devices to access global input device state
@@ -45,25 +45,28 @@ public:
     virtual void disableVirtualKeysUntil(nsecs_t time) = 0;
     virtual bool shouldDropVirtualKey(nsecs_t now, int32_t keyCode, int32_t scanCode) = 0;
 
-    virtual void fadePointer() = 0;
-    virtual std::shared_ptr<PointerControllerInterface> getPointerController(int32_t deviceId) = 0;
-
     virtual void requestTimeoutAtTime(nsecs_t when) = 0;
     virtual int32_t bumpGeneration() = 0;
 
     virtual void getExternalStylusDevices(std::vector<InputDeviceInfo>& outDevices) = 0;
-    virtual void dispatchExternalStylusState(const StylusState& outState) = 0;
+    [[nodiscard]] virtual std::list<NotifyArgs> dispatchExternalStylusState(
+            const StylusState& outState) = 0;
 
     virtual InputReaderPolicyInterface* getPolicy() = 0;
-    virtual InputListenerInterface& getListener() = 0;
     virtual EventHubInterface* getEventHub() = 0;
 
     virtual int32_t getNextId() = 0;
 
     virtual void updateLedMetaState(int32_t metaState) = 0;
     virtual int32_t getLedMetaState() = 0;
+
+    virtual void setPreventingTouchpadTaps(bool prevent) = 0;
+    virtual bool isPreventingTouchpadTaps() = 0;
+
+    virtual void setLastKeyDownTimestamp(nsecs_t when) = 0;
+    virtual nsecs_t getLastKeyDownTimestamp() = 0;
+
+    virtual KeyboardClassifier& getKeyboardClassifier() = 0;
 };
 
 } // namespace android
-
-#endif // _UI_INPUTREADER_INPUT_READER_CONTEXT_H

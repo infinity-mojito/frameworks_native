@@ -163,11 +163,13 @@ void GpuStats::insertDriverStats(const std::string& driverPackageName,
         addLoadingTime(driver, driverLoadingTime, &appInfo);
         appInfo.appPackageName = appPackageName;
         appInfo.driverVersionCode = driverVersionCode;
-        appInfo.angleInUse = driverPackageName == "angle";
+        appInfo.angleInUse =
+                driver == GpuStatsInfo::Driver::ANGLE || driverPackageName == "angle";
         appInfo.lastAccessTime = std::chrono::system_clock::now();
         mAppStats.insert({appStatsKey, appInfo});
     } else {
-        mAppStats[appStatsKey].angleInUse = driverPackageName == "angle";
+        mAppStats[appStatsKey].angleInUse =
+                driver == GpuStatsInfo::Driver::ANGLE || driverPackageName == "angle";
         addLoadingTime(driver, driverLoadingTime, &mAppStats[appStatsKey]);
         mAppStats[appStatsKey].lastAccessTime = std::chrono::system_clock::now();
     }
@@ -175,29 +177,110 @@ void GpuStats::insertDriverStats(const std::string& driverPackageName,
 
 void GpuStats::insertTargetStats(const std::string& appPackageName,
                                  const uint64_t driverVersionCode, const GpuStatsInfo::Stats stats,
-                                 const uint64_t /*value*/) {
+                                 const uint64_t value) {
+    return insertTargetStatsArray(appPackageName, driverVersionCode, stats, &value, 1);
+}
+
+void GpuStats::addVulkanEngineName(const std::string& appPackageName,
+                                   const uint64_t driverVersionCode,
+                                   const char* engineNameCStr) {
+    ATRACE_CALL();
+
+    const std::string appStatsKey = appPackageName + std::to_string(driverVersionCode);
+    const size_t engineNameLen = std::min(strlen(engineNameCStr),
+                                          GpuStatsAppInfo::MAX_VULKAN_ENGINE_NAME_LENGTH);
+    const std::string engineName{engineNameCStr, engineNameLen};
+
+    std::lock_guard<std::mutex> lock(mLock);
+    registerStatsdCallbacksIfNeeded();
+
+    const auto foundApp = mAppStats.find(appStatsKey);
+    if (foundApp == mAppStats.end()) {
+        return;
+    }
+
+    // Storing in std::set<> is not efficient for serialization tasks. Use
+    // vector instead and filter out dups
+    std::vector<std::string>& engineNames = foundApp->second.vulkanEngineNames;
+    if (engineNames.size() < GpuStatsAppInfo::MAX_VULKAN_ENGINE_NAMES
+        && std::find(engineNames.cbegin(), engineNames.cend(), engineName) == engineNames.cend()) {
+        engineNames.push_back(engineName);
+    }
+}
+
+void GpuStats::insertTargetStatsArray(const std::string& appPackageName,
+                                 const uint64_t driverVersionCode, const GpuStatsInfo::Stats stats,
+                                 const uint64_t* values, const uint32_t valueCount) {
     ATRACE_CALL();
 
     const std::string appStatsKey = appPackageName + std::to_string(driverVersionCode);
 
     std::lock_guard<std::mutex> lock(mLock);
     registerStatsdCallbacksIfNeeded();
-    if (!mAppStats.count(appStatsKey)) {
+
+    const auto foundApp = mAppStats.find(appStatsKey);
+    if (foundApp == mAppStats.end()) {
         return;
     }
 
-    switch (stats) {
-        case GpuStatsInfo::Stats::CPU_VULKAN_IN_USE:
-            mAppStats[appStatsKey].cpuVulkanInUse = true;
-            break;
-        case GpuStatsInfo::Stats::FALSE_PREROTATION:
-            mAppStats[appStatsKey].falsePrerotation = true;
-            break;
-        case GpuStatsInfo::Stats::GLES_1_IN_USE:
-            mAppStats[appStatsKey].gles1InUse = true;
-            break;
-        default:
-            break;
+    GpuStatsAppInfo& targetAppStats = foundApp->second;
+
+    if (stats == GpuStatsInfo::Stats::VULKAN_INSTANCE_EXTENSION
+        || stats == GpuStatsInfo::Stats::VULKAN_DEVICE_EXTENSION) {
+        // Handle extension arrays separately as we need to store a unique set of them
+        // in the stats vector. Storing in std::set<> is not efficient for serialization tasks.
+        std::vector<int32_t>& targetVec =
+                                (stats == GpuStatsInfo::Stats::VULKAN_INSTANCE_EXTENSION) ?
+                                targetAppStats.vulkanInstanceExtensions :
+                                targetAppStats.vulkanDeviceExtensions;
+        const bool addAll = (targetVec.size() == 0);
+        targetVec.reserve(valueCount);
+
+        // Add new extensions into the set
+        for(uint32_t i = 0;
+            (i < valueCount) && (targetVec.size() < GpuStatsAppInfo::MAX_NUM_EXTENSIONS);
+            i++) {
+            const int32_t extVal = int32_t(values[i] & 0xFFFFFFFF);
+            if (addAll
+                || std::find(targetVec.cbegin(), targetVec.cend(), extVal) == targetVec.cend()) {
+                targetVec.push_back(extVal);
+            }
+        }
+    }
+    else {
+        // Handle other type of stats info events
+        for(uint32_t i = 0; i < valueCount; i++) {
+            const uint64_t value = values[i];
+            switch (stats) {
+                case GpuStatsInfo::Stats::CPU_VULKAN_IN_USE:
+                    targetAppStats.cpuVulkanInUse = true;
+                    break;
+                case GpuStatsInfo::Stats::FALSE_PREROTATION:
+                    targetAppStats.falsePrerotation = true;
+                    break;
+                case GpuStatsInfo::Stats::GLES_1_IN_USE:
+                    targetAppStats.gles1InUse = true;
+                    break;
+                case GpuStatsInfo::Stats::CREATED_GLES_CONTEXT:
+                    targetAppStats.createdGlesContext = true;
+                    break;
+                case GpuStatsInfo::Stats::CREATED_VULKAN_DEVICE:
+                    targetAppStats.createdVulkanDevice = true;
+                    break;
+                case GpuStatsInfo::Stats::CREATED_VULKAN_API_VERSION:
+                    targetAppStats.vulkanApiVersion = uint32_t(value & 0xffffffff);
+                    break;
+                case GpuStatsInfo::Stats::CREATED_VULKAN_SWAPCHAIN:
+                    targetAppStats.createdVulkanSwapchain = true;
+                    break;
+                case GpuStatsInfo::Stats::VULKAN_DEVICE_FEATURES_ENABLED:
+                    // Merge all requested feature bits together for this app
+                    targetAppStats.vulkanDeviceFeaturesEnabled |= value;
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 }
 
@@ -333,6 +416,11 @@ AStatsManager_PullAtomCallbackReturn GpuStats::pullAppInfoAtom(AStatsEventList* 
             std::string angleDriverBytes = int64VectorToProtoByteString(
                 ele.second.angleDriverLoadingTime);
 
+            std::vector<const char*> engineNames;
+            for (const std::string &engineName : ele.second.vulkanEngineNames) {
+                engineNames.push_back(engineName.c_str());
+            }
+
             android::util::addAStatsEvent(
                     data,
                     android::util::GPU_STATS_APP_INFO,
@@ -347,7 +435,15 @@ AStatsManager_PullAtomCallbackReturn GpuStats::pullAppInfoAtom(AStatsEventList* 
                     ele.second.cpuVulkanInUse,
                     ele.second.falsePrerotation,
                     ele.second.gles1InUse,
-                    ele.second.angleInUse);
+                    ele.second.angleInUse,
+                    ele.second.createdGlesContext,
+                    ele.second.createdVulkanDevice,
+                    ele.second.createdVulkanSwapchain,
+                    ele.second.vulkanApiVersion,
+                    ele.second.vulkanDeviceFeaturesEnabled,
+                    ele.second.vulkanInstanceExtensions,
+                    ele.second.vulkanDeviceExtensions,
+                    engineNames);
         }
     }
 

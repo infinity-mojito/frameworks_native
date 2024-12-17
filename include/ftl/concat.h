@@ -20,7 +20,9 @@
 
 namespace android::ftl {
 
-// Lightweight (not allocating nor sprintf-based) concatenation.
+// Lightweight (not allocating nor sprintf-based) concatenation. The variadic arguments can be
+// values of integral type (including bool and char), string literals, or strings whose length
+// is constrained:
 //
 //   std::string_view name = "Volume";
 //   ftl::Concat string(ftl::truncated<3>(name), ": ", -3, " dB");
@@ -55,7 +57,7 @@ struct Concat<N, T, Ts...> : Concat<N + details::StaticString<T>::N, Ts...> {
 template <std::size_t N>
 struct Concat<N> {
   static constexpr std::size_t max_size() { return N; }
-  constexpr std::size_t size() const { return end_ - buffer_; }
+  constexpr std::size_t size() const { return static_cast<std::size_t>(end_ - buffer_); }
 
   constexpr const char* c_str() const { return buffer_; }
 
@@ -66,6 +68,8 @@ struct Concat<N> {
 
  protected:
   constexpr Concat() : end_(buffer_) {}
+  constexpr Concat(const Concat&) = delete;
+
   constexpr void append() { *end_ = '\0'; }
 
   char buffer_[N + 1];

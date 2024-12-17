@@ -23,6 +23,8 @@
 #include <binder/Parcelable.h>
 #include <system/audio.h>
 #include <utils/RefBase.h>
+#include <vibrator/ExternalVibrationUtils.h>
+#include <android/os/ExternalVibrationScale.h>
 
 namespace android {
 namespace os {
@@ -44,6 +46,11 @@ public :
     audio_attributes_t getAudioAttributes() const { return mAttrs; }
     sp<IExternalVibrationController> getController() { return mController; }
 
+    /* Converts the scale from non-public ExternalVibrationService into the HapticScaleLevel
+     * used by the utils.
+     */
+    static os::HapticScale externalVibrationScaleToHapticScale(
+            os::ExternalVibrationScale externalVibrationScale);
 
 private:
     int32_t mUid;
@@ -53,7 +60,7 @@ private:
     sp<IBinder> mToken = new BBinder();
 };
 
-} // namespace android
 } // namespace os
+} // namespace android
 
 #endif // ANDROID_EXTERNAL_VIBRATION_H

@@ -20,6 +20,7 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 
+#include <com_android_graphics_libgui_flags.h>
 #include <gui/BufferQueueDefs.h>
 #include <gui/ConsumerBase.h>
 
@@ -82,12 +83,25 @@ public:
     // If the constructor without the tex parameter is used, the GLConsumer is
     // created in a detached state, and attachToContext must be called before
     // calls to updateTexImage.
-    GLConsumer(const sp<IGraphicBufferConsumer>& bq,
-            uint32_t tex, uint32_t texureTarget, bool useFenceSync,
-            bool isControlledByApp);
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+    GLConsumer(uint32_t tex, uint32_t textureTarget, bool useFenceSync, bool isControlledByApp);
 
-    GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t texureTarget,
-            bool useFenceSync, bool isControlledByApp);
+    GLConsumer(uint32_t textureTarget, bool useFenceSync, bool isControlledByApp);
+
+    GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t tex, uint32_t textureTarget,
+               bool useFenceSync, bool isControlledByApp)
+            __attribute((deprecated("Prefer ctors that create their own surface and consumer.")));
+
+    GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t textureTarget, bool useFenceSync,
+               bool isControlledByApp)
+            __attribute((deprecated("Prefer ctors that create their own surface and consumer.")));
+#else
+    GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t tex, uint32_t textureTarget,
+               bool useFenceSync, bool isControlledByApp);
+
+    GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t textureTarget, bool useFenceSync,
+               bool isControlledByApp);
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
 
     // updateTexImage acquires the most recently queued buffer, and sets the
     // image contents of the target texture to it.
@@ -137,6 +151,10 @@ public:
     static void computeTransformMatrix(float outTransform[16],
             const sp<GraphicBuffer>& buf, const Rect& cropRect,
             uint32_t transform, bool filtering);
+
+    static void computeTransformMatrix(float outTransform[16], float bufferWidth,
+                                       float bufferHeight, PixelFormat pixelFormat,
+                                       const Rect& cropRect, uint32_t transform, bool filtering);
 
     // Scale the crop down horizontally or vertically such that it has the
     // same aspect ratio as the buffer does.

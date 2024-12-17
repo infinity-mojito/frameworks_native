@@ -37,27 +37,24 @@ TEST_F(DestroyDisplayTest, destroyDisplayClearsCurrentStateForDisplay) {
     // --------------------------------------------------------------------
     // Call Expectations
 
-    // The call should notify the interceptor that a display was created.
-    EXPECT_CALL(*mSurfaceInterceptor, saveDisplayDeletion(_)).Times(1);
-
     // Destroying the display commits a display transaction.
-    EXPECT_CALL(*mFlinger.scheduler(), scheduleFrame()).Times(1);
+    EXPECT_CALL(*mFlinger.scheduler(), scheduleFrame(_)).Times(1);
 
     // --------------------------------------------------------------------
     // Invocation
 
-    mFlinger.destroyDisplay(existing.token());
+    EXPECT_EQ(NO_ERROR, mFlinger.destroyVirtualDisplay(existing.token()));
 
     // --------------------------------------------------------------------
     // Postconditions
 
-    // The display should have been removed from the current state
+    // The display should have been removed from the current state.
     EXPECT_FALSE(hasCurrentDisplayState(existing.token()));
 
-    // Ths display should still exist in the drawing state
+    // Ths display should still exist in the drawing state.
     EXPECT_TRUE(hasDrawingDisplayState(existing.token()));
 
-    // The display transaction needed flasg should be set
+    // The display transaction needed flags should be set.
     EXPECT_TRUE(hasTransactionFlagSet(eDisplayTransactionNeeded));
 }
 
@@ -65,12 +62,12 @@ TEST_F(DestroyDisplayTest, destroyDisplayHandlesUnknownDisplay) {
     // --------------------------------------------------------------------
     // Preconditions
 
-    sp<BBinder> displayToken = new BBinder();
+    sp<BBinder> displayToken = sp<BBinder>::make();
 
     // --------------------------------------------------------------------
     // Invocation
 
-    mFlinger.destroyDisplay(displayToken);
+    EXPECT_EQ(NAME_NOT_FOUND, mFlinger.destroyVirtualDisplay(displayToken));
 }
 
 } // namespace

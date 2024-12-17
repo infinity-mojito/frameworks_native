@@ -18,21 +18,23 @@
 
 namespace android {
 
-SingleTouchInputMapper::SingleTouchInputMapper(InputDeviceContext& deviceContext)
-      : TouchInputMapper(deviceContext) {}
+SingleTouchInputMapper::SingleTouchInputMapper(InputDeviceContext& deviceContext,
+                                               const InputReaderConfiguration& readerConfig)
+      : TouchInputMapper(deviceContext, readerConfig) {}
 
 SingleTouchInputMapper::~SingleTouchInputMapper() {}
 
-void SingleTouchInputMapper::reset(nsecs_t when) {
+std::list<NotifyArgs> SingleTouchInputMapper::reset(nsecs_t when) {
     mSingleTouchMotionAccumulator.reset(getDeviceContext());
 
-    TouchInputMapper::reset(when);
+    return TouchInputMapper::reset(when);
 }
 
-void SingleTouchInputMapper::process(const RawEvent* rawEvent) {
-    TouchInputMapper::process(rawEvent);
+std::list<NotifyArgs> SingleTouchInputMapper::process(const RawEvent& rawEvent) {
+    std::list<NotifyArgs> out = TouchInputMapper::process(rawEvent);
 
     mSingleTouchMotionAccumulator.process(rawEvent);
+    return out;
 }
 
 void SingleTouchInputMapper::syncTouch(nsecs_t when, RawState* outState) {
@@ -40,9 +42,9 @@ void SingleTouchInputMapper::syncTouch(nsecs_t when, RawState* outState) {
         outState->rawPointerData.pointerCount = 1;
         outState->rawPointerData.idToIndex[0] = 0;
 
-        bool isHovering = mTouchButtonAccumulator.getToolType() != AMOTION_EVENT_TOOL_TYPE_MOUSE &&
+        bool isHovering = mTouchButtonAccumulator.getToolType() != ToolType::MOUSE &&
                 (mTouchButtonAccumulator.isHovering() ||
-                 (mRawPointerAxes.pressure.valid &&
+                 (mRawPointerAxes.pressure &&
                   mSingleTouchMotionAccumulator.getAbsolutePressure() <= 0));
         outState->rawPointerData.markIdBit(0, isHovering);
 
@@ -60,8 +62,8 @@ void SingleTouchInputMapper::syncTouch(nsecs_t when, RawState* outState) {
         outPointer.tiltX = mSingleTouchMotionAccumulator.getAbsoluteTiltX();
         outPointer.tiltY = mSingleTouchMotionAccumulator.getAbsoluteTiltY();
         outPointer.toolType = mTouchButtonAccumulator.getToolType();
-        if (outPointer.toolType == AMOTION_EVENT_TOOL_TYPE_UNKNOWN) {
-            outPointer.toolType = AMOTION_EVENT_TOOL_TYPE_FINGER;
+        if (outPointer.toolType == ToolType::UNKNOWN) {
+            outPointer.toolType = ToolType::FINGER;
         }
         outPointer.isHovering = isHovering;
     }
@@ -70,13 +72,19 @@ void SingleTouchInputMapper::syncTouch(nsecs_t when, RawState* outState) {
 void SingleTouchInputMapper::configureRawPointerAxes() {
     TouchInputMapper::configureRawPointerAxes();
 
-    getAbsoluteAxisInfo(ABS_X, &mRawPointerAxes.x);
-    getAbsoluteAxisInfo(ABS_Y, &mRawPointerAxes.y);
-    getAbsoluteAxisInfo(ABS_PRESSURE, &mRawPointerAxes.pressure);
-    getAbsoluteAxisInfo(ABS_TOOL_WIDTH, &mRawPointerAxes.toolMajor);
-    getAbsoluteAxisInfo(ABS_DISTANCE, &mRawPointerAxes.distance);
-    getAbsoluteAxisInfo(ABS_TILT_X, &mRawPointerAxes.tiltX);
-    getAbsoluteAxisInfo(ABS_TILT_Y, &mRawPointerAxes.tiltY);
+    // TODO(b/351870641): Investigate why we are sometime not getting valid axis infos for the x/y
+    //   axes, even though those axes are required to be supported.
+    if (const auto xInfo = getAbsoluteAxisInfo(ABS_X); xInfo.has_value()) {
+        mRawPointerAxes.x = *xInfo;
+    }
+    if (const auto yInfo = getAbsoluteAxisInfo(ABS_Y); yInfo.has_value()) {
+        mRawPointerAxes.y = *yInfo;
+    }
+    mRawPointerAxes.pressure = getAbsoluteAxisInfo(ABS_PRESSURE);
+    mRawPointerAxes.toolMajor = getAbsoluteAxisInfo(ABS_TOOL_WIDTH);
+    mRawPointerAxes.distance = getAbsoluteAxisInfo(ABS_DISTANCE);
+    mRawPointerAxes.tiltX = getAbsoluteAxisInfo(ABS_TILT_X);
+    mRawPointerAxes.tiltY = getAbsoluteAxisInfo(ABS_TILT_Y);
 }
 
 bool SingleTouchInputMapper::hasStylus() const {

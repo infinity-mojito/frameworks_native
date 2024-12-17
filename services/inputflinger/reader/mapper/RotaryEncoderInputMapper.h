@@ -14,37 +14,45 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUTREADER_ROTARY_ENCODER_INPUT_MAPPER_H
-#define _UI_INPUTREADER_ROTARY_ENCODER_INPUT_MAPPER_H
+#pragma once
+
+#include <ui/Rotation.h>
 
 #include "CursorScrollAccumulator.h"
 #include "InputMapper.h"
+#include "SlopController.h"
 
 namespace android {
 
 class RotaryEncoderInputMapper : public InputMapper {
 public:
-    explicit RotaryEncoderInputMapper(InputDeviceContext& deviceContext);
+    template <class T, class... Args>
+    friend std::unique_ptr<T> createInputMapper(InputDeviceContext& deviceContext,
+                                                const InputReaderConfiguration& readerConfig,
+                                                Args... args);
     virtual ~RotaryEncoderInputMapper();
 
     virtual uint32_t getSources() const override;
-    virtual void populateDeviceInfo(InputDeviceInfo* deviceInfo) override;
+    virtual void populateDeviceInfo(InputDeviceInfo& deviceInfo) override;
     virtual void dump(std::string& dump) override;
-    virtual void configure(nsecs_t when, const InputReaderConfiguration* config,
-                           uint32_t changes) override;
-    virtual void reset(nsecs_t when) override;
-    virtual void process(const RawEvent* rawEvent) override;
+    [[nodiscard]] std::list<NotifyArgs> reconfigure(nsecs_t when,
+                                                    const InputReaderConfiguration& config,
+                                                    ConfigurationChanges changes) override;
+    [[nodiscard]] std::list<NotifyArgs> reset(nsecs_t when) override;
+    [[nodiscard]] std::list<NotifyArgs> process(const RawEvent& rawEvent) override;
 
 private:
     CursorScrollAccumulator mRotaryEncoderScrollAccumulator;
 
     int32_t mSource;
     float mScalingFactor;
-    int32_t mOrientation;
+    ui::Rotation mOrientation;
+    ui::LogicalDisplayId mDisplayId = ui::LogicalDisplayId::INVALID;
+    std::unique_ptr<SlopController> mSlopController;
 
-    void sync(nsecs_t when, nsecs_t readTime);
+    explicit RotaryEncoderInputMapper(InputDeviceContext& deviceContext,
+                                      const InputReaderConfiguration& readerConfig);
+    [[nodiscard]] std::list<NotifyArgs> sync(nsecs_t when, nsecs_t readTime);
 };
 
 } // namespace android
-
-#endif // _UI_INPUTREADER_ROTARY_ENCODER_INPUT_MAPPER_H

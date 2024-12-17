@@ -24,13 +24,14 @@ package {
 cc_test {
     name: "gpuservice_unittest",
     test_suites: ["device-tests"],
-    sanitize: {
-        address: true,
-    },
+    defaults: [
+        "libgpuservice_defaults",
+    ],
     srcs: [
         "GpuMemTest.cpp",
         "GpuMemTracerTest.cpp",
         "GpuStatsTest.cpp",
+        "GpuServiceTest.cpp",
     ],
     header_libs: ["bpf_headers"],
     shared_libs: [
@@ -38,9 +39,6 @@ cc_test {
         "libbinder",
         "libbpf_bcc",
         "libcutils",
-        "libgfxstats",
-        "libgpumem",
-        "libgpumemtracer",
         "libgraphicsenv",
         "liblog",
         "libprotobuf-cpp-lite",
@@ -51,6 +49,7 @@ cc_test {
     ],
     static_libs: [
         "libgmock",
+        "libgpuservice",
         "libperfetto_client_experimental",
         "perfetto_trace_protos",
     ],

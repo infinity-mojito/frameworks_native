@@ -40,6 +40,7 @@ public:
     ~GpuWork();
 
     void initialize();
+    void stop() { mStop.store(true); }
 
     // Dumps the GPU work information.
     void dump(const Vector<String16>& args, std::string* result);
@@ -47,7 +48,7 @@ public:
 private:
     // Attaches tracepoint |tracepoint_group|/|tracepoint_name| to BPF program at path
     // |program_path|. The tracepoint is also enabled.
-    static bool attachTracepoint(const char* program_path, const char* tracepoint_group,
+    bool attachTracepoint(const char* program_path, const char* tracepoint_group,
                                  const char* tracepoint_name);
 
     // Native atom puller callback registered in statsd.
@@ -79,6 +80,9 @@ private:
 
     // Indicates whether our eBPF components have been initialized.
     std::atomic<bool> mInitialized = false;
+
+    // Indicates whether eBPF initialization should be stopped.
+    std::atomic<bool> mStop = false;
 
     // A thread that periodically checks whether |mGpuWorkMap| is nearly full
     // and, if so, clears it.
@@ -121,7 +125,7 @@ private:
     static constexpr size_t kNumGpusHardLimit = 32;
 
     // The minimum GPU time needed to actually log stats for a UID.
-    static constexpr uint64_t kMinGpuTimeNanoseconds = 30U * 1000000000U; // 30 seconds.
+    static constexpr uint64_t kMinGpuTimeNanoseconds = 10LLU * 1000000000LLU; // 10 seconds.
 
     // The previous time point at which |mGpuWorkMap| was cleared.
     std::chrono::steady_clock::time_point mPreviousMapClearTimePoint GUARDED_BY(mMutex);

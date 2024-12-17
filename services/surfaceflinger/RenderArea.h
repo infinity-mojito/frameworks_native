@@ -4,6 +4,8 @@
 #include <ui/Transform.h>
 
 #include <functional>
+
+#include "FrontEnd/LayerSnapshot.h"
 #include "Layer.h"
 
 namespace android {
@@ -18,44 +20,34 @@ class DisplayDevice;
 // physical render area.
 class RenderArea {
 public:
-    using RotationFlags = ui::Transform::RotationFlags;
-
     enum class CaptureFill {CLEAR, OPAQUE};
+    enum class Options {
+        // If not set, the secure layer would be blacked out or skipped
+        // when rendered to an insecure render area
+        CAPTURE_SECURE_LAYERS = 1 << 0,
 
+        // If set, the render result may be used for system animations
+        // that must preserve the exact colors of the display
+        HINT_FOR_SEAMLESS_TRANSITION = 1 << 1,
+    };
     static float getCaptureFillValue(CaptureFill captureFill);
 
     RenderArea(ui::Size reqSize, CaptureFill captureFill, ui::Dataspace reqDataSpace,
-               const Rect& layerStackRect, bool allowSecureLayers = false,
-               RotationFlags rotation = ui::Transform::ROT_0)
-          : mAllowSecureLayers(allowSecureLayers),
+               ftl::Flags<Options> options)
+          : mOptions(options),
             mReqSize(reqSize),
             mReqDataSpace(reqDataSpace),
-            mCaptureFill(captureFill),
-            mRotationFlags(rotation),
-            mLayerStackSpaceRect(layerStackRect) {}
+            mCaptureFill(captureFill) {}
 
     virtual ~RenderArea() = default;
-
-    // Invoke drawLayers to render layers into the render area.
-    virtual void render(std::function<void()> drawLayers) { drawLayers(); }
 
     // Returns true if the render area is secure.  A secure layer should be
     // blacked out / skipped when rendered to an insecure render area.
     virtual bool isSecure() const = 0;
 
-    // Returns true if the otherwise disabled layer filtering should be
-    // enabled when rendering to this render area.
-    virtual bool needsFiltering() const = 0;
-
     // Returns the transform to be applied on layers to transform them into
     // the logical render area.
     virtual const ui::Transform& getTransform() const = 0;
-
-    // Returns the size of the logical render area.  Layers are clipped to the
-    // logical render area.
-    virtual int getWidth() const = 0;
-    virtual int getHeight() const = 0;
-    virtual Rect getBounds() const = 0;
 
     // Returns the source crop of the render area.  The source crop defines
     // how layers are projected from the logical render area onto the physical
@@ -66,9 +58,6 @@ public:
     // its children), or in layer-stack space (when rendering all layers visible
     // on the display).
     virtual Rect getSourceCrop() const = 0;
-
-    // Returns the rotation of the source crop and the layers.
-    RotationFlags getRotationFlags() const { return mRotationFlags; }
 
     // Returns the size of the physical render area.
     int getReqWidth() const { return mReqSize.width; }
@@ -83,22 +72,27 @@ public:
 
     virtual sp<const DisplayDevice> getDisplayDevice() const = 0;
 
-    // Returns the source display viewport.
-    const Rect& getLayerStackSpaceRect() const { return mLayerStackSpaceRect; }
-
     // If this is a LayerRenderArea, return the root layer of the
     // capture operation.
     virtual sp<Layer> getParentLayer() const { return nullptr; }
 
+    // If this is a LayerRenderArea, return the layer snapshot
+    // of the root layer of the capture operation
+    virtual const frontend::LayerSnapshot* getLayerSnapshot() const { return nullptr; }
+
+    // Returns whether the render result may be used for system animations that
+    // must preserve the exact colors of the display.
+    bool getHintForSeamlessTransition() const {
+        return mOptions.test(Options::HINT_FOR_SEAMLESS_TRANSITION);
+    }
+
 protected:
-    const bool mAllowSecureLayers;
+    ftl::Flags<Options> mOptions;
 
 private:
     const ui::Size mReqSize;
     const ui::Dataspace mReqDataSpace;
     const CaptureFill mCaptureFill;
-    const RotationFlags mRotationFlags;
-    const Rect mLayerStackSpaceRect;
 };
 
 } // namespace android

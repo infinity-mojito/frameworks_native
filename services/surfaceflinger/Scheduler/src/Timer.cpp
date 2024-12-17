@@ -24,10 +24,10 @@
 #include <sys/timerfd.h>
 #include <sys/unistd.h>
 
+#include <common/trace.h>
 #include <ftl/concat.h>
 #include <ftl/enum.h>
 #include <log/log.h>
-#include <utils/Trace.h>
 
 #include <scheduler/Timer.h>
 
@@ -93,8 +93,8 @@ void Timer::cleanup() {
         close(mPipes[kWritePipe]);
         mPipes[kWritePipe] = -1;
     }
-    mExpectingCallback = false;
-    mCallback = {};
+
+    setCallback({});
 }
 
 void Timer::endDispatch() {
@@ -112,8 +112,7 @@ void Timer::alarmAt(std::function<void()> callback, nsecs_t time) {
     static constexpr int ns_per_s =
             std::chrono::duration_cast<std::chrono::nanoseconds>(1s).count();
 
-    mCallback = std::move(callback);
-    mExpectingCallback = true;
+    setCallback(std::move(callback));
 
     struct itimerspec old_timer;
     struct itimerspec new_timer {
@@ -142,6 +141,8 @@ void Timer::alarmCancel() {
     if (timerfd_settime(mTimerFd, 0, &new_timer, &old_timer)) {
         ALOGW("Failed to disarm timerfd");
     }
+
+    setCallback({});
 }
 
 void Timer::threadMain() {
@@ -158,7 +159,7 @@ bool Timer::dispatch() {
         ALOGW("Failed to set SCHED_FIFO on dispatch thread");
     }
 
-    if (pthread_setname_np(pthread_self(), "TimerDispatch")) {
+    if (pthread_setname_np(pthread_self(), "TimerDispatch") != 0) {
         ALOGW("Failed to set thread name on dispatch thread");
     }
 
@@ -187,9 +188,9 @@ bool Timer::dispatch() {
         int nfds = epoll_wait(mEpollFd, events, DispatchType::MAX_DISPATCH_TYPE, -1);
 
         setDebugState(DebugState::Running);
-        if (ATRACE_ENABLED()) {
+        if (SFTRACE_ENABLED()) {
             ftl::Concat trace("TimerIteration #", iteration++);
-            ATRACE_NAME(trace.c_str());
+            SFTRACE_NAME(trace.c_str());
         }
 
         if (nfds == -1) {
@@ -229,6 +230,11 @@ bool Timer::dispatch() {
 void Timer::setDebugState(DebugState state) {
     std::lock_guard lock(mMutex);
     mDebugState = state;
+}
+
+void Timer::setCallback(std::function<void()>&& callback) {
+    mExpectingCallback = bool(callback);
+    mCallback = std::move(callback);
 }
 
 void Timer::dump(std::string& result) const {

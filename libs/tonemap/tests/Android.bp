@@ -19,10 +19,15 @@ package {
     // to get the below license kinds:
     //   SPDX-license-identifier-Apache-2.0
     default_applicable_licenses: ["frameworks_native_license"],
+    default_team: "trendy_team_android_core_graphics_stack",
 }
 
 cc_test {
     name: "libtonemap_test",
+    defaults: [
+        "android.hardware.graphics.common-ndk_shared",
+        "android.hardware.graphics.composer3-ndk_shared",
+    ],
     test_suites: ["device-tests"],
     srcs: [
         "tonemap_test.cpp",
@@ -31,9 +36,8 @@ cc_test {
         "libtonemap_headers",
     ],
     shared_libs: [
-        "android.hardware.graphics.common-V4-ndk",
-        "android.hardware.graphics.composer3-V1-ndk",
         "libnativewindow",
+        "libbase",
     ],
     static_libs: [
         "libmath",

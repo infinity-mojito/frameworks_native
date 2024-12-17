@@ -18,27 +18,30 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wconversion"
 
+#include <android/gui/ISurfaceComposer.h>
 #include <gtest/gtest.h>
-#include <gui/ISurfaceComposer.h>
-#include <gui/LayerDebugInfo.h>
+#include <gui/AidlUtil.h>
 #include <gui/Surface.h>
 #include <gui/SurfaceComposerClient.h>
 #include <private/android_filesystem_config.h>
-#include <private/gui/ComposerService.h>
+#include <private/gui/ComposerServiceAIDL.h>
 #include <ui/DisplayMode.h>
+#include <ui/DisplayState.h>
 #include <ui/DynamicDisplayInfo.h>
 #include <utils/String8.h>
 #include <functional>
 #include "utils/ScreenshotUtils.h"
+#include "utils/WindowInfosListenerUtils.h"
 
 namespace android {
 
 using Transaction = SurfaceComposerClient::Transaction;
+using gui::aidl_utils::statusTFromBinderStatus;
 using ui::ColorMode;
 
 namespace {
-const String8 DISPLAY_NAME("Credentials Display Test");
-const String8 SURFACE_NAME("Test Surface Name");
+const std::string kDisplayName("Credentials Display Test");
+const String8 kSurfaceName("Test Surface Name");
 } // namespace
 
 /**
@@ -67,19 +70,37 @@ protected:
     sp<SurfaceControl> mVirtualSurfaceControl;
 
     void initClient() {
-        mComposerClient = new SurfaceComposerClient;
+        mComposerClient = sp<SurfaceComposerClient>::make();
         ASSERT_EQ(NO_ERROR, mComposerClient->initCheck());
     }
 
+    static sp<IBinder> getFirstDisplayToken() {
+        const auto ids = SurfaceComposerClient::getPhysicalDisplayIds();
+        if (ids.empty()) {
+            return nullptr;
+        }
+
+        return SurfaceComposerClient::getPhysicalDisplayToken(ids.front());
+    }
+
+    static std::optional<uint64_t> getFirstDisplayId() {
+        const auto ids = SurfaceComposerClient::getPhysicalDisplayIds();
+        if (ids.empty()) {
+            return std::nullopt;
+        }
+
+        return ids.front().value;
+    }
+
     void setupBackgroundSurface() {
-        mDisplay = SurfaceComposerClient::getInternalDisplayToken();
+        mDisplay = getFirstDisplayToken();
         ASSERT_FALSE(mDisplay == nullptr);
 
         ui::DisplayMode mode;
         ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getActiveDisplayMode(mDisplay, &mode));
 
         // Background surface
-        mBGSurfaceControl = mComposerClient->createSurface(SURFACE_NAME, mode.resolution.getWidth(),
+        mBGSurfaceControl = mComposerClient->createSurface(kSurfaceName, mode.resolution.getWidth(),
                                                            mode.resolution.getHeight(),
                                                            PIXEL_FORMAT_RGBA_8888, 0);
         ASSERT_TRUE(mBGSurfaceControl != nullptr);
@@ -149,45 +170,39 @@ TEST_F(CredentialsTest, ClientInitTest) {
     // Anyone else can init the client.
     {
         UIDFaker f(AID_BIN);
-        mComposerClient = new SurfaceComposerClient;
+        mComposerClient = sp<SurfaceComposerClient>::make();
         ASSERT_NO_FATAL_FAILURE(initClient());
     }
 }
 
 TEST_F(CredentialsTest, GetBuiltInDisplayAccessTest) {
-    std::function<bool()> condition = [] {
-        return SurfaceComposerClient::getInternalDisplayToken() != nullptr;
-    };
+    std::function<bool()> condition = [] { return getFirstDisplayToken() != nullptr; };
     // Anyone can access display information.
-    ASSERT_NO_FATAL_FAILURE(checkWithPrivileges(condition, true, true));
+    ASSERT_NO_FATAL_FAILURE(checkWithPrivileges(condition, true, false));
 }
 
 TEST_F(CredentialsTest, AllowedGetterMethodsTest) {
     // The following methods are tested with a UID that is not root, graphics,
     // or system, to show that anyone can access them.
     UIDFaker f(AID_BIN);
-    const auto display = SurfaceComposerClient::getInternalDisplayToken();
-    ASSERT_TRUE(display != nullptr);
-
-    ui::DisplayMode mode;
-    ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getActiveDisplayMode(display, &mode));
-
-    Vector<ui::DisplayMode> modes;
+    const auto id = getFirstDisplayId();
+    ASSERT_TRUE(id);
     ui::DynamicDisplayInfo info;
-    ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getDynamicDisplayInfo(display, &info));
+    ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getDynamicDisplayInfoFromId(*id, &info));
 }
 
 TEST_F(CredentialsTest, GetDynamicDisplayInfoTest) {
-    const auto display = SurfaceComposerClient::getInternalDisplayToken();
+    const auto id = getFirstDisplayId();
+    ASSERT_TRUE(id);
     std::function<status_t()> condition = [=]() {
         ui::DynamicDisplayInfo info;
-        return SurfaceComposerClient::getDynamicDisplayInfo(display, &info);
+        return SurfaceComposerClient::getDynamicDisplayInfoFromId(*id, &info);
     };
     ASSERT_NO_FATAL_FAILURE(checkWithPrivileges<status_t>(condition, NO_ERROR, NO_ERROR));
 }
 
 TEST_F(CredentialsTest, GetDisplayNativePrimariesTest) {
-    const auto display = SurfaceComposerClient::getInternalDisplayToken();
+    const auto display = getFirstDisplayToken();
     std::function<status_t()> condition = [=]() {
         ui::DisplayPrimaries primaries;
         return SurfaceComposerClient::getDisplayNativePrimaries(display, primaries);
@@ -196,30 +211,19 @@ TEST_F(CredentialsTest, GetDisplayNativePrimariesTest) {
 }
 
 TEST_F(CredentialsTest, SetDesiredDisplayConfigsTest) {
-    const auto display = SurfaceComposerClient::getInternalDisplayToken();
-    ui::DisplayModeId defaultMode;
-    bool allowGroupSwitching;
-    float primaryFpsMin;
-    float primaryFpsMax;
-    float appRequestFpsMin;
-    float appRequestFpsMax;
-    status_t res =
-            SurfaceComposerClient::getDesiredDisplayModeSpecs(display, &defaultMode,
-                                                              &allowGroupSwitching, &primaryFpsMin,
-                                                              &primaryFpsMax, &appRequestFpsMin,
-                                                              &appRequestFpsMax);
+    const auto display = getFirstDisplayToken();
+    gui::DisplayModeSpecs specs;
+    status_t res = SurfaceComposerClient::getDesiredDisplayModeSpecs(display, &specs);
     ASSERT_EQ(res, NO_ERROR);
+    gui::DisplayModeSpecs setSpecs;
     std::function<status_t()> condition = [=]() {
-        return SurfaceComposerClient::setDesiredDisplayModeSpecs(display, defaultMode,
-                                                                 allowGroupSwitching, primaryFpsMin,
-                                                                 primaryFpsMax, appRequestFpsMin,
-                                                                 appRequestFpsMax);
+        return SurfaceComposerClient::setDesiredDisplayModeSpecs(display, specs);
     };
     ASSERT_NO_FATAL_FAILURE(checkWithPrivileges<status_t>(condition, NO_ERROR, PERMISSION_DENIED));
 }
 
 TEST_F(CredentialsTest, SetActiveColorModeTest) {
-    const auto display = SurfaceComposerClient::getInternalDisplayToken();
+    const auto display = getFirstDisplayToken();
     std::function<status_t()> condition = [=]() {
         return SurfaceComposerClient::setActiveColorMode(display, ui::ColorMode::NATIVE);
     };
@@ -229,14 +233,14 @@ TEST_F(CredentialsTest, SetActiveColorModeTest) {
 TEST_F(CredentialsTest, CreateDisplayTest) {
     // Only graphics and system processes can create a secure display.
     std::function<bool()> condition = [=]() {
-        sp<IBinder> testDisplay = SurfaceComposerClient::createDisplay(DISPLAY_NAME, true);
+        sp<IBinder> testDisplay = SurfaceComposerClient::createVirtualDisplay(kDisplayName, true);
         return testDisplay.get() != nullptr;
     };
 
     // Check with root.
     {
         UIDFaker f(AID_ROOT);
-        ASSERT_FALSE(condition());
+        ASSERT_TRUE(condition());
     }
 
     // Check as a Graphics user.
@@ -264,31 +268,19 @@ TEST_F(CredentialsTest, CreateDisplayTest) {
     }
 
     condition = [=]() {
-        sp<IBinder> testDisplay = SurfaceComposerClient::createDisplay(DISPLAY_NAME, false);
+        sp<IBinder> testDisplay = SurfaceComposerClient::createVirtualDisplay(kDisplayName, false);
         return testDisplay.get() != nullptr;
     };
     ASSERT_NO_FATAL_FAILURE(checkWithPrivileges(condition, true, false));
 }
 
-TEST_F(CredentialsTest, CaptureTest) {
-    const auto display = SurfaceComposerClient::getInternalDisplayToken();
-    std::function<status_t()> condition = [=]() {
-        sp<GraphicBuffer> outBuffer;
-        DisplayCaptureArgs captureArgs;
-        captureArgs.displayToken = display;
-        ScreenCaptureResults captureResults;
-        return ScreenCapture::captureDisplay(captureArgs, captureResults);
-    };
-    ASSERT_NO_FATAL_FAILURE(checkWithPrivileges<status_t>(condition, NO_ERROR, PERMISSION_DENIED));
-}
-
 TEST_F(CredentialsTest, CaptureLayersTest) {
     setupBackgroundSurface();
     sp<GraphicBuffer> outBuffer;
-    std::function<status_t()> condition = [=]() {
+    std::function<status_t()> condition = [=, this]() {
         LayerCaptureArgs captureArgs;
         captureArgs.layerHandle = mBGSurfaceControl->getHandle();
-        captureArgs.sourceCrop = {0, 0, 1, 1};
+        captureArgs.captureArgs.sourceCrop = gui::aidl_utils::toARect(0, 0, 1, 1);
 
         ScreenCaptureResults captureResults;
         return ScreenCapture::captureLayers(captureArgs, captureResults);
@@ -299,41 +291,18 @@ TEST_F(CredentialsTest, CaptureLayersTest) {
 /**
  * The following tests are for methods accessible directly through SurfaceFlinger.
  */
-TEST_F(CredentialsTest, GetLayerDebugInfo) {
-    setupBackgroundSurface();
-    sp<ISurfaceComposer> sf(ComposerService::getComposerService());
-
-    // Historically, only root and shell can access the getLayerDebugInfo which
-    // is called when we call dumpsys. I don't see a reason why we should change this.
-    std::vector<LayerDebugInfo> outLayers;
-    // Check with root.
-    {
-        UIDFaker f(AID_ROOT);
-        ASSERT_EQ(NO_ERROR, sf->getLayerDebugInfo(&outLayers));
-    }
-
-    // Check as a shell.
-    {
-        UIDFaker f(AID_SHELL);
-        ASSERT_EQ(NO_ERROR, sf->getLayerDebugInfo(&outLayers));
-    }
-
-    // Check as anyone else.
-    {
-        UIDFaker f(AID_BIN);
-        ASSERT_EQ(PERMISSION_DENIED, sf->getLayerDebugInfo(&outLayers));
-    }
-}
 
 TEST_F(CredentialsTest, IsWideColorDisplayBasicCorrectness) {
-    const auto display = SurfaceComposerClient::getInternalDisplayToken();
+    const auto display = getFirstDisplayToken();
     ASSERT_FALSE(display == nullptr);
     bool result = false;
     status_t error = SurfaceComposerClient::isWideColorDisplay(display, &result);
     ASSERT_EQ(NO_ERROR, error);
     bool hasWideColorMode = false;
+    const auto id = getFirstDisplayId();
+    ASSERT_TRUE(id);
     ui::DynamicDisplayInfo info;
-    SurfaceComposerClient::getDynamicDisplayInfo(display, &info);
+    SurfaceComposerClient::getDynamicDisplayInfoFromId(*id, &info);
     const auto& colorModes = info.supportedColorModes;
     for (ColorMode colorMode : colorModes) {
         switch (colorMode) {
@@ -350,7 +319,7 @@ TEST_F(CredentialsTest, IsWideColorDisplayBasicCorrectness) {
 }
 
 TEST_F(CredentialsTest, IsWideColorDisplayWithPrivileges) {
-    const auto display = SurfaceComposerClient::getInternalDisplayToken();
+    const auto display = getFirstDisplayToken();
     ASSERT_FALSE(display == nullptr);
     std::function<status_t()> condition = [=]() {
         bool result = false;
@@ -360,12 +329,122 @@ TEST_F(CredentialsTest, IsWideColorDisplayWithPrivileges) {
 }
 
 TEST_F(CredentialsTest, GetActiveColorModeBasicCorrectness) {
-    const auto display = SurfaceComposerClient::getInternalDisplayToken();
-    ASSERT_FALSE(display == nullptr);
+    const auto id = getFirstDisplayId();
+    ASSERT_TRUE(id);
     ui::DynamicDisplayInfo info;
-    SurfaceComposerClient::getDynamicDisplayInfo(display, &info);
+    SurfaceComposerClient::getDynamicDisplayInfoFromId(*id, &info);
     ColorMode colorMode = info.activeColorMode;
     ASSERT_NE(static_cast<ColorMode>(BAD_VALUE), colorMode);
+}
+
+TEST_F(CredentialsTest, TransactionPermissionTest) {
+    WindowInfosListenerUtils windowInfosListenerUtils;
+    std::string name = "Test Layer";
+    sp<IBinder> token = sp<BBinder>::make();
+    WindowInfo windowInfo;
+    windowInfo.name = name;
+    windowInfo.token = token;
+    sp<SurfaceControl> surfaceControl =
+            mComposerClient->createSurface(String8(name.c_str()), 100, 100, PIXEL_FORMAT_RGBA_8888,
+                                           ISurfaceComposerClient::eFXSurfaceBufferState);
+    const Rect crop(0, 0, 100, 100);
+    {
+        UIDFaker f(AID_SYSTEM);
+        Transaction()
+                .setLayerStack(surfaceControl, ui::DEFAULT_LAYER_STACK)
+                .show(surfaceControl)
+                .setLayer(surfaceControl, INT32_MAX - 1)
+                .setCrop(surfaceControl, crop)
+                .setInputWindowInfo(surfaceControl, windowInfo)
+                .apply();
+    }
+
+    // Attempt to set a trusted overlay from a non-privileged process. This should fail silently.
+    {
+        UIDFaker f{AID_BIN};
+        Transaction().setTrustedOverlay(surfaceControl, true).apply(/*synchronous=*/true);
+    }
+
+    // Verify that the layer was not made a trusted overlay.
+    {
+        UIDFaker f(AID_SYSTEM);
+        auto windowIsPresentAndNotTrusted = [&](const std::vector<WindowInfo>& windowInfos) {
+            auto foundWindowInfo =
+                    WindowInfosListenerUtils::findMatchingWindowInfo(windowInfo, windowInfos);
+            if (!foundWindowInfo) {
+                return false;
+            }
+            return !foundWindowInfo->inputConfig.test(WindowInfo::InputConfig::TRUSTED_OVERLAY);
+        };
+        ASSERT_TRUE(
+                windowInfosListenerUtils.waitForWindowInfosPredicate(windowIsPresentAndNotTrusted));
+    }
+
+    // Verify that privileged processes are able to set trusted overlays.
+    {
+        UIDFaker f(AID_SYSTEM);
+        Transaction().setTrustedOverlay(surfaceControl, true).apply(/*synchronous=*/true);
+        auto windowIsPresentAndTrusted = [&](const std::vector<WindowInfo>& windowInfos) {
+            auto foundWindowInfo =
+                    WindowInfosListenerUtils::findMatchingWindowInfo(windowInfo, windowInfos);
+            if (!foundWindowInfo) {
+                return false;
+            }
+            return foundWindowInfo->inputConfig.test(WindowInfo::InputConfig::TRUSTED_OVERLAY);
+        };
+        ASSERT_TRUE(
+                windowInfosListenerUtils.waitForWindowInfosPredicate(windowIsPresentAndTrusted));
+    }
+}
+
+TEST_F(CredentialsTest, DisplayTransactionPermissionTest) {
+    const auto display = getFirstDisplayToken();
+
+    ui::DisplayState displayState;
+    ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getDisplayState(display, &displayState));
+    const ui::Rotation initialOrientation = displayState.orientation;
+
+    // Set display orientation from an untrusted process. This should fail silently.
+    {
+        UIDFaker f{AID_BIN};
+        Transaction transaction;
+        Rect layerStackRect;
+        Rect displayRect;
+        transaction.setDisplayProjection(display, initialOrientation + ui::ROTATION_90,
+                                         layerStackRect, displayRect);
+        transaction.apply(/*synchronous=*/true);
+    }
+
+    // Verify that the display orientation did not change.
+    ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getDisplayState(display, &displayState));
+    ASSERT_EQ(initialOrientation, displayState.orientation);
+
+    // Set display orientation from a trusted process.
+    {
+        UIDFaker f{AID_SYSTEM};
+        Transaction transaction;
+        Rect layerStackRect;
+        Rect displayRect;
+        transaction.setDisplayProjection(display, initialOrientation + ui::ROTATION_90,
+                                         layerStackRect, displayRect);
+        transaction.apply(/*synchronous=*/true);
+    }
+
+    // Verify that the display orientation did change.
+    ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getDisplayState(display, &displayState));
+    ASSERT_EQ(initialOrientation + ui::ROTATION_90, displayState.orientation);
+
+    // Reset orientation
+    {
+        UIDFaker f{AID_SYSTEM};
+        Transaction transaction;
+        Rect layerStackRect;
+        Rect displayRect;
+        transaction.setDisplayProjection(display, initialOrientation, layerStackRect, displayRect);
+        transaction.apply(/*synchronous=*/true);
+    }
+    ASSERT_EQ(NO_ERROR, SurfaceComposerClient::getDisplayState(display, &displayState));
+    ASSERT_EQ(initialOrientation, displayState.orientation);
 }
 
 } // namespace android

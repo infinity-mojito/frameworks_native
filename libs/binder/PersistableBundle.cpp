@@ -82,13 +82,12 @@ namespace os {
          }                                                               \
     }
 
-#define RETURN_IF_ENTRY_ERASED(map, key)                                 \
-    {                                                                    \
-        size_t num_erased = (map).erase(key);                            \
-        if (num_erased) {                                                \
-            ALOGE("Failed at %s:%d (%s)", __FILE__, __LINE__, __func__); \
-            return num_erased;                                           \
-         }                                                               \
+#define RETURN_IF_ENTRY_ERASED(map, key)      \
+    {                                         \
+        size_t num_erased = (map).erase(key); \
+        if (num_erased) {                     \
+            return num_erased;                \
+        }                                     \
     }
 
 status_t PersistableBundle::writeToParcel(Parcel* parcel) const {
@@ -114,7 +113,7 @@ status_t PersistableBundle::writeToParcel(Parcel* parcel) const {
     // Backpatch length. This length value includes the length header.
     parcel->setDataPosition(length_pos);
     size_t length = end_pos - start_pos;
-    if (length > std::numeric_limits<int32_t>::max()) {
+    if (length > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
         ALOGE("Parcel length (%zu) too large to store in 32-bit signed int", length);
         return BAD_VALUE;
     }
@@ -320,7 +319,7 @@ status_t PersistableBundle::writeToParcelInner(Parcel* parcel) const {
      * pairs themselves.
      */
     size_t num_entries = size();
-    if (num_entries > std::numeric_limits<int32_t>::max()) {
+    if (num_entries > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
         ALOGE("The size of this PersistableBundle (%zu) too large to store in 32-bit signed int",
               num_entries);
         return BAD_VALUE;

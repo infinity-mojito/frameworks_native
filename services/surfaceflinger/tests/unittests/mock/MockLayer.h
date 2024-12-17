@@ -17,8 +17,7 @@
 #pragma once
 
 #include <gmock/gmock.h>
-
-#include "Layer.h"
+#include <optional>
 
 namespace android::mock {
 
@@ -26,15 +25,17 @@ class MockLayer : public Layer {
 public:
     MockLayer(SurfaceFlinger* flinger, std::string name)
           : Layer(LayerCreationArgs(flinger, nullptr, std::move(name), 0, {})) {}
+
+    MockLayer(SurfaceFlinger* flinger, std::string name, std::optional<uint32_t> uid)
+          : Layer(LayerCreationArgs(flinger, nullptr, std::move(name), 0, {}, uid)) {}
+
     explicit MockLayer(SurfaceFlinger* flinger) : MockLayer(flinger, "TestLayer") {}
 
-    MOCK_CONST_METHOD0(getType, const char*());
     MOCK_METHOD0(getFrameSelectionPriority, int32_t());
-    MOCK_CONST_METHOD0(isVisible, bool());
     MOCK_METHOD0(createClone, sp<Layer>());
     MOCK_CONST_METHOD0(getFrameRateForLayerTree, FrameRate());
+    MOCK_CONST_METHOD0(getDefaultFrameRateCompatibility, scheduler::FrameRateCompatibility());
     MOCK_CONST_METHOD0(getOwnerUid, uid_t());
-    MOCK_CONST_METHOD0(getDataSpace, ui::Dataspace());
 };
 
 } // namespace android::mock

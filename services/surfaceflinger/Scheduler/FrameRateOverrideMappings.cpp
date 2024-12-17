@@ -15,6 +15,7 @@
  */
 
 #include "FrameRateOverrideMappings.h"
+#include <common/FlagManager.h>
 
 namespace android::scheduler {
 using FrameRateOverride = DisplayEventReceiver::Event::FrameRateOverride;
@@ -30,7 +31,7 @@ std::optional<Fps> FrameRateOverrideMappings::getFrameRateOverrideForUid(
         }
     }
 
-    {
+    if (!FlagManager::getInstance().game_default_frame_rate()) {
         const auto iter = mFrameRateOverridesFromGameManager.find(uid);
         if (iter != mFrameRateOverridesFromGameManager.end()) {
             return iter->second;
@@ -54,18 +55,20 @@ std::optional<Fps> FrameRateOverrideMappings::getFrameRateOverrideForUid(
 std::vector<FrameRateOverride> FrameRateOverrideMappings::getAllFrameRateOverrides(
         bool supportsFrameRateOverrideByContent) {
     std::lock_guard lock(mFrameRateOverridesLock);
+
     std::vector<FrameRateOverride> overrides;
-    overrides.reserve(std::max({mFrameRateOverridesFromGameManager.size(),
-                                mFrameRateOverridesFromBackdoor.size(),
-                                mFrameRateOverridesByContent.size()}));
+    overrides.reserve(maxOverridesCount());
 
     for (const auto& [uid, frameRate] : mFrameRateOverridesFromBackdoor) {
         overrides.emplace_back(FrameRateOverride{uid, frameRate.getValue()});
     }
-    for (const auto& [uid, frameRate] : mFrameRateOverridesFromGameManager) {
-        if (std::find_if(overrides.begin(), overrides.end(),
-                         [uid = uid](auto i) { return i.uid == uid; }) == overrides.end()) {
-            overrides.emplace_back(FrameRateOverride{uid, frameRate.getValue()});
+
+    if (!FlagManager::getInstance().game_default_frame_rate()) {
+        for (const auto& [uid, frameRate] : mFrameRateOverridesFromGameManager) {
+            if (std::find_if(overrides.begin(), overrides.end(),
+                             [uid = uid](auto i) { return i.uid == uid; }) == overrides.end()) {
+                overrides.emplace_back(FrameRateOverride{uid, frameRate.getValue()});
+            }
         }
     }
 
@@ -83,28 +86,36 @@ std::vector<FrameRateOverride> FrameRateOverrideMappings::getAllFrameRateOverrid
     return overrides;
 }
 
-void FrameRateOverrideMappings::dump(std::string& result) const {
-    using base::StringAppendF;
+void FrameRateOverrideMappings::dump(utils::Dumper& dumper) const {
+    using namespace std::string_view_literals;
 
     std::lock_guard lock(mFrameRateOverridesLock);
 
-    StringAppendF(&result, "Frame Rate Overrides (backdoor): {");
-    for (const auto& [uid, frameRate] : mFrameRateOverridesFromBackdoor) {
-        StringAppendF(&result, "[uid: %d frameRate: %s], ", uid, to_string(frameRate).c_str());
-    }
-    StringAppendF(&result, "}\n");
+    const bool hasOverrides = maxOverridesCount() > 0;
+    dumper.dump("FrameRateOverrides"sv, hasOverrides ? ""sv : "none"sv);
 
-    StringAppendF(&result, "Frame Rate Overrides (GameManager): {");
-    for (const auto& [uid, frameRate] : mFrameRateOverridesFromGameManager) {
-        StringAppendF(&result, "[uid: %d frameRate: %s], ", uid, to_string(frameRate).c_str());
-    }
-    StringAppendF(&result, "}\n");
+    if (!hasOverrides) return;
 
-    StringAppendF(&result, "Frame Rate Overrides (setFrameRate): {");
-    for (const auto& [uid, frameRate] : mFrameRateOverridesByContent) {
-        StringAppendF(&result, "[uid: %d frameRate: %s], ", uid, to_string(frameRate).c_str());
+    dump(dumper, "setFrameRate"sv, mFrameRateOverridesByContent);
+    if (!FlagManager::getInstance().game_default_frame_rate()) {
+        dump(dumper, "GameManager"sv, mFrameRateOverridesFromGameManager);
     }
-    StringAppendF(&result, "}\n");
+    dump(dumper, "Backdoor"sv, mFrameRateOverridesFromBackdoor);
+}
+
+void FrameRateOverrideMappings::dump(utils::Dumper& dumper, std::string_view name,
+                                     const UidToFrameRateOverride& overrides) const {
+    if (overrides.empty()) return;
+
+    utils::Dumper::Indent indent(dumper);
+    dumper.dump(name);
+    {
+        utils::Dumper::Indent indent(dumper);
+        for (const auto& [uid, frameRate] : overrides) {
+            using namespace std::string_view_literals;
+            dumper.dump("(uid, frameRate)"sv, uid, frameRate);
+        }
+    }
 }
 
 bool FrameRateOverrideMappings::updateFrameRateOverridesByContent(

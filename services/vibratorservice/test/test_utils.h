@@ -17,7 +17,7 @@
 #ifndef VIBRATORSERVICE_UNITTEST_UTIL_H_
 #define VIBRATORSERVICE_UNITTEST_UTIL_H_
 
-#include <android/hardware/vibrator/IVibrator.h>
+#include <aidl/android/hardware/vibrator/IVibrator.h>
 
 #include <vibratorservice/VibratorHalWrapper.h>
 
@@ -25,24 +25,12 @@ namespace android {
 
 namespace vibrator {
 
-using ::android::hardware::vibrator::ActivePwle;
-using ::android::hardware::vibrator::Braking;
-using ::android::hardware::vibrator::BrakingPwle;
-using ::android::hardware::vibrator::CompositeEffect;
-using ::android::hardware::vibrator::CompositePrimitive;
-using ::android::hardware::vibrator::PrimitivePwle;
-
-// -------------------------------------------------------------------------------------------------
-
-class MockCallbackScheduler : public vibrator::CallbackScheduler {
-public:
-    MOCK_METHOD(void, schedule, (std::function<void()> callback, std::chrono::milliseconds delay),
-                (override));
-};
-
-ACTION(TriggerSchedulerCallback) {
-    arg0();
-}
+using aidl::android::hardware::vibrator::ActivePwle;
+using aidl::android::hardware::vibrator::Braking;
+using aidl::android::hardware::vibrator::BrakingPwle;
+using aidl::android::hardware::vibrator::CompositeEffect;
+using aidl::android::hardware::vibrator::CompositePrimitive;
+using aidl::android::hardware::vibrator::PrimitivePwle;
 
 // -------------------------------------------------------------------------------------------------
 
@@ -83,6 +71,34 @@ public:
 private:
     TestFactory() = delete;
     ~TestFactory() = delete;
+};
+
+class TestCounter {
+public:
+    TestCounter(int32_t init = 0) : mMutex(), mCondVar(), mCount(init) {}
+
+    int32_t get() {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return mCount;
+    }
+
+    void increment() {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mCount += 1;
+        }
+        mCondVar.notify_all();
+    }
+
+    void tryWaitUntilCountIsAtLeast(int32_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mMutex);
+        mCondVar.wait_for(lock, timeout, [&] { return mCount >= count; });
+    }
+
+private:
+    std::mutex mMutex;
+    std::condition_variable mCondVar;
+    int32_t mCount GUARDED_BY(mMutex);
 };
 
 // -------------------------------------------------------------------------------------------------

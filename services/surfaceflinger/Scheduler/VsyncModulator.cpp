@@ -21,9 +21,8 @@
 
 #include "VsyncModulator.h"
 
-#include <android-base/properties.h>
+#include <common/trace.h>
 #include <log/log.h>
-#include <utils/Trace.h>
 
 #include <chrono>
 #include <cinttypes>
@@ -37,10 +36,9 @@ const std::chrono::nanoseconds VsyncModulator::MIN_EARLY_TRANSACTION_TIME = 1ms;
 
 VsyncModulator::VsyncModulator(const VsyncConfigSet& config, Now now)
       : mVsyncConfigSet(config),
-        mNow(now),
-        mTraceDetailedInfo(base::GetBoolProperty("debug.sf.vsync_trace_detailed_info", false)) {}
+        mNow(now) {}
 
-VsyncModulator::VsyncConfig VsyncModulator::setVsyncConfigSet(const VsyncConfigSet& config) {
+VsyncConfig VsyncModulator::setVsyncConfigSet(const VsyncConfigSet& config) {
     std::lock_guard<std::mutex> lock(mMutex);
     mVsyncConfigSet = config;
     return updateVsyncConfigLocked();
@@ -53,14 +51,14 @@ VsyncModulator::VsyncConfigOpt VsyncModulator::setTransactionSchedule(Transactio
         case Schedule::EarlyStart:
             if (token) {
                 mEarlyWakeupRequests.emplace(token);
-                token->linkToDeath(this);
+                token->linkToDeath(sp<DeathRecipient>::fromExisting(this));
             } else {
                 ALOGW("%s: EarlyStart requested without a valid token", __func__);
             }
             break;
         case Schedule::EarlyEnd: {
             if (token && mEarlyWakeupRequests.erase(token) > 0) {
-                token->unlinkToDeath(this);
+                token->unlinkToDeath(sp<DeathRecipient>::fromExisting(this));
             } else {
                 ALOGW("%s: Unexpected EarlyEnd", __func__);
             }
@@ -69,10 +67,6 @@ VsyncModulator::VsyncConfigOpt VsyncModulator::setTransactionSchedule(Transactio
         case Schedule::Late:
             // No change to mEarlyWakeup for non-explicit states.
             break;
-    }
-
-    if (mTraceDetailedInfo) {
-        ATRACE_INT("mEarlyWakeup", static_cast<int>(mEarlyWakeupRequests.size()));
     }
 
     if (mEarlyWakeupRequests.empty() && schedule == Schedule::EarlyEnd) {
@@ -129,7 +123,7 @@ VsyncModulator::VsyncConfigOpt VsyncModulator::onDisplayRefresh(bool usedGpuComp
     return updateVsyncConfig();
 }
 
-VsyncModulator::VsyncConfig VsyncModulator::getVsyncConfig() const {
+VsyncConfig VsyncModulator::getVsyncConfig() const {
     std::lock_guard<std::mutex> lock(mMutex);
     return mVsyncConfig;
 }
@@ -147,7 +141,7 @@ auto VsyncModulator::getNextVsyncConfigType() const -> VsyncConfigType {
     }
 }
 
-const VsyncModulator::VsyncConfig& VsyncModulator::getNextVsyncConfig() const {
+const VsyncConfig& VsyncModulator::getNextVsyncConfig() const {
     switch (getNextVsyncConfigType()) {
         case VsyncConfigType::Early:
             return mVsyncConfigSet.early;
@@ -158,24 +152,28 @@ const VsyncModulator::VsyncConfig& VsyncModulator::getNextVsyncConfig() const {
     }
 }
 
-VsyncModulator::VsyncConfig VsyncModulator::updateVsyncConfig() {
+VsyncConfig VsyncModulator::updateVsyncConfig() {
     std::lock_guard<std::mutex> lock(mMutex);
     return updateVsyncConfigLocked();
 }
 
-VsyncModulator::VsyncConfig VsyncModulator::updateVsyncConfigLocked() {
+VsyncConfig VsyncModulator::updateVsyncConfigLocked() {
     const VsyncConfig& offsets = getNextVsyncConfig();
     mVsyncConfig = offsets;
 
-    if (mTraceDetailedInfo) {
-        const bool isEarly = &offsets == &mVsyncConfigSet.early;
-        const bool isEarlyGpu = &offsets == &mVsyncConfigSet.earlyGpu;
-        const bool isLate = &offsets == &mVsyncConfigSet.late;
+    // Trace config type
+    SFTRACE_INT("Vsync-Early",  &mVsyncConfig == &mVsyncConfigSet.early);
+    SFTRACE_INT("Vsync-EarlyGpu", &mVsyncConfig == &mVsyncConfigSet.earlyGpu);
+    SFTRACE_INT("Vsync-Late", &mVsyncConfig == &mVsyncConfigSet.late);
 
-        ATRACE_INT("Vsync-EarlyOffsetsOn", isEarly);
-        ATRACE_INT("Vsync-EarlyGpuOffsetsOn", isEarlyGpu);
-        ATRACE_INT("Vsync-LateOffsetsOn", isLate);
-    }
+    // Trace early vsync conditions
+    SFTRACE_INT("EarlyWakeupRequests",
+                                 static_cast<int>(mEarlyWakeupRequests.size()));
+    SFTRACE_INT("EarlyTransactionFrames", mEarlyTransactionFrames);
+    SFTRACE_INT("RefreshRateChangePending", mRefreshRateChangePending);
+
+    // Trace early gpu conditions
+    SFTRACE_INT("EarlyGpuFrames", mEarlyGpuFrames);
 
     return offsets;
 }
@@ -183,13 +181,12 @@ VsyncModulator::VsyncConfig VsyncModulator::updateVsyncConfigLocked() {
 void VsyncModulator::binderDied(const wp<IBinder>& who) {
     std::lock_guard<std::mutex> lock(mMutex);
     mEarlyWakeupRequests.erase(who);
-
     static_cast<void>(updateVsyncConfigLocked());
 }
 
-bool VsyncModulator::isVsyncConfigDefault() const {
+bool VsyncModulator::isVsyncConfigEarly() const {
     std::lock_guard<std::mutex> lock(mMutex);
-    return getNextVsyncConfigType() == VsyncConfigType::Late;
+    return getNextVsyncConfigType() != VsyncConfigType::Late;
 }
 
 } // namespace android::scheduler

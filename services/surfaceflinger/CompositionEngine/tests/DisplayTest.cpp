@@ -194,7 +194,7 @@ struct DisplayTestCommon : public testing::Test {
     StrictMock<Hwc2::mock::PowerAdvisor> mPowerAdvisor;
     StrictMock<renderengine::mock::RenderEngine> mRenderEngine;
     StrictMock<mock::CompositionEngine> mCompositionEngine;
-    sp<mock::NativeWindow> mNativeWindow = new StrictMock<mock::NativeWindow>();
+    sp<mock::NativeWindow> mNativeWindow = sp<StrictMock<mock::NativeWindow>>::make();
 };
 
 struct PartialMockDisplayTestCommon : public DisplayTestCommon {
@@ -403,23 +403,18 @@ TEST_F(DisplaySetColorModeTest, setsModeUnlessNoChange) {
     mock::DisplayColorProfile* colorProfile = new StrictMock<mock::DisplayColorProfile>();
     mDisplay->setDisplayColorProfileForTest(std::unique_ptr<DisplayColorProfile>(colorProfile));
 
-    EXPECT_CALL(*colorProfile, getTargetDataspace(_, _, _))
-            .WillRepeatedly(Return(ui::Dataspace::UNKNOWN));
-
     // These values are expected to be the initial state.
     ASSERT_EQ(ui::ColorMode::NATIVE, mDisplay->getState().colorMode);
     ASSERT_EQ(ui::Dataspace::UNKNOWN, mDisplay->getState().dataspace);
     ASSERT_EQ(ui::RenderIntent::COLORIMETRIC, mDisplay->getState().renderIntent);
-    ASSERT_EQ(ui::Dataspace::UNKNOWN, mDisplay->getState().targetDataspace);
 
     // Otherwise if the values are unchanged, nothing happens
     mDisplay->setColorProfile(ColorProfile{ui::ColorMode::NATIVE, ui::Dataspace::UNKNOWN,
-                                           ui::RenderIntent::COLORIMETRIC, ui::Dataspace::UNKNOWN});
+                                           ui::RenderIntent::COLORIMETRIC});
 
     EXPECT_EQ(ui::ColorMode::NATIVE, mDisplay->getState().colorMode);
     EXPECT_EQ(ui::Dataspace::UNKNOWN, mDisplay->getState().dataspace);
     EXPECT_EQ(ui::RenderIntent::COLORIMETRIC, mDisplay->getState().renderIntent);
-    EXPECT_EQ(ui::Dataspace::UNKNOWN, mDisplay->getState().targetDataspace);
 
     // Otherwise if the values are different, updates happen
     EXPECT_CALL(*renderSurface, setBufferDataspace(ui::Dataspace::DISPLAY_P3)).Times(1);
@@ -429,13 +424,11 @@ TEST_F(DisplaySetColorModeTest, setsModeUnlessNoChange) {
             .Times(1);
 
     mDisplay->setColorProfile(ColorProfile{ui::ColorMode::DISPLAY_P3, ui::Dataspace::DISPLAY_P3,
-                                           ui::RenderIntent::TONE_MAP_COLORIMETRIC,
-                                           ui::Dataspace::UNKNOWN});
+                                           ui::RenderIntent::TONE_MAP_COLORIMETRIC});
 
     EXPECT_EQ(ui::ColorMode::DISPLAY_P3, mDisplay->getState().colorMode);
     EXPECT_EQ(ui::Dataspace::DISPLAY_P3, mDisplay->getState().dataspace);
     EXPECT_EQ(ui::RenderIntent::TONE_MAP_COLORIMETRIC, mDisplay->getState().renderIntent);
-    EXPECT_EQ(ui::Dataspace::UNKNOWN, mDisplay->getState().targetDataspace);
 }
 
 TEST_F(DisplaySetColorModeTest, doesNothingForVirtualDisplay) {
@@ -448,19 +441,13 @@ TEST_F(DisplaySetColorModeTest, doesNothingForVirtualDisplay) {
     virtualDisplay->setDisplayColorProfileForTest(
             std::unique_ptr<DisplayColorProfile>(colorProfile));
 
-    EXPECT_CALL(*colorProfile,
-                getTargetDataspace(ui::ColorMode::DISPLAY_P3, ui::Dataspace::DISPLAY_P3,
-                                   ui::Dataspace::UNKNOWN))
-            .WillOnce(Return(ui::Dataspace::UNKNOWN));
-
-    virtualDisplay->setColorProfile(
-            ColorProfile{ui::ColorMode::DISPLAY_P3, ui::Dataspace::DISPLAY_P3,
-                         ui::RenderIntent::TONE_MAP_COLORIMETRIC, ui::Dataspace::UNKNOWN});
+    virtualDisplay->setColorProfile(ColorProfile{ui::ColorMode::DISPLAY_P3,
+                                                 ui::Dataspace::DISPLAY_P3,
+                                                 ui::RenderIntent::TONE_MAP_COLORIMETRIC});
 
     EXPECT_EQ(ui::ColorMode::NATIVE, virtualDisplay->getState().colorMode);
     EXPECT_EQ(ui::Dataspace::UNKNOWN, virtualDisplay->getState().dataspace);
     EXPECT_EQ(ui::RenderIntent::COLORIMETRIC, virtualDisplay->getState().renderIntent);
-    EXPECT_EQ(ui::Dataspace::UNKNOWN, virtualDisplay->getState().targetDataspace);
 }
 
 /*
@@ -524,7 +511,7 @@ TEST_F(DisplaySetReleasedLayersTest, doesNothingIfGpuDisplay) {
     auto args = getDisplayCreationArgsForGpuVirtualDisplay();
     std::shared_ptr<impl::Display> gpuDisplay = impl::createDisplay(mCompositionEngine, args);
 
-    sp<mock::LayerFE> layerXLayerFE = new StrictMock<mock::LayerFE>();
+    sp<mock::LayerFE> layerXLayerFE = sp<StrictMock<mock::LayerFE>>::make();
 
     {
         Output::ReleasedLayers releasedLayers;
@@ -542,7 +529,7 @@ TEST_F(DisplaySetReleasedLayersTest, doesNothingIfGpuDisplay) {
 }
 
 TEST_F(DisplaySetReleasedLayersTest, doesNothingIfNoLayersWithQueuedFrames) {
-    sp<mock::LayerFE> layerXLayerFE = new StrictMock<mock::LayerFE>();
+    sp<mock::LayerFE> layerXLayerFE = sp<StrictMock<mock::LayerFE>>::make();
 
     {
         Output::ReleasedLayers releasedLayers;
@@ -558,7 +545,7 @@ TEST_F(DisplaySetReleasedLayersTest, doesNothingIfNoLayersWithQueuedFrames) {
 }
 
 TEST_F(DisplaySetReleasedLayersTest, setReleasedLayers) {
-    sp<mock::LayerFE> unknownLayer = new StrictMock<mock::LayerFE>();
+    sp<mock::LayerFE> unknownLayer = sp<StrictMock<mock::LayerFE>>::make();
 
     CompositionRefreshArgs refreshArgs;
     refreshArgs.layersWithQueuedFrames.push_back(mLayer1.layerFE);
@@ -880,7 +867,7 @@ TEST_F(DisplayApplyLayerRequestsToLayersTest, applyClientTargetRequests) {
 }
 
 /*
- * Display::presentAndGetFrameFences()
+ * Display::presentFrame()
  */
 
 using DisplayPresentAndGetFrameFencesTest = DisplayWithLayersTestCommon;
@@ -889,7 +876,7 @@ TEST_F(DisplayPresentAndGetFrameFencesTest, returnsNoFencesOnGpuDisplay) {
     auto args = getDisplayCreationArgsForGpuVirtualDisplay();
     auto gpuDisplay{impl::createDisplay(mCompositionEngine, args)};
 
-    auto result = gpuDisplay->presentAndGetFrameFences();
+    auto result = gpuDisplay->presentFrame();
 
     ASSERT_TRUE(result.presentFence.get());
     EXPECT_FALSE(result.presentFence->isValid());
@@ -897,11 +884,11 @@ TEST_F(DisplayPresentAndGetFrameFencesTest, returnsNoFencesOnGpuDisplay) {
 }
 
 TEST_F(DisplayPresentAndGetFrameFencesTest, returnsPresentAndLayerFences) {
-    sp<Fence> presentFence = new Fence();
-    sp<Fence> layer1Fence = new Fence();
-    sp<Fence> layer2Fence = new Fence();
+    sp<Fence> presentFence = sp<Fence>::make();
+    sp<Fence> layer1Fence = sp<Fence>::make();
+    sp<Fence> layer2Fence = sp<Fence>::make();
 
-    EXPECT_CALL(mHwComposer, presentAndGetReleaseFences(HalDisplayId(DEFAULT_DISPLAY_ID), _, _))
+    EXPECT_CALL(mHwComposer, presentAndGetReleaseFences(HalDisplayId(DEFAULT_DISPLAY_ID), _))
             .Times(1);
     EXPECT_CALL(mHwComposer, getPresentFence(HalDisplayId(DEFAULT_DISPLAY_ID)))
             .WillOnce(Return(presentFence));
@@ -913,7 +900,7 @@ TEST_F(DisplayPresentAndGetFrameFencesTest, returnsPresentAndLayerFences) {
             .WillOnce(Return(layer2Fence));
     EXPECT_CALL(mHwComposer, clearReleaseFences(HalDisplayId(DEFAULT_DISPLAY_ID))).Times(1);
 
-    auto result = mDisplay->presentAndGetFrameFences();
+    auto result = mDisplay->presentFrame();
 
     EXPECT_EQ(presentFence, result.presentFence);
 
@@ -949,7 +936,7 @@ TEST_F(DisplayFinishFrameTest, doesNotSkipCompositionIfNotDirtyOnHwcDisplay) {
     mDisplay->setRenderSurfaceForTest(std::unique_ptr<RenderSurface>(renderSurface));
 
     // We expect no calls to queueBuffer if composition was skipped.
-    EXPECT_CALL(*renderSurface, queueBuffer(_)).Times(1);
+    EXPECT_CALL(*renderSurface, queueBuffer(_, _)).Times(1);
 
     // Expect a call to signal no expensive rendering since there is no client composition.
     EXPECT_CALL(mPowerAdvisor, setExpensiveRenderingExpected(DEFAULT_DISPLAY_ID, false));
@@ -959,7 +946,7 @@ TEST_F(DisplayFinishFrameTest, doesNotSkipCompositionIfNotDirtyOnHwcDisplay) {
     mDisplay->editState().layerStackSpace.setContent(Rect(0, 0, 1, 1));
     mDisplay->editState().dirtyRegion = Region::INVALID_REGION;
 
-    mDisplay->finishFrame({}, std::move(mResultWithBuffer));
+    mDisplay->finishFrame(std::move(mResultWithBuffer));
 }
 
 TEST_F(DisplayFinishFrameTest, skipsCompositionIfNotDirty) {
@@ -970,17 +957,41 @@ TEST_F(DisplayFinishFrameTest, skipsCompositionIfNotDirty) {
     gpuDisplay->setRenderSurfaceForTest(std::unique_ptr<RenderSurface>(renderSurface));
 
     // We expect no calls to queueBuffer if composition was skipped.
-    EXPECT_CALL(*renderSurface, queueBuffer(_)).Times(0);
+    EXPECT_CALL(*renderSurface, queueBuffer(_, _)).Times(0);
+    EXPECT_CALL(*renderSurface, beginFrame(false));
 
     gpuDisplay->editState().isEnabled = true;
     gpuDisplay->editState().usesClientComposition = false;
     gpuDisplay->editState().layerStackSpace.setContent(Rect(0, 0, 1, 1));
     gpuDisplay->editState().dirtyRegion = Region::INVALID_REGION;
+    gpuDisplay->editState().lastCompositionHadVisibleLayers = true;
 
-    gpuDisplay->finishFrame({}, std::move(mResultWithoutBuffer));
+    gpuDisplay->beginFrame();
+    gpuDisplay->finishFrame(std::move(mResultWithoutBuffer));
 }
 
-TEST_F(DisplayFinishFrameTest, performsCompositionIfDirty) {
+TEST_F(DisplayFinishFrameTest, skipsCompositionIfEmpty) {
+    auto args = getDisplayCreationArgsForGpuVirtualDisplay();
+    std::shared_ptr<impl::Display> gpuDisplay = impl::createDisplay(mCompositionEngine, args);
+
+    mock::RenderSurface* renderSurface = new StrictMock<mock::RenderSurface>();
+    gpuDisplay->setRenderSurfaceForTest(std::unique_ptr<RenderSurface>(renderSurface));
+
+    // We expect no calls to queueBuffer if composition was skipped.
+    EXPECT_CALL(*renderSurface, queueBuffer(_, _)).Times(0);
+    EXPECT_CALL(*renderSurface, beginFrame(false));
+
+    gpuDisplay->editState().isEnabled = true;
+    gpuDisplay->editState().usesClientComposition = false;
+    gpuDisplay->editState().layerStackSpace.setContent(Rect(0, 0, 1, 1));
+    gpuDisplay->editState().dirtyRegion = Region(Rect(0, 0, 1, 1));
+    gpuDisplay->editState().lastCompositionHadVisibleLayers = false;
+
+    gpuDisplay->beginFrame();
+    gpuDisplay->finishFrame(std::move(mResultWithoutBuffer));
+}
+
+TEST_F(DisplayFinishFrameTest, performsCompositionIfDirtyAndNotEmpty) {
     auto args = getDisplayCreationArgsForGpuVirtualDisplay();
     std::shared_ptr<impl::Display> gpuDisplay = impl::createDisplay(mCompositionEngine, args);
 
@@ -988,13 +999,17 @@ TEST_F(DisplayFinishFrameTest, performsCompositionIfDirty) {
     gpuDisplay->setRenderSurfaceForTest(std::unique_ptr<RenderSurface>(renderSurface));
 
     // We expect a single call to queueBuffer when composition is not skipped.
-    EXPECT_CALL(*renderSurface, queueBuffer(_)).Times(1);
+    EXPECT_CALL(*renderSurface, queueBuffer(_, _)).Times(1);
+    EXPECT_CALL(*renderSurface, beginFrame(true));
 
     gpuDisplay->editState().isEnabled = true;
     gpuDisplay->editState().usesClientComposition = false;
     gpuDisplay->editState().layerStackSpace.setContent(Rect(0, 0, 1, 1));
     gpuDisplay->editState().dirtyRegion = Region(Rect(0, 0, 1, 1));
-    gpuDisplay->finishFrame({}, std::move(mResultWithBuffer));
+    gpuDisplay->editState().lastCompositionHadVisibleLayers = true;
+
+    gpuDisplay->beginFrame();
+    gpuDisplay->finishFrame(std::move(mResultWithBuffer));
 }
 
 /*
@@ -1018,8 +1033,8 @@ struct DisplayFunctionalTest : public testing::Test {
     NiceMock<android::mock::HWComposer> mHwComposer;
     NiceMock<Hwc2::mock::PowerAdvisor> mPowerAdvisor;
     NiceMock<mock::CompositionEngine> mCompositionEngine;
-    sp<mock::NativeWindow> mNativeWindow = new NiceMock<mock::NativeWindow>();
-    sp<mock::DisplaySurface> mDisplaySurface = new NiceMock<mock::DisplaySurface>();
+    sp<mock::NativeWindow> mNativeWindow = sp<NiceMock<mock::NativeWindow>>::make();
+    sp<mock::DisplaySurface> mDisplaySurface = sp<NiceMock<mock::DisplaySurface>>::make();
     std::shared_ptr<Display> mDisplay;
     impl::RenderSurface* mRenderSurface;
 
@@ -1045,15 +1060,15 @@ struct DisplayFunctionalTest : public testing::Test {
     }
 };
 
-TEST_F(DisplayFunctionalTest, postFramebufferCriticalCallsAreOrdered) {
+TEST_F(DisplayFunctionalTest, presentFrameAndReleaseLayersCriticalCallsAreOrdered) {
     InSequence seq;
 
     mDisplay->editState().isEnabled = true;
 
-    EXPECT_CALL(mHwComposer, presentAndGetReleaseFences(_, _, _));
+    EXPECT_CALL(mHwComposer, presentAndGetReleaseFences(_, _));
     EXPECT_CALL(*mDisplaySurface, onFrameCommitted());
-
-    mDisplay->postFramebuffer();
+    constexpr bool kFlushEvenWhenDisabled = false;
+    mDisplay->presentFrameAndReleaseLayers(kFlushEvenWhenDisabled);
 }
 
 } // namespace

@@ -14,25 +14,90 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUT_INPUTDISPATCHER_TOUCHEDWINDOW_H
-#define _UI_INPUT_INPUTDISPATCHER_TOUCHEDWINDOW_H
+#pragma once
+
+#include <gui/WindowInfo.h>
+#include <input/Input.h>
+#include <utils/BitSet.h>
+#include <bitset>
+#include <ostream>
+#include <set>
+#include "InputTarget.h"
 
 namespace android {
-
-namespace gui {
-class WindowInfoHandle;
-}
 
 namespace inputdispatcher {
 
 // Focus tracking for touch.
 struct TouchedWindow {
     sp<gui::WindowInfoHandle> windowHandle;
-    int32_t targetFlags;
-    BitSet32 pointerIds;
+    InputTarget::DispatchMode dispatchMode = InputTarget::DispatchMode::AS_IS;
+    ftl::Flags<InputTarget::Flags> targetFlags;
+
+    // Hovering
+    bool hasHoveringPointers() const;
+    bool hasHoveringPointers(DeviceId deviceId) const;
+    bool hasHoveringPointer(DeviceId deviceId, int32_t pointerId) const;
+    void addHoveringPointer(DeviceId deviceId, const PointerProperties& pointer, float x, float y);
+    void removeHoveringPointer(DeviceId deviceId, int32_t pointerId);
+
+    // Touching
+    bool hasTouchingPointer(DeviceId deviceId, int32_t pointerId) const;
+    bool hasTouchingPointers() const;
+    bool hasTouchingPointers(DeviceId deviceId) const;
+    std::vector<PointerProperties> getTouchingPointers(DeviceId deviceId) const;
+    android::base::Result<void> addTouchingPointers(DeviceId deviceId,
+                                                    const std::vector<PointerProperties>& pointers);
+    void removeTouchingPointer(DeviceId deviceId, int32_t pointerId);
+    void removeTouchingPointers(DeviceId deviceId, std::bitset<MAX_POINTER_ID + 1> pointers);
+    bool hasActiveStylus() const;
+    std::set<DeviceId> getTouchingDeviceIds() const;
+
+    // Pilfering pointers
+    bool hasPilferingPointers(DeviceId deviceId) const;
+    void addPilferingPointers(DeviceId deviceId, std::bitset<MAX_POINTER_ID + 1> pointerIds);
+    void addPilferingPointer(DeviceId deviceId, int32_t pointerId);
+    std::bitset<MAX_POINTER_ID + 1> getPilferingPointers(DeviceId deviceId) const;
+    std::map<DeviceId, std::bitset<MAX_POINTER_ID + 1>> getPilferingPointers() const;
+
+    // Down time
+    std::optional<nsecs_t> getDownTimeInTarget(DeviceId deviceId) const;
+    void trySetDownTimeInTarget(DeviceId deviceId, nsecs_t downTime);
+
+    void removeAllTouchingPointersForDevice(DeviceId deviceId);
+    void removeAllHoveringPointersForDevice(DeviceId deviceId);
+    void clearHoveringPointers(DeviceId deviceId);
+    std::string dump() const;
+
+    struct HoveringPointer {
+        PointerProperties properties;
+        float x;
+        float y;
+    };
+
+    std::vector<DeviceId> eraseHoveringPointersIf(
+            std::function<bool(const PointerProperties&, float /*x*/, float /*y*/)> condition);
+
+private:
+    struct DeviceState {
+        std::vector<PointerProperties> touchingPointers;
+        // The pointer ids of the pointers that this window is currently pilfering, by device
+        std::bitset<MAX_POINTER_ID + 1> pilferingPointerIds;
+        // Time at which the first action down occurred on this window, for each device
+        // NOTE: This is not initialized in case of HOVER entry/exit and DISPATCH_AS_OUTSIDE
+        // scenario.
+        std::optional<nsecs_t> downTimeInTarget;
+        std::vector<HoveringPointer> hoveringPointers;
+
+        bool hasPointers() const { return !touchingPointers.empty() || !hoveringPointers.empty(); };
+    };
+
+    std::map<DeviceId, DeviceState> mDeviceStates;
+
+    static std::string deviceStateToString(const TouchedWindow::DeviceState& state);
 };
+
+std::ostream& operator<<(std::ostream& out, const TouchedWindow& window);
 
 } // namespace inputdispatcher
 } // namespace android
-
-#endif // _UI_INPUT_INPUTDISPATCHER_TOUCHEDWINDOW_H

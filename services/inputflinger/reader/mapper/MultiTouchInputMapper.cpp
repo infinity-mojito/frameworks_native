@@ -16,9 +16,8 @@
 
 #include "../Macros.h"
 
-#include "MultiTouchInputMapper.h"
-
 #include <android/sysprop/InputProperties.sysprop.h>
+#include "MultiTouchInputMapper.h"
 
 namespace android {
 
@@ -27,220 +26,25 @@ namespace android {
 // Maximum number of slots supported when using the slot-based Multitouch Protocol B.
 static constexpr size_t MAX_SLOTS = 32;
 
-// --- MultiTouchMotionAccumulator ---
-
-MultiTouchMotionAccumulator::MultiTouchMotionAccumulator()
-      : mCurrentSlot(-1),
-        mSlots(nullptr),
-        mSlotCount(0),
-        mUsingSlotsProtocol(false),
-        mHaveStylus(false) {}
-
-MultiTouchMotionAccumulator::~MultiTouchMotionAccumulator() {
-    delete[] mSlots;
-}
-
-void MultiTouchMotionAccumulator::configure(InputDeviceContext& deviceContext, size_t slotCount,
-                                            bool usingSlotsProtocol) {
-    mSlotCount = slotCount;
-    mUsingSlotsProtocol = usingSlotsProtocol;
-    mHaveStylus = deviceContext.hasAbsoluteAxis(ABS_MT_TOOL_TYPE);
-
-    delete[] mSlots;
-    mSlots = new Slot[slotCount];
-}
-
-void MultiTouchMotionAccumulator::reset(InputDeviceContext& deviceContext) {
-    // Unfortunately there is no way to read the initial contents of the slots.
-    // So when we reset the accumulator, we must assume they are all zeroes.
-    if (mUsingSlotsProtocol) {
-        // Query the driver for the current slot index and use it as the initial slot
-        // before we start reading events from the device.  It is possible that the
-        // current slot index will not be the same as it was when the first event was
-        // written into the evdev buffer, which means the input mapper could start
-        // out of sync with the initial state of the events in the evdev buffer.
-        // In the extremely unlikely case that this happens, the data from
-        // two slots will be confused until the next ABS_MT_SLOT event is received.
-        // This can cause the touch point to "jump", but at least there will be
-        // no stuck touches.
-        int32_t initialSlot;
-        status_t status = deviceContext.getAbsoluteAxisValue(ABS_MT_SLOT, &initialSlot);
-        if (status) {
-            ALOGD("Could not retrieve current multitouch slot index.  status=%d", status);
-            initialSlot = -1;
-        }
-        clearSlots(initialSlot);
-    } else {
-        clearSlots(-1);
-    }
-}
-
-void MultiTouchMotionAccumulator::clearSlots(int32_t initialSlot) {
-    if (mSlots) {
-        for (size_t i = 0; i < mSlotCount; i++) {
-            mSlots[i].clear();
-        }
-    }
-    mCurrentSlot = initialSlot;
-}
-
-void MultiTouchMotionAccumulator::process(const RawEvent* rawEvent) {
-    if (rawEvent->type == EV_ABS) {
-        bool newSlot = false;
-        if (mUsingSlotsProtocol) {
-            if (rawEvent->code == ABS_MT_SLOT) {
-                mCurrentSlot = rawEvent->value;
-                newSlot = true;
-            }
-        } else if (mCurrentSlot < 0) {
-            mCurrentSlot = 0;
-        }
-
-        if (mCurrentSlot < 0 || size_t(mCurrentSlot) >= mSlotCount) {
-            if (DEBUG_POINTERS) {
-                if (newSlot) {
-                    ALOGW("MultiTouch device emitted invalid slot index %d but it "
-                          "should be between 0 and %zd; ignoring this slot.",
-                          mCurrentSlot, mSlotCount - 1);
-                }
-            }
-        } else {
-            Slot* slot = &mSlots[mCurrentSlot];
-            // If mUsingSlotsProtocol is true, it means the raw pointer has axis info of
-            // ABS_MT_TRACKING_ID and ABS_MT_SLOT, so driver should send a valid trackingId while
-            // updating the slot.
-            if (!mUsingSlotsProtocol) {
-                slot->mInUse = true;
-            }
-
-            switch (rawEvent->code) {
-                case ABS_MT_POSITION_X:
-                    slot->mAbsMTPositionX = rawEvent->value;
-                    warnIfNotInUse(*rawEvent, *slot);
-                    break;
-                case ABS_MT_POSITION_Y:
-                    slot->mAbsMTPositionY = rawEvent->value;
-                    warnIfNotInUse(*rawEvent, *slot);
-                    break;
-                case ABS_MT_TOUCH_MAJOR:
-                    slot->mAbsMTTouchMajor = rawEvent->value;
-                    break;
-                case ABS_MT_TOUCH_MINOR:
-                    slot->mAbsMTTouchMinor = rawEvent->value;
-                    slot->mHaveAbsMTTouchMinor = true;
-                    break;
-                case ABS_MT_WIDTH_MAJOR:
-                    slot->mAbsMTWidthMajor = rawEvent->value;
-                    break;
-                case ABS_MT_WIDTH_MINOR:
-                    slot->mAbsMTWidthMinor = rawEvent->value;
-                    slot->mHaveAbsMTWidthMinor = true;
-                    break;
-                case ABS_MT_ORIENTATION:
-                    slot->mAbsMTOrientation = rawEvent->value;
-                    break;
-                case ABS_MT_TRACKING_ID:
-                    if (mUsingSlotsProtocol && rawEvent->value < 0) {
-                        // The slot is no longer in use but it retains its previous contents,
-                        // which may be reused for subsequent touches.
-                        slot->mInUse = false;
-                    } else {
-                        slot->mInUse = true;
-                        slot->mAbsMTTrackingId = rawEvent->value;
-                    }
-                    break;
-                case ABS_MT_PRESSURE:
-                    slot->mAbsMTPressure = rawEvent->value;
-                    break;
-                case ABS_MT_DISTANCE:
-                    slot->mAbsMTDistance = rawEvent->value;
-                    break;
-                case ABS_MT_TOOL_TYPE:
-                    slot->mAbsMTToolType = rawEvent->value;
-                    slot->mHaveAbsMTToolType = true;
-                    break;
-            }
-        }
-    } else if (rawEvent->type == EV_SYN && rawEvent->code == SYN_MT_REPORT) {
-        // MultiTouch Sync: The driver has returned all data for *one* of the pointers.
-        mCurrentSlot += 1;
-    }
-}
-
-void MultiTouchMotionAccumulator::finishSync() {
-    if (!mUsingSlotsProtocol) {
-        clearSlots(-1);
-    }
-}
-
-bool MultiTouchMotionAccumulator::hasStylus() const {
-    return mHaveStylus;
-}
-
-void MultiTouchMotionAccumulator::warnIfNotInUse(const RawEvent& event, const Slot& slot) {
-    if (!slot.mInUse) {
-        ALOGW("Received unexpected event (0x%0x, 0x%0x) for slot %i with tracking id %i",
-              event.code, event.value, mCurrentSlot, slot.mAbsMTTrackingId);
-    }
-}
-
-// --- MultiTouchMotionAccumulator::Slot ---
-
-MultiTouchMotionAccumulator::Slot::Slot() {
-    clear();
-}
-
-void MultiTouchMotionAccumulator::Slot::clear() {
-    mInUse = false;
-    mHaveAbsMTTouchMinor = false;
-    mHaveAbsMTWidthMinor = false;
-    mHaveAbsMTToolType = false;
-    mAbsMTPositionX = 0;
-    mAbsMTPositionY = 0;
-    mAbsMTTouchMajor = 0;
-    mAbsMTTouchMinor = 0;
-    mAbsMTWidthMajor = 0;
-    mAbsMTWidthMinor = 0;
-    mAbsMTOrientation = 0;
-    mAbsMTTrackingId = -1;
-    mAbsMTPressure = 0;
-    mAbsMTDistance = 0;
-    mAbsMTToolType = 0;
-}
-
-int32_t MultiTouchMotionAccumulator::Slot::getToolType() const {
-    if (mHaveAbsMTToolType) {
-        switch (mAbsMTToolType) {
-            case MT_TOOL_FINGER:
-                return AMOTION_EVENT_TOOL_TYPE_FINGER;
-            case MT_TOOL_PEN:
-                return AMOTION_EVENT_TOOL_TYPE_STYLUS;
-            case MT_TOOL_PALM:
-                return AMOTION_EVENT_TOOL_TYPE_PALM;
-        }
-    }
-    return AMOTION_EVENT_TOOL_TYPE_UNKNOWN;
-}
-
 // --- MultiTouchInputMapper ---
 
-MultiTouchInputMapper::MultiTouchInputMapper(InputDeviceContext& deviceContext)
-      : TouchInputMapper(deviceContext) {}
+MultiTouchInputMapper::MultiTouchInputMapper(InputDeviceContext& deviceContext,
+                                             const InputReaderConfiguration& readerConfig)
+      : TouchInputMapper(deviceContext, readerConfig) {}
 
 MultiTouchInputMapper::~MultiTouchInputMapper() {}
 
-void MultiTouchInputMapper::reset(nsecs_t when) {
-    mMultiTouchMotionAccumulator.reset(getDeviceContext());
-
+std::list<NotifyArgs> MultiTouchInputMapper::reset(nsecs_t when) {
     mPointerIdBits.clear();
-
-    TouchInputMapper::reset(when);
+    mMultiTouchMotionAccumulator.reset(mDeviceContext);
+    return TouchInputMapper::reset(when);
 }
 
-void MultiTouchInputMapper::process(const RawEvent* rawEvent) {
-    TouchInputMapper::process(rawEvent);
+std::list<NotifyArgs> MultiTouchInputMapper::process(const RawEvent& rawEvent) {
+    std::list<NotifyArgs> out = TouchInputMapper::process(rawEvent);
 
     mMultiTouchMotionAccumulator.process(rawEvent);
+    return out;
 }
 
 std::optional<int32_t> MultiTouchInputMapper::getActiveBitId(
@@ -264,14 +68,14 @@ void MultiTouchInputMapper::syncTouch(nsecs_t when, RawState* outState) {
     mHavePointerIds = true;
 
     for (size_t inIndex = 0; inIndex < inCount; inIndex++) {
-        const MultiTouchMotionAccumulator::Slot* inSlot =
+        const MultiTouchMotionAccumulator::Slot& inSlot =
                 mMultiTouchMotionAccumulator.getSlot(inIndex);
-        if (!inSlot->isInUse()) {
+        if (!inSlot.isInUse()) {
             continue;
         }
 
-        if (inSlot->getToolType() == AMOTION_EVENT_TOOL_TYPE_PALM) {
-            std::optional<int32_t> id = getActiveBitId(*inSlot);
+        if (inSlot.getToolType() == ToolType::PALM) {
+            std::optional<int32_t> id = getActiveBitId(inSlot);
             if (id) {
                 outState->rawPointerData.canceledIdBits.markBit(id.value());
             }
@@ -292,44 +96,56 @@ void MultiTouchInputMapper::syncTouch(nsecs_t when, RawState* outState) {
         }
 
         RawPointerData::Pointer& outPointer = outState->rawPointerData.pointers[outCount];
-        outPointer.x = inSlot->getX();
-        outPointer.y = inSlot->getY();
-        outPointer.pressure = inSlot->getPressure();
-        outPointer.touchMajor = inSlot->getTouchMajor();
-        outPointer.touchMinor = inSlot->getTouchMinor();
-        outPointer.toolMajor = inSlot->getToolMajor();
-        outPointer.toolMinor = inSlot->getToolMinor();
-        outPointer.orientation = inSlot->getOrientation();
-        outPointer.distance = inSlot->getDistance();
+        outPointer.x = inSlot.getX();
+        outPointer.y = inSlot.getY();
+        outPointer.pressure = inSlot.getPressure();
+        outPointer.touchMajor = inSlot.getTouchMajor();
+        outPointer.touchMinor = inSlot.getTouchMinor();
+        outPointer.toolMajor = inSlot.getToolMajor();
+        outPointer.toolMinor = inSlot.getToolMinor();
+        outPointer.orientation = inSlot.getOrientation();
+        outPointer.distance = inSlot.getDistance();
         outPointer.tiltX = 0;
         outPointer.tiltY = 0;
 
-        outPointer.toolType = inSlot->getToolType();
-        if (outPointer.toolType == AMOTION_EVENT_TOOL_TYPE_UNKNOWN) {
+        outPointer.toolType = inSlot.getToolType();
+        if (outPointer.toolType == ToolType::UNKNOWN) {
             outPointer.toolType = mTouchButtonAccumulator.getToolType();
-            if (outPointer.toolType == AMOTION_EVENT_TOOL_TYPE_UNKNOWN) {
-                outPointer.toolType = AMOTION_EVENT_TOOL_TYPE_FINGER;
+            if (outPointer.toolType == ToolType::UNKNOWN) {
+                outPointer.toolType = ToolType::FINGER;
+            }
+        } else if (outPointer.toolType == ToolType::STYLUS && !mStylusMtToolSeen) {
+            mStylusMtToolSeen = true;
+            // The multi-touch device produced a stylus event with MT_TOOL_PEN. Dynamically
+            // re-configure this input device so that we add SOURCE_STYLUS if we haven't already.
+            // This is to cover the case where we cannot reliably detect whether a multi-touch
+            // device will ever produce stylus events when it is initially being configured.
+            if (!isFromSource(mSource, AINPUT_SOURCE_STYLUS)) {
+                // Add the stylus source immediately so that it is included in any events generated
+                // before we have a chance to re-configure the device.
+                mSource |= AINPUT_SOURCE_STYLUS;
+                bumpGeneration();
             }
         }
-        if (shouldSimulateStylusWithTouch() &&
-            outPointer.toolType == AMOTION_EVENT_TOOL_TYPE_FINGER) {
-            outPointer.toolType = AMOTION_EVENT_TOOL_TYPE_STYLUS;
+        if (mShouldSimulateStylusWithTouch && outPointer.toolType == ToolType::FINGER) {
+            outPointer.toolType = ToolType::STYLUS;
         }
 
-        bool isHovering = mTouchButtonAccumulator.getToolType() != AMOTION_EVENT_TOOL_TYPE_MOUSE &&
+        bool isHovering = mTouchButtonAccumulator.getToolType() != ToolType::MOUSE &&
                 (mTouchButtonAccumulator.isHovering() ||
-                 (mRawPointerAxes.pressure.valid && inSlot->getPressure() <= 0));
+                 (mRawPointerAxes.pressure && inSlot.getPressure() <= 0));
         outPointer.isHovering = isHovering;
 
         // Assign pointer id using tracking id if available.
         if (mHavePointerIds) {
-            int32_t trackingId = inSlot->getTrackingId();
+            const int32_t trackingId = inSlot.getTrackingId();
             int32_t id = -1;
             if (trackingId >= 0) {
                 for (BitSet32 idBits(mPointerIdBits); !idBits.isEmpty();) {
                     uint32_t n = idBits.clearFirstMarkedBit();
                     if (mPointerTrackingIdMap[n] == trackingId) {
                         id = n;
+                        break;
                     }
                 }
 
@@ -358,24 +174,42 @@ void MultiTouchInputMapper::syncTouch(nsecs_t when, RawState* outState) {
     mMultiTouchMotionAccumulator.finishSync();
 }
 
+std::list<NotifyArgs> MultiTouchInputMapper::reconfigure(nsecs_t when,
+                                                         const InputReaderConfiguration& config,
+                                                         ConfigurationChanges changes) {
+    const bool simulateStylusWithTouch =
+            sysprop::InputProperties::simulate_stylus_with_touch().value_or(false);
+    if (simulateStylusWithTouch != mShouldSimulateStylusWithTouch) {
+        mShouldSimulateStylusWithTouch = simulateStylusWithTouch;
+        bumpGeneration();
+    }
+    return TouchInputMapper::reconfigure(when, config, changes);
+}
+
 void MultiTouchInputMapper::configureRawPointerAxes() {
     TouchInputMapper::configureRawPointerAxes();
 
-    getAbsoluteAxisInfo(ABS_MT_POSITION_X, &mRawPointerAxes.x);
-    getAbsoluteAxisInfo(ABS_MT_POSITION_Y, &mRawPointerAxes.y);
-    getAbsoluteAxisInfo(ABS_MT_TOUCH_MAJOR, &mRawPointerAxes.touchMajor);
-    getAbsoluteAxisInfo(ABS_MT_TOUCH_MINOR, &mRawPointerAxes.touchMinor);
-    getAbsoluteAxisInfo(ABS_MT_WIDTH_MAJOR, &mRawPointerAxes.toolMajor);
-    getAbsoluteAxisInfo(ABS_MT_WIDTH_MINOR, &mRawPointerAxes.toolMinor);
-    getAbsoluteAxisInfo(ABS_MT_ORIENTATION, &mRawPointerAxes.orientation);
-    getAbsoluteAxisInfo(ABS_MT_PRESSURE, &mRawPointerAxes.pressure);
-    getAbsoluteAxisInfo(ABS_MT_DISTANCE, &mRawPointerAxes.distance);
-    getAbsoluteAxisInfo(ABS_MT_TRACKING_ID, &mRawPointerAxes.trackingId);
-    getAbsoluteAxisInfo(ABS_MT_SLOT, &mRawPointerAxes.slot);
+    // TODO(b/351870641): Investigate why we are sometime not getting valid axis infos for the x/y
+    //   axes, even though those axes are required to be supported.
+    if (const auto xInfo = getAbsoluteAxisInfo(ABS_MT_POSITION_X); xInfo.has_value()) {
+        mRawPointerAxes.x = *xInfo;
+    }
+    if (const auto yInfo = getAbsoluteAxisInfo(ABS_MT_POSITION_Y); yInfo.has_value()) {
+        mRawPointerAxes.y = *yInfo;
+    }
+    mRawPointerAxes.touchMajor = getAbsoluteAxisInfo(ABS_MT_TOUCH_MAJOR);
+    mRawPointerAxes.touchMinor = getAbsoluteAxisInfo(ABS_MT_TOUCH_MINOR);
+    mRawPointerAxes.toolMajor = getAbsoluteAxisInfo(ABS_MT_WIDTH_MAJOR);
+    mRawPointerAxes.toolMinor = getAbsoluteAxisInfo(ABS_MT_WIDTH_MINOR);
+    mRawPointerAxes.orientation = getAbsoluteAxisInfo(ABS_MT_ORIENTATION);
+    mRawPointerAxes.pressure = getAbsoluteAxisInfo(ABS_MT_PRESSURE);
+    mRawPointerAxes.distance = getAbsoluteAxisInfo(ABS_MT_DISTANCE);
+    mRawPointerAxes.trackingId = getAbsoluteAxisInfo(ABS_MT_TRACKING_ID);
+    mRawPointerAxes.slot = getAbsoluteAxisInfo(ABS_MT_SLOT);
 
-    if (mRawPointerAxes.trackingId.valid && mRawPointerAxes.slot.valid &&
-        mRawPointerAxes.slot.minValue == 0 && mRawPointerAxes.slot.maxValue > 0) {
-        size_t slotCount = mRawPointerAxes.slot.maxValue + 1;
+    if (mRawPointerAxes.trackingId && mRawPointerAxes.slot && mRawPointerAxes.slot->minValue == 0 &&
+        mRawPointerAxes.slot->maxValue > 0) {
+        size_t slotCount = mRawPointerAxes.slot->maxValue + 1;
         if (slotCount > MAX_SLOTS) {
             ALOGW("MultiTouch Device %s reported %zu slots but the framework "
                   "only supports a maximum of %zu slots at this time.",
@@ -383,23 +217,16 @@ void MultiTouchInputMapper::configureRawPointerAxes() {
             slotCount = MAX_SLOTS;
         }
         mMultiTouchMotionAccumulator.configure(getDeviceContext(), slotCount,
-                                               true /*usingSlotsProtocol*/);
+                                               /*usingSlotsProtocol=*/true);
     } else {
         mMultiTouchMotionAccumulator.configure(getDeviceContext(), MAX_POINTERS,
-                                               false /*usingSlotsProtocol*/);
+                                               /*usingSlotsProtocol=*/false);
     }
 }
 
 bool MultiTouchInputMapper::hasStylus() const {
-    return mMultiTouchMotionAccumulator.hasStylus() || mTouchButtonAccumulator.hasStylus() ||
-            shouldSimulateStylusWithTouch();
-}
-
-bool MultiTouchInputMapper::shouldSimulateStylusWithTouch() const {
-    static const bool SIMULATE_STYLUS_WITH_TOUCH =
-            sysprop::InputProperties::simulate_stylus_with_touch().value_or(false);
-    return SIMULATE_STYLUS_WITH_TOUCH &&
-            mParameters.deviceType == Parameters::DeviceType::TOUCH_SCREEN;
+    return mStylusMtToolSeen || mTouchButtonAccumulator.hasStylus() ||
+            mShouldSimulateStylusWithTouch;
 }
 
 } // namespace android

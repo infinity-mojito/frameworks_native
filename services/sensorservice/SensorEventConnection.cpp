@@ -23,6 +23,7 @@
 #include <sensor/SensorEventQueue.h>
 
 #include "vec.h"
+#include "BatteryService.h"
 #include "SensorEventConnection.h"
 #include "SensorDevice.h"
 
@@ -55,14 +56,13 @@ SensorService::SensorEventConnection::SensorEventConnection(
 SensorService::SensorEventConnection::~SensorEventConnection() {
     ALOGD_IF(DEBUG_CONNECTIONS, "~SensorEventConnection(%p)", this);
     destroy();
-    mService->cleanupConnection(this);
-    if (mEventCache != nullptr) {
-        delete[] mEventCache;
-    }
+    delete[] mEventCache;
 }
 
 void SensorService::SensorEventConnection::destroy() {
-    mDestroyed = true;
+    if (!mDestroyed.exchange(true)) {
+      mService->cleanupConnection(this);
+    }
 }
 
 void SensorService::SensorEventConnection::onFirstRef() {
@@ -82,7 +82,7 @@ void SensorService::SensorEventConnection::resetWakeLockRefCount() {
 void SensorService::SensorEventConnection::dump(String8& result) {
     Mutex::Autolock _l(mConnectionLock);
     result.appendFormat("\tOperating Mode: ");
-    if (!mService->isWhiteListedPackage(getPackageName())) {
+    if (!mService->isAllowListedPackage(getPackageName())) {
         result.append("RESTRICTED\n");
     } else if (mDataInjectionMode) {
         result.append("DATA_INJECTION\n");
@@ -90,15 +90,14 @@ void SensorService::SensorEventConnection::dump(String8& result) {
         result.append("NORMAL\n");
     }
     result.appendFormat("\t %s | WakeLockRefCount %d | uid %d | cache size %d | "
-            "max cache size %d\n", mPackageName.string(), mWakeLockRefCount, mUid, mCacheSize,
-            mMaxCacheSize);
+                        "max cache size %d | has sensor access: %s\n",
+                        mPackageName.c_str(), mWakeLockRefCount, mUid, mCacheSize, mMaxCacheSize,
+                        hasSensorAccess() ? "true" : "false");
     for (auto& it : mSensorInfo) {
         const FlushInfo& flushInfo = it.second;
-        result.appendFormat("\t %s 0x%08x | status: %s | pending flush events %d \n",
-                            mService->getSensorName(it.first).string(),
-                            it.first,
-                            flushInfo.mFirstFlushPending ? "First flush pending" :
-                                                           "active",
+        result.appendFormat("\t %s 0x%08x | first flush pending: %s | pending flush events %d \n",
+                            mService->getSensorName(it.first).c_str(), it.first,
+                            flushInfo.mFirstFlushPending ? "true" : "false",
                             flushInfo.mPendingFlushEventsToSend);
     }
 #if DEBUG_CONNECTIONS
@@ -124,14 +123,14 @@ void SensorService::SensorEventConnection::dump(util::ProtoOutputStream* proto) 
     using namespace service::SensorEventConnectionProto;
     Mutex::Autolock _l(mConnectionLock);
 
-    if (!mService->isWhiteListedPackage(getPackageName())) {
+    if (!mService->isAllowListedPackage(getPackageName())) {
         proto->write(OPERATING_MODE, OP_MODE_RESTRICTED);
     } else if (mDataInjectionMode) {
         proto->write(OPERATING_MODE, OP_MODE_DATA_INJECTION);
     } else {
         proto->write(OPERATING_MODE, OP_MODE_NORMAL);
     }
-    proto->write(PACKAGE_NAME, std::string(mPackageName.string()));
+    proto->write(PACKAGE_NAME, std::string(mPackageName.c_str()));
     proto->write(WAKE_LOCK_REF_COUNT, int32_t(mWakeLockRefCount));
     proto->write(UID, int32_t(mUid));
     proto->write(CACHE_SIZE, int32_t(mCacheSize));
@@ -160,7 +159,7 @@ void SensorService::SensorEventConnection::dump(util::ProtoOutputStream* proto) 
 
 bool SensorService::SensorEventConnection::addSensor(int32_t handle) {
     Mutex::Autolock _l(mConnectionLock);
-    sp<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
+    std::shared_ptr<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
     if (si == nullptr ||
         !mService->canAccessSensor(si->getSensor(), "Add to SensorEventConnection: ",
                                    mOpPackageName) ||
@@ -173,7 +172,7 @@ bool SensorService::SensorEventConnection::addSensor(int32_t handle) {
 
 bool SensorService::SensorEventConnection::removeSensor(int32_t handle) {
     Mutex::Autolock _l(mConnectionLock);
-    if (mSensorInfo.erase(handle) >= 0) {
+    if (mSensorInfo.erase(handle) > 0) {
         return true;
     }
     return false;
@@ -202,7 +201,7 @@ bool SensorService::SensorEventConnection::hasOneShotSensors() const {
     Mutex::Autolock _l(mConnectionLock);
     for (auto &it : mSensorInfo) {
         const int handle = it.first;
-        sp<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
+        std::shared_ptr<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
         if (si != nullptr && si->getSensor().getReportingMode() == AREPORTING_MODE_ONE_SHOT) {
             return true;
         }
@@ -245,7 +244,7 @@ void SensorService::SensorEventConnection::updateLooperRegistrationLocked(
     if (mDataInjectionMode) looper_flags |= ALOOPER_EVENT_INPUT;
     for (auto& it : mSensorInfo) {
         const int handle = it.first;
-        sp<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
+        std::shared_ptr<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
         if (si != nullptr && si->getSensor().isWakeUpSensor()) {
             looper_flags |= ALOOPER_EVENT_INPUT;
         }
@@ -392,6 +391,8 @@ status_t SensorService::SensorEventConnection::sendEvents(
     if (hasSensorAccess()) {
         index_wake_up_event = findWakeUpSensorEventLocked(scratch, count);
         if (index_wake_up_event >= 0) {
+            BatteryService::noteWakeupSensorEvent(scratch[index_wake_up_event].timestamp,
+                                                  mUid, scratch[index_wake_up_event].sensor);
             scratch[index_wake_up_event].flags |= WAKE_UP_SENSOR_EVENT_NEEDS_ACK;
             ++mWakeLockRefCount;
 #if DEBUG_CONNECTIONS
@@ -459,16 +460,18 @@ bool SensorService::SensorEventConnection::noteOpIfRequired(const sensors_event_
         // is pre-Q, still permit delivering events to the app even if permission isn't granted
         // (since this permission was only introduced in Q)
         if ((event.type == SENSOR_TYPE_STEP_COUNTER || event.type == SENSOR_TYPE_STEP_DETECTOR) &&
-                mTargetSdk > 0 && mTargetSdk <= __ANDROID_API_P__) {
+            mTargetSdk > 0 && mTargetSdk <= __ANDROID_API_P__) {
+            success = true;
+        } else if (mUid == AID_SYSTEM) {
+            // Allow access if it is requested from system.
             success = true;
         } else {
             int32_t sensorHandle = event.sensor;
             String16 noteMsg("Sensor event (");
             noteMsg.append(String16(mService->getSensorStringType(sensorHandle)));
             noteMsg.append(String16(")"));
-            int32_t appOpMode = mService->sAppOpsManager.noteOp(iter->second, mUid,
-                                                                mOpPackageName, mAttributionTag,
-                                                                noteMsg);
+            int32_t appOpMode = mService->sAppOpsManager.noteOp(iter->second, mUid, mOpPackageName,
+                                                                mAttributionTag, noteMsg);
             success = (appOpMode == AppOpsManager::MODE_ALLOWED);
         }
     }
@@ -555,7 +558,7 @@ void SensorService::SensorEventConnection::sendPendingFlushEventsLocked() {
     // flush complete events to be sent.
     for (auto& it : mSensorInfo) {
         const int handle = it.first;
-        sp<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
+        std::shared_ptr<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
         if (si == nullptr) {
             continue;
         }
@@ -689,7 +692,7 @@ status_t SensorService::SensorEventConnection::enableDisable(
     if (enabled) {
         nsecs_t requestedSamplingPeriodNs = samplingPeriodNs;
         bool isSensorCapped = false;
-        sp<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
+        std::shared_ptr<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
         if (si != nullptr) {
             const Sensor& s = si->getSensor();
             if (mService->isSensorInCappedSet(s.getType())) {
@@ -708,14 +711,17 @@ status_t SensorService::SensorEventConnection::enableDisable(
         if (err == OK && isSensorCapped) {
             if ((requestedSamplingPeriodNs >= SENSOR_SERVICE_CAPPED_SAMPLING_PERIOD_NS) ||
                 !isRateCappedBasedOnPermission()) {
+                Mutex::Autolock _l(mConnectionLock);
                 mMicSamplingPeriodBackup[handle] = requestedSamplingPeriodNs;
             } else {
+                Mutex::Autolock _l(mConnectionLock);
                 mMicSamplingPeriodBackup[handle] = SENSOR_SERVICE_CAPPED_SAMPLING_PERIOD_NS;
             }
         }
 
     } else {
         err = mService->disable(this, handle);
+        Mutex::Autolock _l(mConnectionLock);
         mMicSamplingPeriodBackup.erase(handle);
     }
     return err;
@@ -729,7 +735,7 @@ status_t SensorService::SensorEventConnection::setEventRate(int handle, nsecs_t 
 
     nsecs_t requestedSamplingPeriodNs = samplingPeriodNs;
     bool isSensorCapped = false;
-    sp<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
+    std::shared_ptr<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
     if (si != nullptr) {
         const Sensor& s = si->getSensor();
         if (mService->isSensorInCappedSet(s.getType())) {
@@ -747,8 +753,10 @@ status_t SensorService::SensorEventConnection::setEventRate(int handle, nsecs_t 
     if (ret == OK && isSensorCapped) {
         if ((requestedSamplingPeriodNs >= SENSOR_SERVICE_CAPPED_SAMPLING_PERIOD_NS) ||
             !isRateCappedBasedOnPermission()) {
+            Mutex::Autolock _l(mConnectionLock);
             mMicSamplingPeriodBackup[handle] = requestedSamplingPeriodNs;
         } else {
+            Mutex::Autolock _l(mConnectionLock);
             mMicSamplingPeriodBackup[handle] = SENSOR_SERVICE_CAPPED_SAMPLING_PERIOD_NS;
         }
     }
@@ -846,13 +854,18 @@ int SensorService::SensorEventConnection::handleEvent(int fd, int events, void* 
             if (numBytesRead == sizeof(sensors_event_t)) {
                 if (!mDataInjectionMode) {
                     ALOGE("Data injected in normal mode, dropping event"
-                          "package=%s uid=%d", mPackageName.string(), mUid);
+                          "package=%s uid=%d", mPackageName.c_str(), mUid);
                     // Unregister call backs.
+                    return 0;
+                }
+                if (!mService->isAllowListedPackage(mPackageName)) {
+                    ALOGE("App not allowed to inject data, dropping event"
+                          "package=%s uid=%d", mPackageName.c_str(), mUid);
                     return 0;
                 }
                 sensors_event_t sensor_event;
                 memcpy(&sensor_event, buf, sizeof(sensors_event_t));
-                sp<SensorInterface> si =
+                std::shared_ptr<SensorInterface> si =
                         mService->getSensorInterfaceFromHandle(sensor_event.sensor);
                 if (si == nullptr) {
                     return 1;
@@ -903,7 +916,7 @@ int SensorService::SensorEventConnection::computeMaxCacheSizeLocked() const {
     size_t fifoWakeUpSensors = 0;
     size_t fifoNonWakeUpSensors = 0;
     for (auto& it : mSensorInfo) {
-        sp<SensorInterface> si = mService->getSensorInterfaceFromHandle(it.first);
+        std::shared_ptr<SensorInterface> si = mService->getSensorInterfaceFromHandle(it.first);
         if (si == nullptr) {
             continue;
         }

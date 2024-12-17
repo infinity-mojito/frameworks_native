@@ -32,61 +32,65 @@ namespace android {
 
 TEST(UtilsHost, ExecuteImmediately) {
     auto result = execute({"echo", "foo"}, nullptr);
-    ASSERT_THAT(result, Ok());
+    ASSERT_TRUE(result.has_value());
     EXPECT_THAT(result->exitCode, Optional(EX_OK));
     EXPECT_EQ(result->stdoutStr, "foo\n");
 }
 
+template <typename T>
+auto millisSince(std::chrono::time_point<T> now) {
+    auto elapsed = std::chrono::system_clock::now() - now;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+}
+
 TEST(UtilsHost, ExecuteLongRunning) {
-    auto now = std::chrono::system_clock::now();
+    auto start = std::chrono::system_clock::now();
 
     {
-        std::vector<std::string> args{"sh", "-c",
-                                      "sleep 0.5 && echo -n f && sleep 0.5 && echo oo && sleep 1"};
-        auto result = execute(std::move(args), [](const CommandResult& commandResult) {
+        std::vector<std::string>
+                args{"sh", "-c", "sleep 0.5 && echo -n f && sleep 0.5 && echo oo && sleep 100"};
+        auto result = execute(std::move(args), [&](const CommandResult& commandResult) {
+            std::cout << millisSince(start)
+                      << "ms: GOT PARTIAL COMMAND RESULT:" << commandResult.stdoutStr << std::endl;
             return android::base::EndsWith(commandResult.stdoutStr, "\n");
         });
-        auto elapsed = std::chrono::system_clock::now() - now;
-        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+        auto elapsedMs = millisSince(start);
         EXPECT_GE(elapsedMs, 1000);
         EXPECT_LT(elapsedMs, 2000);
 
-        ASSERT_THAT(result, Ok());
+        ASSERT_TRUE(result.has_value());
         EXPECT_EQ(std::nullopt, result->exitCode);
         EXPECT_EQ(result->stdoutStr, "foo\n");
     }
 
     // ~CommandResult() called, child process is killed.
     // Assert that the second sleep does not finish.
-    auto elapsed = std::chrono::system_clock::now() - now;
-    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-    EXPECT_LT(elapsedMs, 2000);
+    EXPECT_LT(millisSince(start), 2000);
 }
 
 TEST(UtilsHost, ExecuteLongRunning2) {
-    auto now = std::chrono::system_clock::now();
+    auto start = std::chrono::system_clock::now();
 
     {
         std::vector<std::string> args{"sh", "-c",
-                                      "sleep 2 && echo -n f && sleep 2 && echo oo && sleep 2"};
-        auto result = execute(std::move(args), [](const CommandResult& commandResult) {
+                                      "sleep 2 && echo -n f && sleep 2 && echo oo && sleep 100"};
+        auto result = execute(std::move(args), [&](const CommandResult& commandResult) {
+            std::cout << millisSince(start)
+                      << "ms: GOT PARTIAL COMMAND RESULT:" << commandResult.stdoutStr << std::endl;
             return android::base::EndsWith(commandResult.stdoutStr, "\n");
         });
-        auto elapsed = std::chrono::system_clock::now() - now;
-        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+        auto elapsedMs = millisSince(start);
         EXPECT_GE(elapsedMs, 4000);
         EXPECT_LT(elapsedMs, 6000);
 
-        ASSERT_THAT(result, Ok());
+        ASSERT_TRUE(result.has_value());
         EXPECT_EQ(std::nullopt, result->exitCode);
         EXPECT_EQ(result->stdoutStr, "foo\n");
     }
 
     // ~CommandResult() called, child process is killed.
     // Assert that the second sleep does not finish.
-    auto elapsed = std::chrono::system_clock::now() - now;
-    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-    EXPECT_LT(elapsedMs, 6000);
+    EXPECT_LT(millisSince(start), 6000);
 }
 
 TEST(UtilsHost, KillWithSigKill) {
@@ -100,7 +104,7 @@ TEST(UtilsHost, KillWithSigKill) {
         return false;
     });
 
-    ASSERT_THAT(result, Ok());
+    ASSERT_TRUE(result.has_value());
     EXPECT_EQ(std::nullopt, result->exitCode);
     EXPECT_THAT(result->signal, Optional(SIGKILL));
 }

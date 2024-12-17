@@ -14,14 +14,29 @@
  * limitations under the License.
  */
 
-#ifndef _INPUTFLINGER_POINTER_CONTROLLER_INTERFACE_H
-#define _INPUTFLINGER_POINTER_CONTROLLER_INTERFACE_H
+#pragma once
 
 #include <input/DisplayViewport.h>
 #include <input/Input.h>
 #include <utils/BitSet.h>
 
 namespace android {
+
+struct SpriteIcon;
+
+struct FloatPoint {
+    float x;
+    float y;
+
+    inline FloatPoint(float x, float y) : x(x), y(y) {}
+
+    inline explicit FloatPoint(vec2 p) : x(p.x), y(p.y) {}
+
+    template <typename T, typename U>
+    operator std::tuple<T, U>() {
+        return {x, y};
+    }
+};
 
 /**
  * Interface for tracking a mouse / touch pad pointer and touch pad spots.
@@ -35,29 +50,36 @@ namespace android {
  */
 class PointerControllerInterface {
 protected:
-    PointerControllerInterface() { }
-    virtual ~PointerControllerInterface() { }
+    PointerControllerInterface() {}
+    virtual ~PointerControllerInterface() {}
 
 public:
-    /* Gets the bounds of the region that the pointer can traverse.
-     * Returns true if the bounds are available. */
-    virtual bool getBounds(float* outMinX, float* outMinY,
-            float* outMaxX, float* outMaxY) const = 0;
+    /**
+     * Enum used to differentiate various types of PointerControllers for the transition to
+     * using PointerChoreographer.
+     *
+     * TODO(b/293587049): Refactor the PointerController class into different controller types.
+     */
+    enum class ControllerType {
+        // Represents a single mouse pointer.
+        MOUSE,
+        // Represents multiple touch spots.
+        TOUCH,
+        // Represents a single stylus pointer.
+        STYLUS,
+    };
+
+    /* Dumps the state of the pointer controller. */
+    virtual std::string dump() = 0;
 
     /* Move the pointer. */
     virtual void move(float deltaX, float deltaY) = 0;
-
-    /* Sets a mask that indicates which buttons are pressed. */
-    virtual void setButtonState(int32_t buttonState) = 0;
-
-    /* Gets a mask that indicates which buttons are pressed. */
-    virtual int32_t getButtonState() const = 0;
 
     /* Sets the absolute location of the pointer. */
     virtual void setPosition(float x, float y) = 0;
 
     /* Gets the absolute location of the pointer. */
-    virtual void getPosition(float* outX, float* outY) const = 0;
+    virtual FloatPoint getPosition() const = 0;
 
     enum class Transition {
         // Fade/unfade immediately.
@@ -80,6 +102,10 @@ public:
         POINTER,
         // Show spots and a spot anchor in place of the mouse pointer.
         SPOT,
+        // Show the stylus hover pointer.
+        STYLUS_HOVER,
+
+        ftl_last = STYLUS_HOVER,
     };
 
     /* Sets the mode of the pointer controller. */
@@ -95,18 +121,30 @@ public:
      * pressed (not hovering).
      */
     virtual void setSpots(const PointerCoords* spotCoords, const uint32_t* spotIdToIndex,
-            BitSet32 spotIdBits, int32_t displayId) = 0;
+                          BitSet32 spotIdBits, ui::LogicalDisplayId displayId) = 0;
 
     /* Removes all spots. */
     virtual void clearSpots() = 0;
 
     /* Gets the id of the display where the pointer should be shown. */
-    virtual int32_t getDisplayId() const = 0;
+    virtual ui::LogicalDisplayId getDisplayId() const = 0;
 
     /* Sets the associated display of this pointer. Pointer should show on that display. */
     virtual void setDisplayViewport(const DisplayViewport& displayViewport) = 0;
+
+    /* Sets the pointer icon type for mice or styluses. */
+    virtual void updatePointerIcon(PointerIconStyle iconId) = 0;
+
+    /* Sets the custom pointer icon for mice or styluses. */
+    virtual void setCustomPointerIcon(const SpriteIcon& icon) = 0;
+
+    /* Sets the flag to skip screenshot of the pointer indicators on the display for the specified
+     * displayId. This flag can only be reset with resetSkipScreenshotFlags()
+     */
+    virtual void setSkipScreenshotFlagForDisplay(ui::LogicalDisplayId displayId) = 0;
+
+    /* Resets the flag to skip screenshot of the pointer indicators for all displays. */
+    virtual void clearSkipScreenshotFlags() = 0;
 };
 
 } // namespace android
-
-#endif // _INPUTFLINGER_POINTER_CONTROLLER_INTERFACE_H

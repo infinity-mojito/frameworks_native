@@ -41,10 +41,14 @@
 #include <new>
 #include <vector>
 
+#include <com_android_graphics_libvulkan_flags.h>
 #include "stubhal.h"
 
 using namespace android::hardware::configstore;
 using namespace android::hardware::configstore::V1_0;
+using namespace com::android::graphics::libvulkan;
+
+extern "C" android_namespace_t* android_get_exported_namespace(const char*);
 
 // #define ENABLE_ALLOC_CALLSTACKS 1
 #if ENABLE_ALLOC_CALLSTACKS
@@ -159,6 +163,7 @@ const std::array<const char*, 2> HAL_SUBNAME_KEY_PROPERTIES = {{
     "ro.board.platform",
 }};
 constexpr int LIB_DL_FLAGS = RTLD_LOCAL | RTLD_NOW;
+constexpr char RO_VULKAN_APEX_PROPERTY[] = "ro.vulkan.apex";
 
 // LoadDriver returns:
 // * 0 when succeed, or
@@ -166,6 +171,7 @@ constexpr int LIB_DL_FLAGS = RTLD_LOCAL | RTLD_NOW;
 // * -EINVAL when fail to find HAL_MODULE_INFO_SYM_AS_STR or
 //   HWVULKAN_HARDWARE_MODULE_ID in the library.
 int LoadDriver(android_namespace_t* library_namespace,
+               const char* ns_name,
                const hwvulkan_module_t** module) {
     ATRACE_CALL();
 
@@ -183,8 +189,10 @@ int LoadDriver(android_namespace_t* library_namespace,
                 .library_namespace = library_namespace,
             };
             so = android_dlopen_ext(lib_name.c_str(), LIB_DL_FLAGS, &dlextinfo);
-            ALOGE("Could not load %s from updatable gfx driver namespace: %s.",
-                  lib_name.c_str(), dlerror());
+            if (!so) {
+                ALOGE("Could not load %s from %s namespace: %s.",
+                      lib_name.c_str(), ns_name, dlerror());
+            }
         } else {
             // load built-in driver
             so = android_load_sphal_library(lib_name.c_str(), LIB_DL_FLAGS);
@@ -211,12 +219,30 @@ int LoadDriver(android_namespace_t* library_namespace,
     return 0;
 }
 
+int LoadDriverFromApex(const hwvulkan_module_t** module) {
+    ATRACE_CALL();
+
+    auto apex_name = android::base::GetProperty(RO_VULKAN_APEX_PROPERTY, "");
+    if (apex_name == "") {
+        return -ENOENT;
+    }
+    // Get linker namespace for Vulkan APEX
+    std::replace(apex_name.begin(), apex_name.end(), '.', '_');
+    auto ns = android_get_exported_namespace(apex_name.c_str());
+    if (!ns) {
+        return -ENOENT;
+    }
+    android::GraphicsEnv::getInstance().setDriverToLoad(
+        android::GpuStatsInfo::Driver::VULKAN);
+    return LoadDriver(ns, apex_name.c_str(), module);
+}
+
 int LoadBuiltinDriver(const hwvulkan_module_t** module) {
     ATRACE_CALL();
 
     android::GraphicsEnv::getInstance().setDriverToLoad(
         android::GpuStatsInfo::Driver::VULKAN);
-    return LoadDriver(nullptr, module);
+    return LoadDriver(nullptr, nullptr, module);
 }
 
 int LoadUpdatedDriver(const hwvulkan_module_t** module) {
@@ -227,7 +253,7 @@ int LoadUpdatedDriver(const hwvulkan_module_t** module) {
         return -ENOENT;
     android::GraphicsEnv::getInstance().setDriverToLoad(
         android::GpuStatsInfo::Driver::VULKAN_UPDATED);
-    int result = LoadDriver(ns, module);
+    int result = LoadDriver(ns, "updatable gfx driver", module);
     if (result != 0) {
         LOG_ALWAYS_FATAL(
             "couldn't find an updated Vulkan implementation from %s",
@@ -255,6 +281,9 @@ bool Hal::Open() {
     const hwvulkan_module_t* module = nullptr;
 
     result = LoadUpdatedDriver(&module);
+    if (result == -ENOENT) {
+        result = LoadDriverFromApex(&module);
+    }
     if (result == -ENOENT) {
         result = LoadBuiltinDriver(&module);
     }
@@ -312,9 +341,13 @@ void Hal::UnloadBuiltinDriver() {
 
     ALOGD("Unload builtin Vulkan driver.");
 
-    // Close the opened device
-    ALOG_ASSERT(!hal_.dev_->common.close(hal_.dev_->common),
-                "hw_device_t::close() failed.");
+    if (hal_.dev_->common.close != nullptr)
+    {
+        // Close the opened device
+        int err = hal_.dev_->common.close(
+            const_cast<struct hw_device_t*>(&hal_.dev_->common));
+        ALOG_ASSERT(!err, "hw_device_t::close() failed.");
+    }
 
     // Close the opened shared library in the hw_module_t
     android_unload_sphal_library(hal_.dev_->common.module->dso);
@@ -636,6 +669,7 @@ void CreateInfoWrapper::FilterExtension(const char* name) {
             case ProcHook::EXT_swapchain_colorspace:
             case ProcHook::KHR_get_surface_capabilities2:
             case ProcHook::GOOGLE_surfaceless_query:
+            case ProcHook::EXT_surface_maintenance1:
                 hook_extensions_.set(ext_bit);
                 // return now as these extensions do not require HAL support
                 return;
@@ -656,10 +690,13 @@ void CreateInfoWrapper::FilterExtension(const char* name) {
             case ProcHook::KHR_incremental_present:
             case ProcHook::KHR_shared_presentable_image:
             case ProcHook::KHR_swapchain:
+            case ProcHook::KHR_swapchain_mutable_format:
             case ProcHook::EXT_hdr_metadata:
+            case ProcHook::EXT_swapchain_maintenance1:
             case ProcHook::ANDROID_external_memory_android_hardware_buffer:
             case ProcHook::ANDROID_native_buffer:
             case ProcHook::GOOGLE_display_timing:
+            case ProcHook::KHR_external_fence_fd:
             case ProcHook::EXTENSION_CORE_1_0:
             case ProcHook::EXTENSION_CORE_1_1:
             case ProcHook::EXTENSION_CORE_1_2:
@@ -690,16 +727,23 @@ void CreateInfoWrapper::FilterExtension(const char* name) {
                 ext_bit = ProcHook::ANDROID_native_buffer;
                 break;
             case ProcHook::KHR_incremental_present:
-            case ProcHook::GOOGLE_display_timing:
             case ProcHook::KHR_shared_presentable_image:
+            case ProcHook::GOOGLE_display_timing:
                 hook_extensions_.set(ext_bit);
                 // return now as these extensions do not require HAL support
                 return;
+            case ProcHook::EXT_swapchain_maintenance1:
+                // map VK_KHR_swapchain_maintenance1 to KHR_external_fence_fd
+                name = VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME;
+                ext_bit = ProcHook::KHR_external_fence_fd;
+                break;
             case ProcHook::EXT_hdr_metadata:
             case ProcHook::KHR_bind_memory2:
                 hook_extensions_.set(ext_bit);
                 break;
             case ProcHook::ANDROID_external_memory_android_hardware_buffer:
+            case ProcHook::KHR_external_fence_fd:
+            case ProcHook::KHR_swapchain_mutable_format:
             case ProcHook::EXTENSION_UNKNOWN:
                 // Extensions we don't need to do anything about at this level
                 break;
@@ -715,6 +759,7 @@ void CreateInfoWrapper::FilterExtension(const char* name) {
             case ProcHook::KHR_surface_protected_capabilities:
             case ProcHook::EXT_debug_report:
             case ProcHook::EXT_swapchain_colorspace:
+            case ProcHook::EXT_surface_maintenance1:
             case ProcHook::GOOGLE_surfaceless_query:
             case ProcHook::ANDROID_native_buffer:
             case ProcHook::EXTENSION_CORE_1_0:
@@ -747,10 +792,29 @@ void CreateInfoWrapper::FilterExtension(const char* name) {
         if (strcmp(name, props.extensionName) != 0)
             continue;
 
+        if (ext_bit != ProcHook::EXTENSION_UNKNOWN &&
+                hal_extensions_.test(ext_bit)) {
+            ALOGI("CreateInfoWrapper::FilterExtension: already have '%s'.", name);
+            continue;
+        }
+
+        // Ignore duplicate extensions (see: b/288929054)
+        bool duplicate_entry = false;
+        for (uint32_t j = 0; j < filter.name_count; j++) {
+            if (strcmp(name, filter.names[j]) == 0) {
+                duplicate_entry = true;
+                break;
+            }
+        }
+        if (duplicate_entry == true)
+            continue;
+
         filter.names[filter.name_count++] = name;
         if (ext_bit != ProcHook::EXTENSION_UNKNOWN) {
             if (ext_bit == ProcHook::ANDROID_native_buffer)
                 hook_extensions_.set(ProcHook::KHR_swapchain);
+            if (ext_bit == ProcHook::KHR_external_fence_fd)
+                hook_extensions_.set(ProcHook::EXT_swapchain_maintenance1);
 
             hal_extensions_.set(ext_bit);
         }
@@ -907,13 +971,19 @@ PFN_vkVoidFunction GetInstanceProcAddr(VkInstance instance, const char* pName) {
 
 PFN_vkVoidFunction GetDeviceProcAddr(VkDevice device, const char* pName) {
     const ProcHook* hook = GetProcHook(pName);
+    PFN_vkVoidFunction drv_func = GetData(device).driver.GetDeviceProcAddr(device, pName);
+
     if (!hook)
-        return GetData(device).driver.GetDeviceProcAddr(device, pName);
+        return drv_func;
 
     if (hook->type != ProcHook::DEVICE) {
         ALOGE("internal vkGetDeviceProcAddr called for %s", pName);
         return nullptr;
     }
+
+    // Don't hook if we don't have a device entry function below for the core function.
+    if (!drv_func && (hook->extension >= ProcHook::EXTENSION_CORE_1_0))
+        return nullptr;
 
     return (GetData(device).hook_extensions[hook->extension]) ? hook->proc
                                                               : nullptr;
@@ -940,6 +1010,9 @@ VkResult EnumerateInstanceExtensionProperties(
          VK_KHR_GET_SURFACE_CAPABILITIES_2_SPEC_VERSION});
     loader_extensions.push_back({VK_GOOGLE_SURFACELESS_QUERY_EXTENSION_NAME,
                                  VK_GOOGLE_SURFACELESS_QUERY_SPEC_VERSION});
+    loader_extensions.push_back({
+        VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
+        VK_EXT_SURFACE_MAINTENANCE_1_SPEC_VERSION});
 
     static const VkExtensionProperties loader_debug_report_extension = {
         VK_EXT_DEBUG_REPORT_EXTENSION_NAME, VK_EXT_DEBUG_REPORT_SPEC_VERSION,
@@ -1072,6 +1145,33 @@ VkResult GetAndroidNativeBufferSpecVersion9Support(
     return result;
 }
 
+bool CanSupportSwapchainMaintenance1Extension(VkPhysicalDevice physicalDevice) {
+    const auto& driver = GetData(physicalDevice).driver;
+    if (!driver.GetPhysicalDeviceExternalFenceProperties)
+        return false;
+
+    // Requires support for external fences imported from sync fds.
+    // This is _almost_ universal on Android, but may be missing on
+    // some extremely old drivers, or on strange implementations like
+    // cuttlefish.
+    VkPhysicalDeviceExternalFenceInfo fenceInfo = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
+        nullptr,
+        VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT
+    };
+    VkExternalFenceProperties fenceProperties = {
+        VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES,
+        nullptr,
+        0, 0, 0
+    };
+
+    GetPhysicalDeviceExternalFenceProperties(physicalDevice, &fenceInfo, &fenceProperties);
+    if (fenceProperties.externalFenceFeatures & VK_EXTERNAL_FENCE_FEATURE_IMPORTABLE_BIT)
+        return true;
+
+    return false;
+}
+
 VkResult EnumerateDeviceExtensionProperties(
     VkPhysicalDevice physicalDevice,
     const char* pLayerName,
@@ -1147,6 +1247,21 @@ VkResult EnumerateDeviceExtensionProperties(
         loader_extensions.push_back(
             {VK_EXT_IMAGE_COMPRESSION_CONTROL_SWAPCHAIN_EXTENSION_NAME,
              VK_EXT_IMAGE_COMPRESSION_CONTROL_SWAPCHAIN_SPEC_VERSION});
+    }
+
+    if (CanSupportSwapchainMaintenance1Extension(physicalDevice)) {
+        loader_extensions.push_back({
+                VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
+                VK_EXT_SWAPCHAIN_MAINTENANCE_1_SPEC_VERSION});
+    }
+
+    VkPhysicalDeviceProperties pDeviceProperties;
+    data.driver.GetPhysicalDeviceProperties(physicalDevice, &pDeviceProperties);
+    if (flags::swapchain_mutable_format_ext() &&
+        pDeviceProperties.apiVersion >= VK_API_VERSION_1_2) {
+        loader_extensions.push_back(
+            {VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME,
+             VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_SPEC_VERSION});
     }
 
     // enumerate our extensions first
@@ -1266,6 +1381,32 @@ VkResult CreateInstance(const VkInstanceCreateInfo* pCreateInfo,
         return VK_ERROR_INCOMPATIBLE_DRIVER;
     }
 
+    // TODO(b/259516419) avoid getting stats from hwui
+    // const bool reportStats = (pCreateInfo->pApplicationInfo == nullptr )
+    //         || (strcmp("android framework",
+    //         pCreateInfo->pApplicationInfo->pEngineName) != 0);
+    const bool reportStats = true;
+    if (reportStats) {
+        // Set stats for Vulkan api version requested with application info
+        if (pCreateInfo->pApplicationInfo) {
+            const uint32_t vulkanApiVersion =
+                pCreateInfo->pApplicationInfo->apiVersion;
+            android::GraphicsEnv::getInstance().setTargetStats(
+                android::GpuStatsInfo::Stats::CREATED_VULKAN_API_VERSION,
+                vulkanApiVersion);
+
+            if (pCreateInfo->pApplicationInfo->pEngineName) {
+                android::GraphicsEnv::getInstance().addVulkanEngineName(
+                    pCreateInfo->pApplicationInfo->pEngineName);
+            }
+        }
+
+        // Update stats for the extensions requested
+        android::GraphicsEnv::getInstance().setVulkanInstanceExtensions(
+            pCreateInfo->enabledExtensionCount,
+            pCreateInfo->ppEnabledExtensionNames);
+    }
+
     *pInstance = instance;
 
     return VK_SUCCESS;
@@ -1347,13 +1488,15 @@ VkResult CreateDevice(VkPhysicalDevice physicalDevice,
     if ((wrapper.GetHalExtensions()[ProcHook::ANDROID_native_buffer]) &&
         !data->driver.GetSwapchainGrallocUsageANDROID &&
         !data->driver.GetSwapchainGrallocUsage2ANDROID &&
-        !data->driver.GetSwapchainGrallocUsage3ANDROID) {
+        !data->driver.GetSwapchainGrallocUsage3ANDROID &&
+        !data->driver.GetSwapchainGrallocUsage4ANDROID) {
         ALOGE(
             "Driver's implementation of ANDROID_native_buffer is broken;"
             " must expose at least one of "
             "vkGetSwapchainGrallocUsageANDROID or "
             "vkGetSwapchainGrallocUsage2ANDROID or "
-            "vkGetSwapchainGrallocUsage3ANDROID");
+            "vkGetSwapchainGrallocUsage3ANDROID or "
+            "vkGetSwapchainGrallocUsage4ANDROID");
 
         data->driver.DestroyDevice(dev, pAllocator);
         FreeDeviceData(data, data_allocator);
@@ -1368,8 +1511,68 @@ VkResult CreateDevice(VkPhysicalDevice physicalDevice,
     }
 
     data->driver_device = dev;
+    data->driver_physical_device = physicalDevice;
 
     *pDevice = dev;
+
+    // TODO(b/259516419) avoid getting stats from hwui
+    const bool reportStats = true;
+    if (reportStats) {
+        android::GraphicsEnv::getInstance().setTargetStats(
+            android::GpuStatsInfo::Stats::CREATED_VULKAN_DEVICE);
+
+        // Set stats for creating a Vulkan device and report features in use
+        const VkPhysicalDeviceFeatures* pEnabledFeatures =
+            pCreateInfo->pEnabledFeatures;
+        if (!pEnabledFeatures) {
+            // Use features from the chained VkPhysicalDeviceFeatures2
+            // structure, if given
+            const VkPhysicalDeviceFeatures2* features2 =
+                reinterpret_cast<const VkPhysicalDeviceFeatures2*>(
+                    pCreateInfo->pNext);
+            while (features2 &&
+                   features2->sType !=
+                       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+                features2 = reinterpret_cast<const VkPhysicalDeviceFeatures2*>(
+                    features2->pNext);
+            }
+            if (features2) {
+                pEnabledFeatures = &features2->features;
+            }
+        }
+        const VkBool32* pFeatures =
+            reinterpret_cast<const VkBool32*>(pEnabledFeatures);
+        if (pFeatures) {
+            // VkPhysicalDeviceFeatures consists of VkBool32 values, go over all
+            // of them using pointer arithmetic here and save the features in a
+            // 64-bit bitfield
+            static_assert(
+                (sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32)) <= 64,
+                "VkPhysicalDeviceFeatures has too many elements for bitfield "
+                "packing");
+            static_assert(
+                (sizeof(VkPhysicalDeviceFeatures) % sizeof(VkBool32)) == 0,
+                "VkPhysicalDeviceFeatures has invalid size for bitfield "
+                "packing");
+            const int numFeatures =
+                sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32);
+
+            uint64_t enableFeatureBits = 0;
+            for (int i = 0; i < numFeatures; i++) {
+                if (pFeatures[i] != VK_FALSE) {
+                    enableFeatureBits |= (uint64_t(1) << i);
+                }
+            }
+            android::GraphicsEnv::getInstance().setTargetStats(
+                android::GpuStatsInfo::Stats::VULKAN_DEVICE_FEATURES_ENABLED,
+                enableFeatureBits);
+        }
+
+        // Update stats for the extensions requested
+        android::GraphicsEnv::getInstance().setVulkanDeviceExtensions(
+            pCreateInfo->enabledExtensionCount,
+            pCreateInfo->ppEnabledExtensionNames);
+    }
 
     return VK_SUCCESS;
 }
@@ -1562,6 +1765,12 @@ void GetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
                         pFeats);
                 compressionFeat->imageCompressionControlSwapchain = false;
                 imageCompressionControlSwapchainInChain = true;
+            } break;
+
+            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT: {
+                auto smf = reinterpret_cast<VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT *>(
+                        pFeats);
+                smf->swapchainMaintenance1 = true;
             } break;
 
             default:

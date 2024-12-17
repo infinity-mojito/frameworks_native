@@ -14,13 +14,12 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUT_INPUTDISPATCHER_INPUTDISPATCHERINTERFACE_H
-#define _UI_INPUT_INPUTDISPATCHER_INPUTDISPATCHERINTERFACE_H
+#pragma once
 
 #include <InputListener.h>
 #include <android-base/result.h>
 #include <android/gui/FocusRequest.h>
-#include <android/os/BlockUntrustedTouchesMode.h>
+
 #include <android/os/InputEventInjectionResult.h>
 #include <android/os/InputEventInjectionSync.h>
 #include <gui/InputApplication.h>
@@ -40,7 +39,7 @@ public:
     /* Dumps the state of the input dispatcher.
      *
      * This method may be called on any thread (usually by the input manager). */
-    virtual void dump(std::string& dump) = 0;
+    virtual void dump(std::string& dump) const = 0;
 
     /* Called by the heatbeat to ensures that the dispatcher has not deadlocked. */
     virtual void monitor() = 0;
@@ -51,7 +50,7 @@ public:
      * Return true if the dispatcher is idle.
      * Return false if the timeout waiting for the dispatcher to become idle has expired.
      */
-    virtual bool waitForIdle() = 0;
+    virtual bool waitForIdle() const = 0;
 
     /* Make the dispatcher start processing events.
      *
@@ -77,7 +76,7 @@ public:
      * perform all necessary permission checks prior to injecting events.
      */
     virtual android::os::InputEventInjectionResult injectInputEvent(
-            const InputEvent* event, std::optional<int32_t> targetUid,
+            const InputEvent* event, std::optional<gui::Uid> targetUid,
             android::os::InputEventInjectionSync syncMode, std::chrono::milliseconds timeout,
             uint32_t policyFlags) = 0;
 
@@ -88,27 +87,22 @@ public:
      */
     virtual std::unique_ptr<VerifiedInputEvent> verifyInputEvent(const InputEvent& event) = 0;
 
-    /* Sets the list of input windows per display.
-     *
-     * This method may be called on any thread (usually by the input manager).
-     */
-    virtual void setInputWindows(
-            const std::unordered_map<int32_t, std::vector<sp<gui::WindowInfoHandle>>>&
-                    handlesPerDisplay) = 0;
-
     /* Sets the focused application on the given display.
      *
      * This method may be called on any thread (usually by the input manager).
      */
     virtual void setFocusedApplication(
-            int32_t displayId,
+            ui::LogicalDisplayId displayId,
             const std::shared_ptr<InputApplicationHandle>& inputApplicationHandle) = 0;
 
     /* Sets the focused display.
      *
      * This method may be called on any thread (usually by the input manager).
      */
-    virtual void setFocusedDisplay(int32_t displayId) = 0;
+    virtual void setFocusedDisplay(ui::LogicalDisplayId displayId) = 0;
+
+    /** Sets the minimum time between user activity pokes. */
+    virtual void setMinTimeBetweenUserActivityPokes(std::chrono::milliseconds interval) = 0;
 
     /* Sets the input dispatching mode.
      *
@@ -126,13 +120,17 @@ public:
 
     /**
      * Set the touch mode state.
-     * Touch mode is a global state that apps may enter / exit based on specific
-     * user interactions with input devices.
-     * If true, the device is in touch mode.
+     * Touch mode is a per display state that apps may enter / exit based on specific user
+     * interactions with input devices. If <code>inTouchMode</code> is set to true, the display
+     * identified by <code>displayId</code> will be changed to touch mode. Performs a permission
+     * check if hasPermission is set to false.
+     *
+     * This method also enqueues a a TouchModeEntry message for dispatching.
      *
      * Returns true when changing touch mode state.
      */
-    virtual bool setInTouchMode(bool inTouchMode, int32_t pid, int32_t uid, bool hasPermission) = 0;
+    virtual bool setInTouchMode(bool inTouchMode, gui::Pid pid, gui::Uid uid, bool hasPermission,
+                                ui::LogicalDisplayId displayId) = 0;
 
     /**
      * Sets the maximum allowed obscuring opacity by UID to propagate touches.
@@ -143,25 +141,23 @@ public:
     virtual void setMaximumObscuringOpacityForTouch(float opacity) = 0;
 
     /**
-     * Sets the mode of the block untrusted touches feature.
+     * Transfers a touch gesture from one window to another window. Transferring touch will not
+     * have any effect on the focused window.
      *
-     * TODO(b/169067926): Clean-up feature modes.
+     * Returns true on success.  False if the window did not actually have an active touch gesture.
      */
-    virtual void setBlockUntrustedTouchesMode(android::os::BlockUntrustedTouchesMode mode) = 0;
-
-    /* Transfers touch focus from one window to another window.
-     *
-     * Returns true on success.  False if the window did not actually have touch focus.
-     */
-    virtual bool transferTouchFocus(const sp<IBinder>& fromToken, const sp<IBinder>& toToken,
-                                    bool isDragDrop) = 0;
+    virtual bool transferTouchGesture(const sp<IBinder>& fromToken, const sp<IBinder>& toToken,
+                                      bool isDragDrop) = 0;
 
     /**
-     * Transfer touch focus to the provided channel, no matter where the current touch is.
+     * Transfer a touch gesture to the provided channel, no matter where the current touch is.
+     * Transferring touch will not have any effect on the focused window.
      *
-     * Return true on success, false if there was no on-going touch.
+     * Returns true on success, false if there was no on-going touch on the display.
+     * @deprecated
      */
-    virtual bool transferTouch(const sp<IBinder>& destChannelToken, int32_t displayId) = 0;
+    virtual bool transferTouchOnDisplay(const sp<IBinder>& destChannelToken,
+                                        ui::LogicalDisplayId displayId) = 0;
 
     /**
      * Sets focus on the specified window.
@@ -184,9 +180,8 @@ public:
      *
      * This method may be called on any thread (usually by the input manager).
      */
-    virtual base::Result<std::unique_ptr<InputChannel>> createInputMonitor(int32_t displayId,
-                                                                           const std::string& name,
-                                                                           int32_t pid) = 0;
+    virtual base::Result<std::unique_ptr<InputChannel>> createInputMonitor(
+            ui::LogicalDisplayId displayId, const std::string& name, gui::Pid pid) = 0;
 
     /* Removes input channels that will no longer receive input events.
      *
@@ -212,7 +207,8 @@ public:
      * ineligible, all attempts to request pointer capture for windows on that display will fail.
      *  TODO(b/214621487): Remove or move to a display flag.
      */
-    virtual void setDisplayEligibilityForPointerCapture(int displayId, bool isEligible) = 0;
+    virtual void setDisplayEligibilityForPointerCapture(ui::LogicalDisplayId displayId,
+                                                        bool isEligible) = 0;
 
     /* Flush input device motion sensor.
      *
@@ -223,14 +219,30 @@ public:
     /**
      * Called when a display has been removed from the system.
      */
-    virtual void displayRemoved(int32_t displayId) = 0;
+    virtual void displayRemoved(ui::LogicalDisplayId displayId) = 0;
 
     /*
      * Abort the current touch stream.
      */
     virtual void cancelCurrentTouch() = 0;
+
+    /*
+     * Updates whether key repeat is enabled and key repeat configuration timeout and delay.
+     */
+    virtual void setKeyRepeatConfiguration(std::chrono::nanoseconds timeout,
+                                           std::chrono::nanoseconds delay,
+                                           bool keyRepeatEnabled) = 0;
+
+    /*
+     * Determine if a pointer from a device is being dispatched to the given window.
+     */
+    virtual bool isPointerInWindow(const sp<IBinder>& token, ui::LogicalDisplayId displayId,
+                                   DeviceId deviceId, int32_t pointerId) = 0;
+
+    /*
+     * Notify the dispatcher that the state of the input method connection changed.
+     */
+    virtual void setInputMethodConnectionIsActive(bool isActive) = 0;
 };
 
 } // namespace android
-
-#endif // _UI_INPUT_INPUTDISPATCHER_INPUTDISPATCHERINTERFACE_H

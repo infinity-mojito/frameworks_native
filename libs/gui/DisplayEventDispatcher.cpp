@@ -15,6 +15,7 @@
  */
 
 #define LOG_TAG "DisplayEventDispatcher"
+#define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
 #include <cinttypes>
 #include <cstdint>
@@ -23,10 +24,13 @@
 #include <gui/DisplayEventReceiver.h>
 #include <utils/Log.h>
 #include <utils/Looper.h>
-
 #include <utils/Timers.h>
+#include <utils/Trace.h>
+
+#include <com_android_graphics_libgui_flags.h>
 
 namespace android {
+using namespace com::android::graphics::libgui;
 
 // Number of events to read at a time from the DisplayEventDispatcher pipe.
 // The value should be large enough that we can quickly drain the pipe
@@ -35,11 +39,15 @@ static const size_t EVENT_BUFFER_SIZE = 100;
 
 static constexpr nsecs_t WAITING_FOR_VSYNC_TIMEOUT = ms2ns(300);
 
-DisplayEventDispatcher::DisplayEventDispatcher(
-        const sp<Looper>& looper, ISurfaceComposer::VsyncSource vsyncSource,
-        ISurfaceComposer::EventRegistrationFlags eventRegistration)
-      : mLooper(looper), mReceiver(vsyncSource, eventRegistration), mWaitingForVsync(false),
-        mLastVsyncCount(0), mLastScheduleVsyncTime(0) {
+DisplayEventDispatcher::DisplayEventDispatcher(const sp<Looper>& looper,
+                                               gui::ISurfaceComposer::VsyncSource vsyncSource,
+                                               EventRegistrationFlags eventRegistration,
+                                               const sp<IBinder>& layerHandle)
+      : mLooper(looper),
+        mReceiver(vsyncSource, eventRegistration, layerHandle),
+        mWaitingForVsync(false),
+        mLastVsyncCount(0),
+        mLastScheduleVsyncTime(0) {
     ALOGV("dispatcher %p ~ Initializing display event dispatcher.", this);
 }
 
@@ -167,9 +175,22 @@ bool DisplayEventDispatcher::processPendingEvents(nsecs_t* outTimestamp,
                     *outDisplayId = ev.header.displayId;
                     *outCount = ev.vsync.count;
                     *outVsyncEventData = ev.vsync.vsyncData;
+
+                    // Trace the RenderRate for this app
+                    if (ATRACE_ENABLED() && flags::trace_frame_rate_override()) {
+                        const auto frameInterval = ev.vsync.vsyncData.frameInterval;
+                        int fps = frameInterval > 0 ? 1e9f / frameInterval : 0;
+                        ATRACE_INT("RenderRate", fps);
+                    }
                     break;
                 case DisplayEventReceiver::DISPLAY_EVENT_HOTPLUG:
-                    dispatchHotplug(ev.header.timestamp, ev.header.displayId, ev.hotplug.connected);
+                    if (ev.hotplug.connectionError == 0) {
+                        dispatchHotplug(ev.header.timestamp, ev.header.displayId,
+                                        ev.hotplug.connected);
+                    } else {
+                        dispatchHotplugConnectionError(ev.header.timestamp,
+                                                       ev.hotplug.connectionError);
+                    }
                     break;
                 case DisplayEventReceiver::DISPLAY_EVENT_MODE_CHANGE:
                     dispatchModeChanged(ev.header.timestamp, ev.header.displayId,
@@ -184,6 +205,11 @@ bool DisplayEventDispatcher::processPendingEvents(nsecs_t* outTimestamp,
                 case DisplayEventReceiver::DISPLAY_EVENT_FRAME_RATE_OVERRIDE_FLUSH:
                     dispatchFrameRateOverrides(ev.header.timestamp, ev.header.displayId,
                                                std::move(mFrameRateOverrides));
+                    break;
+                case DisplayEventReceiver::DISPLAY_EVENT_HDCP_LEVELS_CHANGE:
+                    dispatchHdcpLevelsChanged(ev.header.displayId,
+                                              ev.hdcpLevelsChange.connectedLevel,
+                                              ev.hdcpLevelsChange.maxLevel);
                     break;
                 default:
                     ALOGW("dispatcher %p ~ ignoring unknown event type %#x", this, ev.header.type);

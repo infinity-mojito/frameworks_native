@@ -16,24 +16,56 @@
 
 #pragma once
 
+#include <bitset>
 #include <map>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace android {
 
+template <size_t N>
+std::string bitsetToString(const std::bitset<N>& bitset) {
+    if (bitset.none()) {
+        return "<none>";
+    }
+    return bitset.to_string();
+}
+
+template <class T>
+std::string streamableToString(const T& streamable) {
+    std::stringstream out;
+    out << streamable;
+    return out.str();
+}
+
 template <typename T>
-std::string constToString(const T& v) {
+inline std::string constToString(const T& v) {
     return std::to_string(v);
+}
+
+template <>
+inline std::string constToString(const bool& value) {
+    return value ? "true" : "false";
+}
+
+template <>
+inline std::string constToString(const std::vector<bool>::reference& value) {
+    return value ? "true" : "false";
+}
+
+inline std::string constToString(const std::string& s) {
+    return s;
 }
 
 /**
  * Convert an optional type to string.
  */
 template <typename T>
-std::string toString(const std::optional<T>& optional,
-                     std::string (*toString)(const T&) = constToString) {
+inline std::string toString(const std::optional<T>& optional,
+                            std::string (*toString)(const T&) = constToString) {
     return optional ? toString(*optional) : "<not set>";
 }
 
@@ -51,11 +83,12 @@ std::string dumpSet(const std::set<T>& v, std::string (*toString)(const T&) = co
 }
 
 /**
- * Convert a map to string. Both keys and values of the map should be integral type.
+ * Convert a map or multimap to string. Both keys and values of the map should be integral type.
  */
-template <typename K, typename V>
-std::string dumpMap(const std::map<K, V>& map, std::string (*keyToString)(const K&) = constToString,
-                    std::string (*valueToString)(const V&) = constToString) {
+template <typename T>
+std::string dumpMap(const T& map,
+                    std::string (*keyToString)(const typename T::key_type&) = constToString,
+                    std::string (*valueToString)(const typename T::mapped_type&) = constToString) {
     std::string out;
     for (const auto& [k, v] : map) {
         if (!out.empty()) {
@@ -64,6 +97,32 @@ std::string dumpMap(const std::map<K, V>& map, std::string (*keyToString)(const 
         out += keyToString(k) + ":" + valueToString(v);
     }
     return out;
+}
+
+/**
+ * Convert map keys to string. The keys of the map should be integral type.
+ */
+template <typename K, typename V>
+std::string dumpMapKeys(const std::map<K, V>& map,
+                        std::string (*keyToString)(const K&) = constToString) {
+    std::string out;
+    for (const auto& [k, _] : map) {
+        out += out.empty() ? "{" : ", ";
+        out += keyToString(k);
+    }
+    return out.empty() ? "{}" : (out + "}");
+}
+
+/** Convert a vector to a string. */
+template <typename T>
+std::string dumpVector(const std::vector<T>& values,
+                       std::string (*valueToString)(const T&) = constToString) {
+    std::string out;
+    for (const auto& value : values) {
+        out += out.empty() ? "[" : ", ";
+        out += valueToString(value);
+    }
+    return out.empty() ? "[]" : (out + "]");
 }
 
 const char* toString(bool value);

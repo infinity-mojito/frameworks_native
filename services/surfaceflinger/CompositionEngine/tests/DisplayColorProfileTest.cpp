@@ -123,10 +123,10 @@ public:
                 .build();
     }
 
-    static impl::DisplayColorProfile createProfileWithSRGBColorModeSupport() {
+    static impl::DisplayColorProfile createProfileWithSRGBColorModeSupport(bool wcg = true) {
         return ProfileFactory()
-                .setHasWideColorGamut(true)
                 .addHdrType(Hdr::HDR10)
+                .setHasWideColorGamut(wcg)
                 .addColorModeRenderIntent(ColorMode::SRGB, RenderIntent::COLORIMETRIC)
                 .addColorModeRenderIntent(ColorMode::SRGB, RenderIntent::ENHANCE)
                 .addColorModeRenderIntent(ColorMode::SRGB, VendorRenderIntent)
@@ -282,39 +282,6 @@ TEST_F(DisplayColorProfileTest, ctorUsesOrDefaultsLuminanceValuesFromInputArgs) 
     }
 }
 
-TEST_F(DisplayColorProfileTest, ctorSignalsHdrSupportForAnyWideColorGamutDevice) {
-    {
-        // If the output does not profile wide color gamut, then no HDR modes
-        // will be profileed in the generated HDR capabilities.
-        auto profile = ProfileFactory().setHasWideColorGamut(false).build();
-
-        EXPECT_THAT(profile.getHdrCapabilities().getSupportedHdrTypes(), IsEmpty());
-    }
-
-    {
-        // If the HWC does not show profile for certain HDR modes, then the
-        // generated HDR capabilities will indicate profile anyway.
-        auto profile = ProfileFactory().setHasWideColorGamut(true).build();
-
-        EXPECT_THAT(profile.getHdrCapabilities().getSupportedHdrTypes(), SizeIs(2));
-        EXPECT_THAT(profile.getHdrCapabilities().getSupportedHdrTypes(), Contains(Hdr::HDR10));
-        EXPECT_THAT(profile.getHdrCapabilities().getSupportedHdrTypes(), Contains(Hdr::HLG));
-    }
-
-    {
-        // If the HWC profiles the HDR modes, then the generated capabilities
-        // still has one entry for each HDR type.
-        auto profile = ProfileFactory()
-                               .setHasWideColorGamut(true)
-                               .addHdrTypes({Hdr::HLG, Hdr::HDR10})
-                               .build();
-
-        EXPECT_THAT(profile.getHdrCapabilities().getSupportedHdrTypes(), SizeIs(2));
-        EXPECT_THAT(profile.getHdrCapabilities().getSupportedHdrTypes(), Contains(Hdr::HDR10));
-        EXPECT_THAT(profile.getHdrCapabilities().getSupportedHdrTypes(), Contains(Hdr::HLG));
-    }
-}
-
 /* ------------------------------------------------------------------------
  * DisplayColorProfile::hasRenderIntent
  */
@@ -322,7 +289,7 @@ TEST_F(DisplayColorProfileTest, ctorSignalsHdrSupportForAnyWideColorGamutDevice)
 TEST_F(DisplayColorProfileTest, hasRenderIntentReturnsExpectedValueWhenOutputHasNoSupport) {
     auto profile = ProfileFactory::createProfileWithNoColorModeSupport();
 
-    EXPECT_FALSE(profile.hasRenderIntent(RenderIntent::COLORIMETRIC));
+    EXPECT_TRUE(profile.hasRenderIntent(RenderIntent::COLORIMETRIC));
     EXPECT_FALSE(profile.hasRenderIntent(RenderIntent::ENHANCE));
     EXPECT_FALSE(profile.hasRenderIntent(RenderIntent::TONE_MAP_COLORIMETRIC));
     EXPECT_FALSE(profile.hasRenderIntent(RenderIntent::TONE_MAP_ENHANCE));
@@ -337,6 +304,16 @@ TEST_F(DisplayColorProfileTest, hasRenderIntentReturnsExpectedValueWhenOutputHas
     EXPECT_FALSE(profile.hasRenderIntent(RenderIntent::TONE_MAP_COLORIMETRIC));
     EXPECT_FALSE(profile.hasRenderIntent(RenderIntent::TONE_MAP_ENHANCE));
     EXPECT_FALSE(profile.hasRenderIntent(VendorRenderIntent));
+}
+
+TEST_F(DisplayColorProfileTest, hasRenderIntentReturnsExpectedValueWhenOutputHasSRGBSupport_NoWCG) {
+    auto profile = ProfileFactory::createProfileWithSRGBColorModeSupport(false);
+
+    EXPECT_TRUE(profile.hasRenderIntent(RenderIntent::COLORIMETRIC));
+    EXPECT_TRUE(profile.hasRenderIntent(RenderIntent::ENHANCE));
+    EXPECT_FALSE(profile.hasRenderIntent(RenderIntent::TONE_MAP_COLORIMETRIC));
+    EXPECT_FALSE(profile.hasRenderIntent(RenderIntent::TONE_MAP_ENHANCE));
+    EXPECT_TRUE(profile.hasRenderIntent(VendorRenderIntent));
 }
 
 TEST_F(DisplayColorProfileTest, hasRenderIntentReturnsExpectedValueWhenOutputHasSRGBSupport) {
@@ -509,6 +486,40 @@ TEST_F(DisplayColorProfileTest, getBestColorModeReturnsExpectedModesWhenOutputHa
     checkGetBestColorMode(profile, expectedResults);
 }
 
+TEST_F(DisplayColorProfileTest,
+       getBestColorModeReturnsExpectedModesWhenOutputHasSRGBSupport_NoWCG) {
+    auto profile = ProfileFactory::createProfileWithSRGBColorModeSupport(false);
+
+    // Note: This table of expected values goes with the table of arguments
+    // used in checkGetBestColorMode.
+    using Result = std::tuple<Dataspace, ColorMode, RenderIntent>;
+    std::array<Result, 15> expectedResults = {
+            /* clang-format off */
+            /*  0 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, RenderIntent::COLORIMETRIC},
+            /*  1 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, RenderIntent::ENHANCE},
+            /*  2 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, VendorRenderIntent},
+
+            /*  3 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, RenderIntent::COLORIMETRIC},
+            /*  4 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, RenderIntent::ENHANCE},
+            /*  5 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, VendorRenderIntent},
+
+            /*  6 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, RenderIntent::COLORIMETRIC},
+            /*  7 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, RenderIntent::ENHANCE},
+            /*  8 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, VendorRenderIntent},
+
+            /*  9 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, RenderIntent::COLORIMETRIC},
+            /* 10 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, RenderIntent::COLORIMETRIC},
+            /* 11 */ Result{Dataspace::UNKNOWN, ColorMode::NATIVE, RenderIntent::COLORIMETRIC},
+
+            /* 12 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, RenderIntent::COLORIMETRIC},
+            /* 13 */ Result{Dataspace::V0_SRGB, ColorMode::SRGB, RenderIntent::COLORIMETRIC},
+            /* 14 */ Result{Dataspace::UNKNOWN, ColorMode::NATIVE, RenderIntent::COLORIMETRIC},
+            /* clang-format on */
+    };
+
+    checkGetBestColorMode(profile, expectedResults);
+}
+
 TEST_F(DisplayColorProfileTest, getBestColorModeReturnsExpectedModesWhenOutputHasSRGBSupport) {
     auto profile = ProfileFactory::createProfileWithSRGBColorModeSupport();
 
@@ -644,30 +655,6 @@ TEST_F(DisplayColorProfileTest, isDataspaceSupportedWorksForProfileWithHlgSuppor
     EXPECT_FALSE(profile.isDataspaceSupported(Dataspace::BT2020_ITU_PQ));
     EXPECT_TRUE(profile.isDataspaceSupported(Dataspace::BT2020_HLG));
     EXPECT_TRUE(profile.isDataspaceSupported(Dataspace::BT2020_ITU_HLG));
-}
-
-/*
- * RenderSurface::getTargetDataspace()
- */
-
-TEST_F(DisplayColorProfileTest, getTargetDataspaceWorks) {
-    auto profile = ProfileFactory::createProfileWithNoColorModeSupport();
-
-    // For a non-HDR colorspace with no colorSpaceAgnosticDataspace override,
-    // the input dataspace should be returned.
-    EXPECT_EQ(Dataspace::DISPLAY_P3,
-              profile.getTargetDataspace(ColorMode::DISPLAY_P3, Dataspace::DISPLAY_P3,
-                                         Dataspace::UNKNOWN));
-
-    // If colorSpaceAgnosticDataspace is set, its value should be returned
-    EXPECT_EQ(Dataspace::V0_SRGB,
-              profile.getTargetDataspace(ColorMode::DISPLAY_P3, Dataspace::DISPLAY_P3,
-                                         Dataspace::V0_SRGB));
-
-    // For an HDR colorspace, Dataspace::UNKNOWN should be returned.
-    EXPECT_EQ(Dataspace::UNKNOWN,
-              profile.getTargetDataspace(ColorMode::BT2100_PQ, Dataspace::BT2020_PQ,
-                                         Dataspace::UNKNOWN));
 }
 
 } // namespace

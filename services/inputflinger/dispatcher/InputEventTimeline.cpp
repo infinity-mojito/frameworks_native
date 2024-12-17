@@ -16,6 +16,8 @@
 
 #include "InputEventTimeline.h"
 
+#include "../InputDeviceMetricsSource.h"
+
 namespace android::inputdispatcher {
 
 ConnectionTimeline::ConnectionTimeline(nsecs_t deliveryTime, nsecs_t consumeTime,
@@ -64,8 +66,16 @@ bool ConnectionTimeline::operator!=(const ConnectionTimeline& rhs) const {
     return !operator==(rhs);
 }
 
-InputEventTimeline::InputEventTimeline(bool isDown, nsecs_t eventTime, nsecs_t readTime)
-      : isDown(isDown), eventTime(eventTime), readTime(readTime) {}
+InputEventTimeline::InputEventTimeline(nsecs_t eventTime, nsecs_t readTime, uint16_t vendorId,
+                                       uint16_t productId,
+                                       const std::set<InputDeviceUsageSource>& sources,
+                                       InputEventActionType inputEventActionType)
+      : eventTime(eventTime),
+        readTime(readTime),
+        vendorId(vendorId),
+        productId(productId),
+        sources(sources),
+        inputEventActionType(inputEventActionType) {}
 
 bool InputEventTimeline::operator==(const InputEventTimeline& rhs) const {
     if (connectionTimelines.size() != rhs.connectionTimelines.size()) {
@@ -80,7 +90,9 @@ bool InputEventTimeline::operator==(const InputEventTimeline& rhs) const {
             return false;
         }
     }
-    return isDown == rhs.isDown && eventTime == rhs.eventTime && readTime == rhs.readTime;
+    return eventTime == rhs.eventTime && readTime == rhs.readTime && vendorId == rhs.vendorId &&
+            productId == rhs.productId && sources == rhs.sources &&
+            inputEventActionType == rhs.inputEventActionType;
 }
 
 } // namespace android::inputdispatcher

@@ -21,10 +21,11 @@
 #include <binder/ActivityManager.h>
 #include <binder/Binder.h>
 #include <binder/IServiceManager.h>
-
-#include <utils/SystemClock.h>
+#include <binder/ProcessState.h>
 
 namespace android {
+
+using namespace std::chrono_literals;
 
 ActivityManager::ActivityManager()
 {
@@ -33,27 +34,37 @@ ActivityManager::ActivityManager()
 sp<IActivityManager> ActivityManager::getService()
 {
     std::lock_guard<Mutex> scoped_lock(mLock);
-    int64_t startTime = 0;
     sp<IActivityManager> service = mService;
-    while (service == nullptr || !IInterface::asBinder(service)->isBinderAlive()) {
-        sp<IBinder> binder = defaultServiceManager()->checkService(String16("activity"));
-        if (binder == nullptr) {
-            // Wait for the activity service to come back...
-            if (startTime == 0) {
-                startTime = uptimeMillis();
-                ALOGI("Waiting for activity service");
-            } else if ((uptimeMillis() - startTime) > 1000000) {
-                ALOGW("Waiting too long for activity service, giving up");
-                service = nullptr;
-                break;
-            }
-            usleep(25000);
-        } else {
+    if (ProcessState::self()->isThreadPoolStarted()) {
+        if (service == nullptr || !IInterface::asBinder(service)->isBinderAlive()) {
+            sp<IBinder> binder = defaultServiceManager()->waitForService(String16("activity"));
             service = interface_cast<IActivityManager>(binder);
             mService = service;
         }
+    } else {
+        ALOGI("Thread pool not started. Polling for activity service.");
+        auto startTime = std::chrono::steady_clock::now().min();
+        while (service == nullptr || !IInterface::asBinder(service)->isBinderAlive()) {
+            sp<IBinder> binder = defaultServiceManager()->checkService(String16("activity"));
+            if (binder == nullptr) {
+                // Wait for the activity service to come back...
+                if (startTime == startTime.min()) {
+                    startTime = std::chrono::steady_clock::now();
+                    ALOGI("Waiting for activity service");
+                } else if (std::chrono::steady_clock::now() - startTime > 1000s) {
+                    // TODO(b/342453147): timeout of 1000s = 16min and 40s doesn't seem intended
+                    ALOGW("Waiting too long for activity service, giving up");
+                    service = nullptr;
+                    break;
+                }
+                usleep(25000);
+            } else {
+                service = interface_cast<IActivityManager>(binder);
+                mService = service;
+            }
+        }
     }
-    return service;
+    return mService;
 }
 
 int ActivityManager::openContentUri(const String16& stringUri)
@@ -75,11 +86,45 @@ status_t ActivityManager::registerUidObserver(const sp<IUidObserver>& observer,
     return DEAD_OBJECT;
 }
 
+status_t ActivityManager::registerUidObserverForUids(const sp<IUidObserver>& observer,
+                                                     const int32_t event, const int32_t cutpoint,
+                                                     const String16& callingPackage,
+                                                     const int32_t uids[], size_t nUids,
+                                                     /*out*/ sp<IBinder>& observerToken) {
+    sp<IActivityManager> service = getService();
+    if (service != nullptr) {
+        return service->registerUidObserverForUids(observer, event, cutpoint, callingPackage, uids,
+                                                   nUids, observerToken);
+    }
+    // ActivityManagerService appears dead. Return usual error code for dead service.
+    return DEAD_OBJECT;
+}
+
 status_t ActivityManager::unregisterUidObserver(const sp<IUidObserver>& observer)
 {
     sp<IActivityManager> service = getService();
     if (service != nullptr) {
         return service->unregisterUidObserver(observer);
+    }
+    // ActivityManagerService appears dead. Return usual error code for dead service.
+    return DEAD_OBJECT;
+}
+
+status_t ActivityManager::addUidToObserver(const sp<IBinder>& observerToken,
+                                           const String16& callingPackage, int32_t uid) {
+    sp<IActivityManager> service = getService();
+    if (service != nullptr) {
+        return service->addUidToObserver(observerToken, callingPackage, uid);
+    }
+    // ActivityManagerService appears dead. Return usual error code for dead service.
+    return DEAD_OBJECT;
+}
+
+status_t ActivityManager::removeUidFromObserver(const sp<IBinder>& observerToken,
+                                                const String16& callingPackage, int32_t uid) {
+    sp<IActivityManager> service = getService();
+    if (service != nullptr) {
+        return service->removeUidFromObserver(observerToken, callingPackage, uid);
     }
     // ActivityManagerService appears dead. Return usual error code for dead service.
     return DEAD_OBJECT;

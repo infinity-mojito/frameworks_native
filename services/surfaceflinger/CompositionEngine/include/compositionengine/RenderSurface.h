@@ -86,20 +86,13 @@ public:
 
     // Queues the drawn buffer for consumption by HWC. readyFence is the fence
     // which will fire when the buffer is ready for consumption.
-    virtual void queueBuffer(base::unique_fd readyFence) = 0;
+    virtual void queueBuffer(base::unique_fd readyFence, float hdrSdrRatio) = 0;
 
     // Called after the HWC calls are made to present the display
     virtual void onPresentDisplayCompleted() = 0;
 
-    // Called after the surface has been rendering to signal the surface should
-    // be made ready for displaying
-    virtual void flip() = 0;
-
     // Debugging - Dumps the state of the RenderSurface to a string
     virtual void dump(std::string& result) const = 0;
-
-    // Debugging - gets the page flip count for the RenderSurface
-    virtual std::uint32_t getPageFlipCount() const = 0;
 
     // Returns true if the render surface supports client composition prediction.
     virtual bool supportsCompositionStrategyPrediction() const = 0;

@@ -38,9 +38,9 @@ public:
 
     bool isLoaded() const override;
 
-    status_t createDescriptor(void* bufferDescriptorInfo, void* outBufferDescriptor) const override;
+    status_t createDescriptor(void* bufferDescriptorInfo, void* outBufferDescriptor) const;
 
-    status_t importBuffer(const hardware::hidl_handle& rawHandle,
+    status_t importBuffer(const native_handle_t* rawHandle,
                           buffer_handle_t* outBufferHandle) const override;
 
     void freeBuffer(buffer_handle_t bufferHandle) const override;
@@ -81,9 +81,8 @@ public:
     std::string dumpDebugInfo(bool less = true) const override;
 
     status_t allocate(std::string requestorName, uint32_t width, uint32_t height,
-                      PixelFormat format, uint32_t layerCount, uint64_t usage, uint32_t bufferCount,
-                      uint32_t* outStride, buffer_handle_t* outBufferHandles,
-                      bool importBuffers = true) const override;
+                      PixelFormat format, uint32_t layerCount, uint64_t usage, uint32_t* outStride,
+                      buffer_handle_t* outBufferHandles, bool importBuffers = true) const override;
 
 private:
     const Gralloc2Mapper& mMapper;

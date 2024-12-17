@@ -32,7 +32,10 @@ protected:
     void SetUp() {
         mComposerClient = new SurfaceComposerClient;
         ASSERT_EQ(OK, mComposerClient->initCheck());
-        mDisplayToken = mComposerClient->getInternalDisplayToken();
+        const auto ids = SurfaceComposerClient::getPhysicalDisplayIds();
+        ASSERT_FALSE(ids.empty());
+        // display 0 is picked for now, can extend to support all displays if needed
+        mDisplayToken = SurfaceComposerClient::getPhysicalDisplayToken(ids.front());
         ASSERT_TRUE(mDisplayToken);
     }
 
@@ -113,10 +116,10 @@ TEST_F(DisplayedContentSamplingTest, SampleCollectionCoherentWithSupportMask) {
     EXPECT_EQ(OK, status);
     if (stats.numFrames <= 0) return;
 
-    if (componentMask & (0x1 << 0)) EXPECT_NE(0, stats.component_0_sample.size());
-    if (componentMask & (0x1 << 1)) EXPECT_NE(0, stats.component_1_sample.size());
-    if (componentMask & (0x1 << 2)) EXPECT_NE(0, stats.component_2_sample.size());
-    if (componentMask & (0x1 << 3)) EXPECT_NE(0, stats.component_3_sample.size());
+    if (componentMask & (0x1 << 0)) EXPECT_NE(0u, stats.component_0_sample.size());
+    if (componentMask & (0x1 << 1)) EXPECT_NE(0u, stats.component_1_sample.size());
+    if (componentMask & (0x1 << 2)) EXPECT_NE(0u, stats.component_2_sample.size());
+    if (componentMask & (0x1 << 3)) EXPECT_NE(0u, stats.component_3_sample.size());
 }
 
 } // namespace android

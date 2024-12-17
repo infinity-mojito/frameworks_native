@@ -24,17 +24,16 @@
 #include <gtest/gtest.h>
 #include <gui/LayerMetadata.h>
 
-#include "BufferQueueLayer.h"
-#include "BufferStateLayer.h"
-#include "EffectLayer.h"
+#include "Client.h" // temporarily needed for LayerCreationArgs
 #include "FpsReporter.h"
+#include "FrontEnd/LayerCreationArgs.h"
+#include "FrontEnd/LayerHierarchy.h"
+#include "FrontEnd/LayerLifecycleManager.h"
 #include "Layer.h"
 #include "TestableSurfaceFlinger.h"
 #include "fake/FakeClock.h"
 #include "mock/DisplayHardware/MockComposer.h"
-#include "mock/MockEventThread.h"
 #include "mock/MockFrameTimeline.h"
-#include "mock/MockVsyncController.h"
 
 namespace android {
 
@@ -50,7 +49,7 @@ using testing::UnorderedElementsAre;
 using android::Hwc2::IComposer;
 using android::Hwc2::IComposerClient;
 
-using FakeHwcDisplayInjector = TestableSurfaceFlinger::FakeHwcDisplayInjector;
+using gui::LayerMetadata;
 
 struct TestableFpsListener : public gui::BnFpsListener {
     TestableFpsListener() {}
@@ -79,10 +78,17 @@ protected:
     static constexpr uint32_t LAYER_FLAGS = 0;
     static constexpr int32_t PRIORITY_UNSET = -1;
 
-    void setupScheduler();
-    sp<BufferStateLayer> createBufferStateLayer(LayerMetadata metadata);
+    sp<Layer> createBufferStateLayer(LayerMetadata metadata);
 
-    TestableSurfaceFlinger mFlinger;
+    LayerCreationArgs createArgs(uint32_t id, bool canBeRoot, uint32_t parentId,
+                                 LayerMetadata metadata);
+
+    void createRootLayer(uint32_t id, LayerMetadata metadata);
+
+    void createLayer(uint32_t id, uint32_t parentId, LayerMetadata metadata);
+
+    frontend::LayerLifecycleManager mLifecycleManager;
+
     mock::FrameTimeline mFrameTimeline =
             mock::FrameTimeline(std::make_shared<impl::TimeStats>(), 0);
 
@@ -96,7 +102,7 @@ protected:
     sp<TestableFpsListener> mFpsListener;
     fake::FakeClock* mClock = new fake::FakeClock();
     sp<FpsReporter> mFpsReporter =
-            new FpsReporter(mFrameTimeline, *(mFlinger.flinger()), std::unique_ptr<Clock>(mClock));
+            sp<FpsReporter>::make(mFrameTimeline, std::unique_ptr<Clock>(mClock));
 };
 
 FpsReporterTest::FpsReporterTest() {
@@ -104,10 +110,7 @@ FpsReporterTest::FpsReporterTest() {
             ::testing::UnitTest::GetInstance()->current_test_info();
     ALOGD("**** Setting up for %s.%s\n", test_info->test_case_name(), test_info->name());
 
-    setupScheduler();
-    mFlinger.setupComposer(std::make_unique<Hwc2::mock::Composer>());
-
-    mFpsListener = new TestableFpsListener();
+    mFpsListener = sp<TestableFpsListener>::make();
 }
 
 FpsReporterTest::~FpsReporterTest() {
@@ -116,101 +119,94 @@ FpsReporterTest::~FpsReporterTest() {
     ALOGD("**** Tearing down after %s.%s\n", test_info->test_case_name(), test_info->name());
 }
 
-sp<BufferStateLayer> FpsReporterTest::createBufferStateLayer(LayerMetadata metadata = {}) {
+LayerCreationArgs FpsReporterTest::createArgs(uint32_t id, bool canBeRoot, uint32_t parentId,
+                                              LayerMetadata metadata) {
     sp<Client> client;
-    LayerCreationArgs args(mFlinger.flinger(), client, "buffer-state-layer", LAYER_FLAGS, metadata);
-    return new BufferStateLayer(args);
+    LayerCreationArgs args(std::make_optional(id));
+    args.name = "testlayer";
+    args.addToRoot = canBeRoot;
+    args.flags = LAYER_FLAGS;
+    args.metadata = metadata;
+    args.parentId = parentId;
+    return args;
 }
 
-void FpsReporterTest::setupScheduler() {
-    auto eventThread = std::make_unique<mock::EventThread>();
-    auto sfEventThread = std::make_unique<mock::EventThread>();
+void FpsReporterTest::createRootLayer(uint32_t id, LayerMetadata metadata = LayerMetadata()) {
+    std::vector<std::unique_ptr<frontend::RequestedLayerState>> layers;
+    layers.emplace_back(std::make_unique<frontend::RequestedLayerState>(
+            createArgs(/*id=*/id, /*canBeRoot=*/true, /*parent=*/UNASSIGNED_LAYER_ID,
+                       /*metadata=*/metadata)));
+    mLifecycleManager.addLayers(std::move(layers));
+}
 
-    EXPECT_CALL(*eventThread, registerDisplayEventConnection(_));
-    EXPECT_CALL(*eventThread, createEventConnection(_, _))
-            .WillOnce(Return(new EventThreadConnection(eventThread.get(), /*callingUid=*/0,
-                                                       ResyncCallback())));
-
-    EXPECT_CALL(*sfEventThread, registerDisplayEventConnection(_));
-    EXPECT_CALL(*sfEventThread, createEventConnection(_, _))
-            .WillOnce(Return(new EventThreadConnection(sfEventThread.get(), /*callingUid=*/0,
-                                                       ResyncCallback())));
-
-    auto vsyncController = std::make_unique<mock::VsyncController>();
-    auto vsyncTracker = std::make_unique<mock::VSyncTracker>();
-
-    EXPECT_CALL(*vsyncTracker, nextAnticipatedVSyncTimeFrom(_)).WillRepeatedly(Return(0));
-    EXPECT_CALL(*vsyncTracker, currentPeriod())
-            .WillRepeatedly(Return(FakeHwcDisplayInjector::DEFAULT_VSYNC_PERIOD));
-    EXPECT_CALL(*vsyncTracker, nextAnticipatedVSyncTimeFrom(_)).WillRepeatedly(Return(0));
-    mFlinger.setupScheduler(std::move(vsyncController), std::move(vsyncTracker),
-                            std::move(eventThread), std::move(sfEventThread));
+void FpsReporterTest::createLayer(uint32_t id, uint32_t parentId,
+                                  LayerMetadata metadata = LayerMetadata()) {
+    std::vector<std::unique_ptr<frontend::RequestedLayerState>> layers;
+    layers.emplace_back(std::make_unique<frontend::RequestedLayerState>(
+            createArgs(/*id=*/id, /*canBeRoot=*/false, /*parent=*/parentId,
+                       /*mirror=*/metadata)));
+    mLifecycleManager.addLayers(std::move(layers));
 }
 
 namespace {
 
 TEST_F(FpsReporterTest, callsListeners) {
-    mParent = createBufferStateLayer();
     constexpr int32_t kTaskId = 12;
     LayerMetadata targetMetadata;
-    targetMetadata.setInt32(METADATA_TASK_ID, kTaskId);
-    mTarget = createBufferStateLayer(targetMetadata);
-    mChild = createBufferStateLayer();
-    mGrandChild = createBufferStateLayer();
-    mUnrelated = createBufferStateLayer();
-    mParent->addChild(mTarget);
-    mTarget->addChild(mChild);
-    mChild->addChild(mGrandChild);
-    mParent->commitChildList();
-    mFlinger.mutableCurrentState().layersSortedByZ.add(mParent);
-    mFlinger.mutableCurrentState().layersSortedByZ.add(mTarget);
-    mFlinger.mutableCurrentState().layersSortedByZ.add(mChild);
-    mFlinger.mutableCurrentState().layersSortedByZ.add(mGrandChild);
+    targetMetadata.setInt32(gui::METADATA_TASK_ID, kTaskId);
+
+    createRootLayer(1, targetMetadata);
+    createLayer(11, 1);
+    createLayer(111, 11);
+
+    frontend::LayerHierarchyBuilder hierarchyBuilder;
+    hierarchyBuilder.update(mLifecycleManager);
 
     float expectedFps = 44.0;
 
-    EXPECT_CALL(mFrameTimeline,
-                computeFps(UnorderedElementsAre(mTarget->getSequence(), mChild->getSequence(),
-                                                mGrandChild->getSequence())))
+    EXPECT_CALL(mFrameTimeline, computeFps(UnorderedElementsAre(1, 11, 111)))
             .WillOnce(Return(expectedFps));
 
     mFpsReporter->addListener(mFpsListener, kTaskId);
     mClock->advanceTime(600ms);
-    mFpsReporter->dispatchLayerFps();
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
     EXPECT_EQ(expectedFps, mFpsListener->lastReportedFps);
     mFpsReporter->removeListener(mFpsListener);
     Mock::VerifyAndClearExpectations(&mFrameTimeline);
 
     EXPECT_CALL(mFrameTimeline, computeFps(_)).Times(0);
-    mFpsReporter->dispatchLayerFps();
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
 }
 
 TEST_F(FpsReporterTest, rateLimits) {
     const constexpr int32_t kTaskId = 12;
     LayerMetadata targetMetadata;
-    targetMetadata.setInt32(METADATA_TASK_ID, kTaskId);
-    mTarget = createBufferStateLayer(targetMetadata);
-    mFlinger.mutableCurrentState().layersSortedByZ.add(mTarget);
+    targetMetadata.setInt32(gui::METADATA_TASK_ID, kTaskId);
+    createRootLayer(1);
+    createLayer(11, 1, targetMetadata);
+
+    frontend::LayerHierarchyBuilder hierarchyBuilder;
+    hierarchyBuilder.update(mLifecycleManager);
 
     float firstFps = 44.0;
     float secondFps = 53.0;
 
-    EXPECT_CALL(mFrameTimeline, computeFps(UnorderedElementsAre(mTarget->getSequence())))
+    EXPECT_CALL(mFrameTimeline, computeFps(UnorderedElementsAre(11)))
             .WillOnce(Return(firstFps))
             .WillOnce(Return(secondFps));
 
     mFpsReporter->addListener(mFpsListener, kTaskId);
     mClock->advanceTime(600ms);
-    mFpsReporter->dispatchLayerFps();
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
     EXPECT_EQ(firstFps, mFpsListener->lastReportedFps);
     mClock->advanceTime(200ms);
-    mFpsReporter->dispatchLayerFps();
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
     EXPECT_EQ(firstFps, mFpsListener->lastReportedFps);
     mClock->advanceTime(200ms);
-    mFpsReporter->dispatchLayerFps();
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
     EXPECT_EQ(firstFps, mFpsListener->lastReportedFps);
     mClock->advanceTime(200ms);
-    mFpsReporter->dispatchLayerFps();
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
     EXPECT_EQ(secondFps, mFpsListener->lastReportedFps);
 }
 

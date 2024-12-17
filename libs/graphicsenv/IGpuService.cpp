@@ -61,12 +61,50 @@ public:
         remote()->transact(BnGpuService::SET_TARGET_STATS, data, &reply, IBinder::FLAG_ONEWAY);
     }
 
+    void setTargetStatsArray(const std::string& appPackageName, const uint64_t driverVersionCode,
+                             const GpuStatsInfo::Stats stats, const uint64_t* values,
+                             const uint32_t valueCount) override {
+        Parcel data, reply;
+        data.writeInterfaceToken(IGpuService::getInterfaceDescriptor());
+
+        data.writeUtf8AsUtf16(appPackageName);
+        data.writeUint64(driverVersionCode);
+        data.writeInt32(static_cast<int32_t>(stats));
+        data.writeUint32(valueCount);
+        data.write(values, valueCount * sizeof(uint64_t));
+
+        remote()->transact(BnGpuService::SET_TARGET_STATS_ARRAY, data, &reply,
+                           IBinder::FLAG_ONEWAY);
+    }
+
+    void addVulkanEngineName(const std::string& appPackageName, const uint64_t driverVersionCode,
+                             const char* engineName) override {
+        Parcel data, reply;
+        data.writeInterfaceToken(IGpuService::getInterfaceDescriptor());
+
+        data.writeUtf8AsUtf16(appPackageName);
+        data.writeUint64(driverVersionCode);
+        data.writeCString(engineName);
+
+        remote()->transact(BnGpuService::ADD_VULKAN_ENGINE_NAME, data, &reply,
+                           IBinder::FLAG_ONEWAY);
+    }
+
     void setUpdatableDriverPath(const std::string& driverPath) override {
         Parcel data, reply;
         data.writeInterfaceToken(IGpuService::getInterfaceDescriptor());
         data.writeUtf8AsUtf16(driverPath);
 
         remote()->transact(BnGpuService::SET_UPDATABLE_DRIVER_PATH, data, &reply,
+                           IBinder::FLAG_ONEWAY);
+    }
+
+    void toggleAngleAsSystemDriver(bool enabled) override {
+        Parcel data, reply;
+        data.writeInterfaceToken(IGpuService::getInterfaceDescriptor());
+        data.writeBool(enabled);
+
+        remote()->transact(BnGpuService::TOGGLE_ANGLE_AS_SYSTEM_DRIVER, data, &reply,
                            IBinder::FLAG_ONEWAY);
     }
 
@@ -147,6 +185,46 @@ status_t BnGpuService::onTransact(uint32_t code, const Parcel& data, Parcel* rep
 
             return OK;
         }
+        case SET_TARGET_STATS_ARRAY: {
+            CHECK_INTERFACE(IGpuService, data, reply);
+
+            std::string appPackageName;
+            if ((status = data.readUtf8FromUtf16(&appPackageName)) != OK) return status;
+
+            uint64_t driverVersionCode;
+            if ((status = data.readUint64(&driverVersionCode)) != OK) return status;
+
+            int32_t stats;
+            if ((status = data.readInt32(&stats)) != OK) return status;
+
+            uint32_t valueCount;
+            if ((status = data.readUint32(&valueCount)) != OK) return status;
+
+            std::vector<uint64_t> values(valueCount);
+            if ((status = data.read(values.data(), valueCount * sizeof(uint64_t))) != OK) {
+                return status;
+            }
+
+            setTargetStatsArray(appPackageName, driverVersionCode,
+                                static_cast<GpuStatsInfo::Stats>(stats), values.data(), valueCount);
+
+            return OK;
+        }
+        case ADD_VULKAN_ENGINE_NAME: {
+            CHECK_INTERFACE(IGpuService, data, reply);
+
+            std::string appPackageName;
+            if ((status = data.readUtf8FromUtf16(&appPackageName)) != OK) return status;
+
+            uint64_t driverVersionCode;
+            if ((status = data.readUint64(&driverVersionCode)) != OK) return status;
+
+            const char* engineName;
+            if ((engineName = data.readCString()) == nullptr) return BAD_VALUE;
+
+            addVulkanEngineName(appPackageName, driverVersionCode, engineName);
+            return OK;
+        }
         case SET_UPDATABLE_DRIVER_PATH: {
             CHECK_INTERFACE(IGpuService, data, reply);
 
@@ -163,9 +241,9 @@ status_t BnGpuService::onTransact(uint32_t code, const Parcel& data, Parcel* rep
             return reply->writeUtf8AsUtf16(driverPath);
         }
         case SHELL_COMMAND_TRANSACTION: {
-            int in = data.readFileDescriptor();
-            int out = data.readFileDescriptor();
-            int err = data.readFileDescriptor();
+            int in = dup(data.readFileDescriptor());
+            int out = dup(data.readFileDescriptor());
+            int err = dup(data.readFileDescriptor());
 
             std::vector<String16> args;
             data.readString16Vector(&args);
@@ -178,7 +256,19 @@ status_t BnGpuService::onTransact(uint32_t code, const Parcel& data, Parcel* rep
 
             status = shellCommand(in, out, err, args);
             if (resultReceiver != nullptr) resultReceiver->send(status);
+            ::close(in);
+            ::close(out);
+            ::close(err);
 
+            return OK;
+        }
+        case TOGGLE_ANGLE_AS_SYSTEM_DRIVER: {
+            CHECK_INTERFACE(IGpuService, data, reply);
+
+            bool enableAngleAsSystemDriver;
+            if ((status = data.readBool(&enableAngleAsSystemDriver)) != OK) return status;
+
+            toggleAngleAsSystemDriver(enableAngleAsSystemDriver);
             return OK;
         }
         default:

@@ -27,13 +27,9 @@
 #include <optional>
 
 #include <android-base/properties.h>
+#include <common/trace.h>
 #include <utils/Log.h>
 #include <utils/Mutex.h>
-#include <utils/Trace.h>
-
-#include <android/hardware/power/1.3/IPower.h>
-#include <android/hardware/power/IPowerHintSession.h>
-#include <android/hardware/power/WorkDuration.h>
 
 #include <binder/IServiceManager.h>
 
@@ -49,17 +45,22 @@ PowerAdvisor::~PowerAdvisor() = default;
 
 namespace impl {
 
-namespace V1_0 = android::hardware::power::V1_0;
-namespace V1_3 = android::hardware::power::V1_3;
-using V1_3::PowerHint;
+using aidl::android::hardware::power::Boost;
+using aidl::android::hardware::power::ChannelConfig;
+using aidl::android::hardware::power::Mode;
+using aidl::android::hardware::power::SessionHint;
+using aidl::android::hardware::power::SessionTag;
+using aidl::android::hardware::power::WorkDuration;
+using aidl::android::hardware::power::WorkDurationFixedV1;
 
-using android::hardware::power::Boost;
-using android::hardware::power::IPower;
-using android::hardware::power::IPowerHintSession;
-using android::hardware::power::Mode;
-using android::hardware::power::WorkDuration;
+using aidl::android::hardware::common::fmq::MQDescriptor;
+using aidl::android::hardware::common::fmq::SynchronizedReadWrite;
+using aidl::android::hardware::power::ChannelMessage;
+using android::hardware::EventFlag;
 
-using scheduler::OneShotTimer;
+using ChannelMessageContents = ChannelMessage::ChannelMessageContents;
+using MsgQueue = android::AidlMessageQueue<ChannelMessage, SynchronizedReadWrite>;
+using FlagQueue = android::AidlMessageQueue<int8_t, SynchronizedReadWrite>;
 
 PowerAdvisor::~PowerAdvisor() = default;
 
@@ -73,15 +74,16 @@ std::chrono::milliseconds getUpdateTimeout() {
 
 void traceExpensiveRendering(bool enabled) {
     if (enabled) {
-        ATRACE_ASYNC_BEGIN("ExpensiveRendering", 0);
+        SFTRACE_ASYNC_BEGIN("ExpensiveRendering", 0);
     } else {
-        ATRACE_ASYNC_END("ExpensiveRendering", 0);
+        SFTRACE_ASYNC_END("ExpensiveRendering", 0);
     }
 }
 
 } // namespace
 
-PowerAdvisor::PowerAdvisor(SurfaceFlinger& flinger) : mFlinger(flinger) {
+PowerAdvisor::PowerAdvisor(SurfaceFlinger& flinger)
+      : mPowerHal(std::make_unique<power::PowerHalController>()), mFlinger(flinger) {
     if (getUpdateTimeout() > 0ms) {
         mScreenUpdateTimer.emplace("UpdateImminentTimer", getUpdateTimeout(),
                                    /* resetCallback */ nullptr,
@@ -118,6 +120,10 @@ void PowerAdvisor::onBootFinished() {
 }
 
 void PowerAdvisor::setExpensiveRenderingExpected(DisplayId displayId, bool expected) {
+    if (!mHasExpensiveRendering) {
+        ALOGV("Skipped sending EXPENSIVE_RENDERING because HAL doesn't support it");
+        return;
+    }
     if (expected) {
         mExpensiveDisplays.insert(displayId);
     } else {
@@ -126,23 +132,29 @@ void PowerAdvisor::setExpensiveRenderingExpected(DisplayId displayId, bool expec
 
     const bool expectsExpensiveRendering = !mExpensiveDisplays.empty();
     if (mNotifiedExpensiveRendering != expectsExpensiveRendering) {
-        std::lock_guard lock(mPowerHalMutex);
-        HalWrapper* const halWrapper = getPowerHal();
-        if (halWrapper == nullptr) {
-            return;
-        }
-
-        if (!halWrapper->setExpensiveRendering(expectsExpensiveRendering)) {
-            // The HAL has become unavailable; attempt to reconnect later
-            mReconnectPowerHal = true;
+        auto ret = getPowerHal().setMode(Mode::EXPENSIVE_RENDERING, expectsExpensiveRendering);
+        if (!ret.isOk()) {
+            if (ret.isUnsupported()) {
+                mHasExpensiveRendering = false;
+            }
             return;
         }
 
         mNotifiedExpensiveRendering = expectsExpensiveRendering;
+        traceExpensiveRendering(mNotifiedExpensiveRendering);
     }
 }
 
-void PowerAdvisor::notifyDisplayUpdateImminent() {
+void PowerAdvisor::notifyCpuLoadUp() {
+    // Only start sending this notification once the system has booted so we don't introduce an
+    // early-boot dependency on Power HAL
+    if (!mBootFinished.load()) {
+        return;
+    }
+    sendHintSessionHint(SessionHint::CPU_LOAD_UP);
+}
+
+void PowerAdvisor::notifyDisplayUpdateImminentAndCpuReset() {
     // Only start sending this notification once the system has booted so we don't introduce an
     // early-boot dependency on Power HAL
     if (!mBootFinished.load()) {
@@ -150,16 +162,16 @@ void PowerAdvisor::notifyDisplayUpdateImminent() {
     }
 
     if (mSendUpdateImminent.exchange(false)) {
-        std::lock_guard lock(mPowerHalMutex);
-        HalWrapper* const halWrapper = getPowerHal();
-        if (halWrapper == nullptr) {
-            return;
-        }
+        ALOGV("AIDL notifyDisplayUpdateImminentAndCpuReset");
+        sendHintSessionHint(SessionHint::CPU_LOAD_RESET);
 
-        if (!halWrapper->notifyDisplayUpdateImminent()) {
-            // The HAL has become unavailable; attempt to reconnect later
-            mReconnectPowerHal = true;
-            return;
+        if (!mHasDisplayUpdateImminent) {
+            ALOGV("Skipped sending DISPLAY_UPDATE_IMMINENT because HAL doesn't support it");
+        } else {
+            auto ret = getPowerHal().setBoost(Boost::DISPLAY_UPDATE_IMMINENT, 0);
+            if (ret.isUnsupported()) {
+                mHasDisplayUpdateImminent = false;
+            }
         }
 
         if (mScreenUpdateTimer) {
@@ -176,98 +188,300 @@ void PowerAdvisor::notifyDisplayUpdateImminent() {
     }
 }
 
-// checks both if it supports and if it's enabled
 bool PowerAdvisor::usePowerHintSession() {
     // uses cached value since the underlying support and flag are unlikely to change at runtime
-    return mPowerHintEnabled.value_or(false) && supportsPowerHintSession();
+    return mHintSessionEnabled.value_or(false) && supportsPowerHintSession();
 }
 
 bool PowerAdvisor::supportsPowerHintSession() {
-    // cache to avoid needing lock every time
-    if (!mSupportsPowerHint.has_value()) {
-        std::lock_guard lock(mPowerHalMutex);
-        HalWrapper* const halWrapper = getPowerHal();
-        mSupportsPowerHint = halWrapper && halWrapper->supportsPowerHintSession();
+    if (!mSupportsHintSession.has_value()) {
+        mSupportsHintSession = getPowerHal().getHintSessionPreferredRate().isOk();
     }
-    return *mSupportsPowerHint;
+    return *mSupportsHintSession;
 }
 
-bool PowerAdvisor::isPowerHintSessionRunning() {
-    return mPowerHintSessionRunning;
+bool PowerAdvisor::shouldCreateSessionWithConfig() {
+    return mSessionConfigSupported && mBootFinished &&
+            FlagManager::getInstance().adpf_use_fmq_channel();
 }
 
-void PowerAdvisor::setTargetWorkDuration(int64_t targetDuration) {
-    if (!usePowerHintSession()) {
-        ALOGV("Power hint session target duration cannot be set, skipping");
+void PowerAdvisor::sendHintSessionHint(SessionHint hint) {
+    if (!mBootFinished || !usePowerHintSession()) {
+        ALOGV("Power hint session is not enabled, skip sending session hint");
         return;
     }
+    SFTRACE_CALL();
+    if (sTraceHintSessionData) SFTRACE_INT("Session hint", static_cast<int>(hint));
     {
-        std::lock_guard lock(mPowerHalMutex);
-        HalWrapper* const halWrapper = getPowerHal();
-        if (halWrapper != nullptr) {
-            halWrapper->setTargetWorkDuration(targetDuration);
+        std::scoped_lock lock(mHintSessionMutex);
+        if (!ensurePowerHintSessionRunning()) {
+            ALOGV("Hint session not running and could not be started, skip sending session hint");
+            return;
+        }
+        ALOGV("Sending session hint: %d", static_cast<int>(hint));
+        if (!writeHintSessionMessage<ChannelMessageContents::Tag::hint>(&hint, 1)) {
+            auto ret = mHintSession->sendHint(hint);
+            if (!ret.isOk()) {
+                ALOGW("Failed to send session hint with error: %s", ret.errorMessage());
+                mHintSession = nullptr;
+            }
         }
     }
 }
 
-void PowerAdvisor::sendActualWorkDuration() {
+bool PowerAdvisor::ensurePowerHintSessionRunning() {
+    if (mHintSession == nullptr && !mHintSessionThreadIds.empty() && usePowerHintSession()) {
+        if (shouldCreateSessionWithConfig()) {
+            auto ret = getPowerHal().createHintSessionWithConfig(getpid(),
+                                                                 static_cast<int32_t>(getuid()),
+                                                                 mHintSessionThreadIds,
+                                                                 mTargetDuration.ns(),
+                                                                 SessionTag::SURFACEFLINGER,
+                                                                 &mSessionConfig);
+            if (ret.isOk()) {
+                mHintSession = ret.value();
+                if (FlagManager::getInstance().adpf_use_fmq_channel_fixed()) {
+                    setUpFmq();
+                }
+            }
+            // If it fails the first time we try, or ever returns unsupported, assume unsupported
+            else if (mFirstConfigSupportCheck || ret.isUnsupported()) {
+                ALOGI("Hint session with config is unsupported, falling back to a legacy session");
+                mSessionConfigSupported = false;
+            }
+            mFirstConfigSupportCheck = false;
+        }
+        // Immediately try original method after, in case the first way returned unsupported
+        if (mHintSession == nullptr && !shouldCreateSessionWithConfig()) {
+            auto ret = getPowerHal().createHintSession(getpid(), static_cast<int32_t>(getuid()),
+                                                       mHintSessionThreadIds, mTargetDuration.ns());
+            if (ret.isOk()) {
+                mHintSession = ret.value();
+            }
+        }
+    }
+    return mHintSession != nullptr;
+}
+
+void PowerAdvisor::setUpFmq() {
+    auto&& channelRet = getPowerHal().getSessionChannel(getpid(), static_cast<int32_t>(getuid()));
+    if (!channelRet.isOk()) {
+        ALOGE("Failed to get session channel with error: %s", channelRet.errorMessage());
+        return;
+    }
+    auto& channelConfig = channelRet.value();
+    mMsgQueue = std::make_unique<MsgQueue>(std::move(channelConfig.channelDescriptor), true);
+    LOG_ALWAYS_FATAL_IF(!mMsgQueue->isValid(), "Failed to set up hint session msg queue");
+    LOG_ALWAYS_FATAL_IF(channelConfig.writeFlagBitmask <= 0,
+                        "Invalid flag bit masks found in channel config: writeBitMask(%d)",
+                        channelConfig.writeFlagBitmask);
+    mFmqWriteMask = static_cast<uint32_t>(channelConfig.writeFlagBitmask);
+    if (!channelConfig.eventFlagDescriptor.has_value()) {
+        // For FMQ v1 in Android 15 we will force using shared event flag since the default
+        // no-op FMQ impl in Power HAL v5 will always return a valid channel config with
+        // non-zero masks but no shared flag.
+        mMsgQueue = nullptr;
+        ALOGE("No event flag descriptor found in channel config");
+        return;
+    }
+    mFlagQueue = std::make_unique<FlagQueue>(std::move(*channelConfig.eventFlagDescriptor), true);
+    LOG_ALWAYS_FATAL_IF(!mFlagQueue->isValid(), "Failed to set up hint session flag queue");
+    auto status = EventFlag::createEventFlag(mFlagQueue->getEventFlagWord(), &mEventFlag);
+    LOG_ALWAYS_FATAL_IF(status != OK, "Failed to set up hint session event flag");
+}
+
+void PowerAdvisor::updateTargetWorkDuration(Duration targetDuration) {
     if (!mBootFinished || !usePowerHintSession()) {
+        ALOGV("Power hint session is not enabled, skipping target update");
+        return;
+    }
+    SFTRACE_CALL();
+    {
+        mTargetDuration = targetDuration;
+        if (sTraceHintSessionData) SFTRACE_INT64("Time target", targetDuration.ns());
+        if (targetDuration == mLastTargetDurationSent) return;
+        std::scoped_lock lock(mHintSessionMutex);
+        if (!ensurePowerHintSessionRunning()) {
+            ALOGV("Hint session not running and could not be started, skip updating target");
+            return;
+        }
+        ALOGV("Sending target time: %" PRId64 "ns", targetDuration.ns());
+        mLastTargetDurationSent = targetDuration;
+        auto target = targetDuration.ns();
+        if (!writeHintSessionMessage<ChannelMessageContents::Tag::targetDuration>(&target, 1)) {
+            auto ret = mHintSession->updateTargetWorkDuration(targetDuration.ns());
+            if (!ret.isOk()) {
+                ALOGW("Failed to set power hint target work duration with error: %s",
+                      ret.errorMessage());
+                mHintSession = nullptr;
+            }
+        }
+    }
+}
+
+void PowerAdvisor::reportActualWorkDuration() {
+    if (!mBootFinished || !sUseReportActualDuration || !usePowerHintSession()) {
         ALOGV("Actual work duration power hint cannot be sent, skipping");
         return;
     }
-    const std::optional<nsecs_t> actualDuration = estimateWorkDuration(false);
-    if (actualDuration.has_value()) {
-        std::lock_guard lock(mPowerHalMutex);
-        HalWrapper* const halWrapper = getPowerHal();
-        if (halWrapper != nullptr) {
-            halWrapper->sendActualWorkDuration(*actualDuration + kTargetSafetyMargin.count(),
-                                               systemTime());
-        }
-    }
-}
-
-void PowerAdvisor::sendPredictedWorkDuration() {
-    if (!mBootFinished || !usePowerHintSession()) {
-        ALOGV("Actual work duration power hint cannot be sent, skipping");
+    SFTRACE_CALL();
+    std::optional<WorkDuration> actualDuration = estimateWorkDuration();
+    if (!actualDuration.has_value() || actualDuration->durationNanos < 0) {
+        ALOGV("Failed to send actual work duration, skipping");
         return;
     }
-
-    const std::optional<nsecs_t> predictedDuration = estimateWorkDuration(true);
-
-    if (predictedDuration.has_value()) {
-        std::lock_guard lock(mPowerHalMutex);
-        HalWrapper* const halWrapper = getPowerHal();
-        if (halWrapper != nullptr) {
-            halWrapper->sendActualWorkDuration(*predictedDuration + kTargetSafetyMargin.count(),
-                                               systemTime());
+    actualDuration->durationNanos += sTargetSafetyMargin.ns();
+    if (sTraceHintSessionData) {
+        SFTRACE_INT64("Measured duration", actualDuration->durationNanos);
+        SFTRACE_INT64("Target error term", actualDuration->durationNanos - mTargetDuration.ns());
+        SFTRACE_INT64("Reported duration", actualDuration->durationNanos);
+        if (supportsGpuReporting()) {
+            SFTRACE_INT64("Reported cpu duration", actualDuration->cpuDurationNanos);
+            SFTRACE_INT64("Reported gpu duration", actualDuration->gpuDurationNanos);
         }
+        SFTRACE_INT64("Reported target", mLastTargetDurationSent.ns());
+        SFTRACE_INT64("Reported target error term",
+                      actualDuration->durationNanos - mLastTargetDurationSent.ns());
     }
-}
 
-void PowerAdvisor::enablePowerHint(bool enabled) {
-    mPowerHintEnabled = enabled;
-}
+    ALOGV("Sending actual work duration of: %" PRId64 " with cpu: %" PRId64 " and gpu: %" PRId64
+          " on reported target: %" PRId64 " with error: %" PRId64,
+          actualDuration->durationNanos, actualDuration->cpuDurationNanos,
+          actualDuration->gpuDurationNanos, mLastTargetDurationSent.ns(),
+          actualDuration->durationNanos - mLastTargetDurationSent.ns());
 
-bool PowerAdvisor::startPowerHintSession(const std::vector<int32_t>& threadIds) {
-    if (!usePowerHintSession()) {
-        ALOGI("Power hint session cannot be started, skipping");
+    if (mTimingTestingMode) {
+        mDelayReportActualMutexAcquisitonPromise.get_future().wait();
+        mDelayReportActualMutexAcquisitonPromise = std::promise<bool>{};
     }
+
     {
-        std::lock_guard lock(mPowerHalMutex);
-        HalWrapper* halWrapper = getPowerHal();
-        if (halWrapper != nullptr && usePowerHintSession()) {
-            halWrapper->setPowerHintSessionThreadIds(threadIds);
-            mPowerHintSessionRunning = halWrapper->startPowerHintSession();
+        std::scoped_lock lock(mHintSessionMutex);
+        if (!ensurePowerHintSessionRunning()) {
+            ALOGV("Hint session not running and could not be started, skip reporting durations");
+            return;
+        }
+        mHintSessionQueue.push_back(*actualDuration);
+        if (!writeHintSessionMessage<
+                    ChannelMessageContents::Tag::workDuration>(mHintSessionQueue.data(),
+                                                               mHintSessionQueue.size())) {
+            auto ret = mHintSession->reportActualWorkDuration(mHintSessionQueue);
+            if (!ret.isOk()) {
+                ALOGW("Failed to report actual work durations with error: %s", ret.errorMessage());
+                mHintSession = nullptr;
+                return;
+            }
         }
     }
-    return mPowerHintSessionRunning;
+    mHintSessionQueue.clear();
 }
 
-void PowerAdvisor::setGpuFenceTime(DisplayId displayId, std::unique_ptr<FenceTime>&& fenceTime) {
+template <ChannelMessage::ChannelMessageContents::Tag T, class In>
+bool PowerAdvisor::writeHintSessionMessage(In* contents, size_t count) {
+    if (!mMsgQueue) {
+        ALOGV("Skip using FMQ with message tag %hhd as it's not supported", T);
+        return false;
+    }
+    auto availableSize = mMsgQueue->availableToWrite();
+    if (availableSize < count) {
+        ALOGW("Skip using FMQ with message tag %hhd as there isn't enough space", T);
+        return false;
+    }
+    MsgQueue::MemTransaction tx;
+    if (!mMsgQueue->beginWrite(count, &tx)) {
+        ALOGW("Failed to begin writing message with tag %hhd", T);
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if constexpr (T == ChannelMessageContents::Tag::workDuration) {
+            const WorkDuration& duration = contents[i];
+            new (tx.getSlot(i)) ChannelMessage{
+                    .sessionID = static_cast<int32_t>(mSessionConfig.id),
+                    .timeStampNanos =
+                            (i == count - 1) ? ::android::uptimeNanos() : duration.timeStampNanos,
+                    .data = ChannelMessageContents::make<ChannelMessageContents::Tag::workDuration,
+                                                         WorkDurationFixedV1>({
+                            .durationNanos = duration.durationNanos,
+                            .workPeriodStartTimestampNanos = duration.workPeriodStartTimestampNanos,
+                            .cpuDurationNanos = duration.cpuDurationNanos,
+                            .gpuDurationNanos = duration.gpuDurationNanos,
+                    }),
+            };
+        } else {
+            new (tx.getSlot(i)) ChannelMessage{
+                    .sessionID = static_cast<int32_t>(mSessionConfig.id),
+                    .timeStampNanos = ::android::uptimeNanos(),
+                    .data = ChannelMessageContents::make<T, In>(std::move(contents[i])),
+            };
+        }
+    }
+    if (!mMsgQueue->commitWrite(count)) {
+        ALOGW("Failed to send message with tag %hhd, fall back to binder call", T);
+        return false;
+    }
+    mEventFlag->wake(mFmqWriteMask);
+    return true;
+}
+
+void PowerAdvisor::enablePowerHintSession(bool enabled) {
+    mHintSessionEnabled = enabled;
+}
+
+bool PowerAdvisor::startPowerHintSession(std::vector<int32_t>&& threadIds) {
+    mHintSessionThreadIds = threadIds;
+    if (!mBootFinished.load()) {
+        return false;
+    }
+    if (!usePowerHintSession()) {
+        ALOGI("Cannot start power hint session: disabled or unsupported");
+        return false;
+    }
+    LOG_ALWAYS_FATAL_IF(mHintSessionThreadIds.empty(),
+                        "No thread IDs provided to power hint session!");
+    {
+        std::scoped_lock lock(mHintSessionMutex);
+        if (mHintSession != nullptr) {
+            ALOGE("Cannot start power hint session: already running");
+            return false;
+        }
+        return ensurePowerHintSessionRunning();
+    }
+}
+
+bool PowerAdvisor::supportsGpuReporting() {
+    return mBootFinished && FlagManager::getInstance().adpf_gpu_sf();
+}
+
+void PowerAdvisor::setGpuStartTime(DisplayId displayId, TimePoint startTime) {
     DisplayTimingData& displayData = mDisplayTimingData[displayId];
     if (displayData.gpuEndFenceTime) {
         nsecs_t signalTime = displayData.gpuEndFenceTime->getSignalTime();
         if (signalTime != Fence::SIGNAL_TIME_INVALID && signalTime != Fence::SIGNAL_TIME_PENDING) {
+            displayData.lastValidGpuStartTime = displayData.gpuStartTime;
+            displayData.lastValidGpuEndTime = TimePoint::fromNs(signalTime);
+            for (auto&& [_, otherDisplayData] : mDisplayTimingData) {
+                if (!otherDisplayData.lastValidGpuStartTime.has_value() ||
+                    !otherDisplayData.lastValidGpuEndTime.has_value())
+                    continue;
+                if ((*otherDisplayData.lastValidGpuStartTime < *displayData.gpuStartTime) &&
+                    (*otherDisplayData.lastValidGpuEndTime > *displayData.gpuStartTime)) {
+                    displayData.lastValidGpuStartTime = *otherDisplayData.lastValidGpuEndTime;
+                    break;
+                }
+            }
+        }
+        displayData.gpuEndFenceTime = nullptr;
+    }
+    displayData.gpuStartTime = startTime;
+}
+
+void PowerAdvisor::setGpuFenceTime(DisplayId displayId, std::unique_ptr<FenceTime>&& fenceTime) {
+    DisplayTimingData& displayData = mDisplayTimingData[displayId];
+    if (displayData.gpuEndFenceTime && !supportsGpuReporting()) {
+        nsecs_t signalTime = displayData.gpuEndFenceTime->getSignalTime();
+        if (signalTime != Fence::SIGNAL_TIME_INVALID && signalTime != Fence::SIGNAL_TIME_PENDING) {
+            displayData.lastValidGpuStartTime = displayData.gpuStartTime;
+            displayData.lastValidGpuEndTime = TimePoint::fromNs(signalTime);
             for (auto&& [_, otherDisplayData] : mDisplayTimingData) {
                 // If the previous display started before us but ended after we should have
                 // started, then it likely delayed our start time and we must compensate for that.
@@ -280,23 +494,23 @@ void PowerAdvisor::setGpuFenceTime(DisplayId displayId, std::unique_ptr<FenceTim
                     break;
                 }
             }
-            displayData.lastValidGpuStartTime = displayData.gpuStartTime;
-            displayData.lastValidGpuEndTime = signalTime;
         }
     }
     displayData.gpuEndFenceTime = std::move(fenceTime);
-    displayData.gpuStartTime = systemTime();
+    if (!supportsGpuReporting()) {
+        displayData.gpuStartTime = TimePoint::now();
+    }
 }
 
-void PowerAdvisor::setHwcValidateTiming(DisplayId displayId, nsecs_t validateStartTime,
-                                        nsecs_t validateEndTime) {
+void PowerAdvisor::setHwcValidateTiming(DisplayId displayId, TimePoint validateStartTime,
+                                        TimePoint validateEndTime) {
     DisplayTimingData& displayData = mDisplayTimingData[displayId];
     displayData.hwcValidateStartTime = validateStartTime;
     displayData.hwcValidateEndTime = validateEndTime;
 }
 
-void PowerAdvisor::setHwcPresentTiming(DisplayId displayId, nsecs_t presentStartTime,
-                                       nsecs_t presentEndTime) {
+void PowerAdvisor::setHwcPresentTiming(DisplayId displayId, TimePoint presentStartTime,
+                                       TimePoint presentEndTime) {
     DisplayTimingData& displayData = mDisplayTimingData[displayId];
     displayData.hwcPresentStartTime = presentStartTime;
     displayData.hwcPresentEndTime = presentEndTime;
@@ -306,48 +520,45 @@ void PowerAdvisor::setSkippedValidate(DisplayId displayId, bool skipped) {
     mDisplayTimingData[displayId].skippedValidate = skipped;
 }
 
-void PowerAdvisor::setRequiresClientComposition(DisplayId displayId,
-                                                bool requiresClientComposition) {
-    mDisplayTimingData[displayId].usedClientComposition = requiresClientComposition;
+void PowerAdvisor::setRequiresRenderEngine(DisplayId displayId, bool requiresRenderEngine) {
+    mDisplayTimingData[displayId].requiresRenderEngine = requiresRenderEngine;
 }
 
-void PowerAdvisor::setExpectedPresentTime(nsecs_t expectedPresentTime) {
+void PowerAdvisor::setExpectedPresentTime(TimePoint expectedPresentTime) {
     mExpectedPresentTimes.append(expectedPresentTime);
 }
 
-void PowerAdvisor::setSfPresentTiming(nsecs_t presentFenceTime, nsecs_t presentEndTime) {
-    mLastSfPresentEndTime = presentEndTime;
+void PowerAdvisor::setSfPresentTiming(TimePoint presentFenceTime, TimePoint presentEndTime) {
     mLastPresentFenceTime = presentFenceTime;
+    mLastSfPresentEndTime = presentEndTime;
 }
 
-void PowerAdvisor::setFrameDelay(nsecs_t frameDelayDuration) {
+void PowerAdvisor::setFrameDelay(Duration frameDelayDuration) {
     mFrameDelayDuration = frameDelayDuration;
 }
 
-void PowerAdvisor::setHwcPresentDelayedTime(
-        DisplayId displayId, std::chrono::steady_clock::time_point earliestFrameStartTime) {
-    mDisplayTimingData[displayId].hwcPresentDelayedTime =
-            (earliestFrameStartTime - std::chrono::steady_clock::now()).count() + systemTime();
+void PowerAdvisor::setHwcPresentDelayedTime(DisplayId displayId, TimePoint earliestFrameStartTime) {
+    mDisplayTimingData[displayId].hwcPresentDelayedTime = earliestFrameStartTime;
 }
 
-void PowerAdvisor::setCommitStart(nsecs_t commitStartTime) {
+void PowerAdvisor::setCommitStart(TimePoint commitStartTime) {
     mCommitStartTimes.append(commitStartTime);
 }
 
-void PowerAdvisor::setCompositeEnd(nsecs_t compositeEnd) {
-    mLastPostcompDuration = compositeEnd - mLastSfPresentEndTime;
+void PowerAdvisor::setCompositeEnd(TimePoint compositeEndTime) {
+    mLastPostcompDuration = compositeEndTime - mLastSfPresentEndTime;
 }
 
 void PowerAdvisor::setDisplays(std::vector<DisplayId>& displayIds) {
     mDisplayIds = displayIds;
 }
 
-void PowerAdvisor::setTotalFrameTargetWorkDuration(nsecs_t targetDuration) {
+void PowerAdvisor::setTotalFrameTargetWorkDuration(Duration targetDuration) {
     mTotalFrameTargetDuration = targetDuration;
 }
 
 std::vector<DisplayId> PowerAdvisor::getOrderedDisplayIds(
-        std::optional<nsecs_t> DisplayTimingData::*sortBy) {
+        std::optional<TimePoint> DisplayTimingData::*sortBy) {
     std::vector<DisplayId> sortedDisplays;
     std::copy_if(mDisplayIds.begin(), mDisplayIds.end(), std::back_inserter(sortedDisplays),
                  [&](DisplayId id) {
@@ -360,39 +571,29 @@ std::vector<DisplayId> PowerAdvisor::getOrderedDisplayIds(
     return sortedDisplays;
 }
 
-std::optional<nsecs_t> PowerAdvisor::estimateWorkDuration(bool earlyHint) {
-    if (earlyHint && (!mExpectedPresentTimes.isFull() || !mCommitStartTimes.isFull())) {
+std::optional<WorkDuration> PowerAdvisor::estimateWorkDuration() {
+    if (!mExpectedPresentTimes.isFull() || !mCommitStartTimes.isFull()) {
         return std::nullopt;
     }
 
     // Tracks when we finish presenting to hwc
-    nsecs_t estimatedEndTime = mCommitStartTimes[0];
+    TimePoint estimatedHwcEndTime = mCommitStartTimes[0];
 
     // How long we spent this frame not doing anything, waiting for fences or vsync
-    nsecs_t idleDuration = 0;
+    Duration idleDuration = 0ns;
 
     // Most recent previous gpu end time in the current frame, probably from a prior display, used
     // as the start time for the next gpu operation if it ran over time since it probably blocked
-    std::optional<nsecs_t> previousValidGpuEndTime;
+    std::optional<TimePoint> previousValidGpuEndTime;
 
     // The currently estimated gpu end time for the frame,
     // used to accumulate gpu time as we iterate over the active displays
-    std::optional<nsecs_t> estimatedGpuEndTime;
+    std::optional<TimePoint> estimatedGpuEndTime;
 
-    // If we're predicting at the start of the frame, we use last frame as our reference point
-    // If we're predicting at the end of the frame, we use the current frame as a reference point
-    nsecs_t referenceFrameStartTime = (earlyHint ? mCommitStartTimes[-1] : mCommitStartTimes[0]);
-
-    // When the prior frame should be presenting to the display
-    // If we're predicting at the start of the frame, we use last frame's expected present time
-    // If we're predicting at the end of the frame, the present fence time is already known
-    nsecs_t lastFramePresentTime = (earlyHint ? mExpectedPresentTimes[-1] : mLastPresentFenceTime);
-
-    // The timing info for the previously calculated display, if there was one
-    std::optional<DisplayTimeline> previousDisplayReferenceTiming;
     std::vector<DisplayId>&& displayIds =
             getOrderedDisplayIds(&DisplayTimingData::hwcPresentStartTime);
-    DisplayTimeline referenceTiming, estimatedTiming;
+    DisplayTimeline displayTiming;
+    std::optional<GpuTimeline> firstGpuTimeline;
 
     // Iterate over the displays that use hwc in the same order they are presented
     for (DisplayId displayId : displayIds) {
@@ -402,112 +603,92 @@ std::optional<nsecs_t> PowerAdvisor::estimateWorkDuration(bool earlyHint) {
 
         auto& displayData = mDisplayTimingData.at(displayId);
 
-        // mLastPresentFenceTime should always be the time of the reference frame, since it will be
-        // the previous frame's present fence if called at the start, and current frame's if called
-        // at the end
-        referenceTiming = displayData.calculateDisplayTimeline(mLastPresentFenceTime);
-
-        // If this is the first display, include the duration before hwc present starts
-        if (!previousDisplayReferenceTiming.has_value()) {
-            estimatedEndTime += referenceTiming.hwcPresentStartTime - referenceFrameStartTime;
-        } else { // Otherwise add the time since last display's hwc present finished
-            estimatedEndTime += referenceTiming.hwcPresentStartTime -
-                    previousDisplayReferenceTiming->hwcPresentEndTime;
-        }
-
-        // Late hint can re-use reference timing here since it's estimating its own reference frame
-        estimatedTiming = earlyHint
-                ? referenceTiming.estimateTimelineFromReference(lastFramePresentTime,
-                                                                estimatedEndTime)
-                : referenceTiming;
+        displayTiming = displayData.calculateDisplayTimeline(mLastPresentFenceTime);
 
         // Update predicted present finish time with this display's present time
-        estimatedEndTime = estimatedTiming.hwcPresentEndTime;
+        estimatedHwcEndTime = displayTiming.hwcPresentEndTime;
 
         // Track how long we spent waiting for the fence, can be excluded from the timing estimate
-        idleDuration += estimatedTiming.probablyWaitsForPresentFence
-                ? lastFramePresentTime - estimatedTiming.presentFenceWaitStartTime
-                : 0;
+        idleDuration += displayTiming.probablyWaitsForPresentFence
+                ? mLastPresentFenceTime - displayTiming.presentFenceWaitStartTime
+                : 0ns;
 
         // Track how long we spent waiting to present, can be excluded from the timing estimate
-        idleDuration += earlyHint ? 0 : referenceTiming.hwcPresentDelayDuration;
+        idleDuration += displayTiming.hwcPresentDelayDuration;
 
         // Estimate the reference frame's gpu timing
         auto gpuTiming = displayData.estimateGpuTiming(previousValidGpuEndTime);
         if (gpuTiming.has_value()) {
+            if (!firstGpuTimeline.has_value()) {
+                firstGpuTimeline = gpuTiming;
+            }
             previousValidGpuEndTime = gpuTiming->startTime + gpuTiming->duration;
 
             // Estimate the prediction frame's gpu end time from the reference frame
-            estimatedGpuEndTime =
-                    std::max(estimatedTiming.hwcPresentStartTime, estimatedGpuEndTime.value_or(0)) +
+            estimatedGpuEndTime = std::max(displayTiming.hwcPresentStartTime,
+                                           estimatedGpuEndTime.value_or(TimePoint{0ns})) +
                     gpuTiming->duration;
         }
-        previousDisplayReferenceTiming = referenceTiming;
     }
-    ATRACE_INT64("Idle duration", idleDuration);
 
-    nsecs_t estimatedFlingerEndTime = earlyHint ? estimatedEndTime : mLastSfPresentEndTime;
+    TimePoint estimatedFlingerEndTime = mLastSfPresentEndTime;
 
     // Don't count time spent idly waiting in the estimate as we could do more work in that time
-    estimatedEndTime -= idleDuration;
+    estimatedHwcEndTime -= idleDuration;
     estimatedFlingerEndTime -= idleDuration;
 
     // We finish the frame when both present and the gpu are done, so wait for the later of the two
     // Also add the frame delay duration since the target did not move while we were delayed
-    nsecs_t totalDuration = mFrameDelayDuration +
-            std::max(estimatedEndTime, estimatedGpuEndTime.value_or(0)) - mCommitStartTimes[0];
+    Duration totalDuration = mFrameDelayDuration +
+            std::max(estimatedHwcEndTime, estimatedGpuEndTime.value_or(TimePoint{0ns})) -
+            mCommitStartTimes[0];
+    Duration totalDurationWithoutGpu =
+            mFrameDelayDuration + estimatedHwcEndTime - mCommitStartTimes[0];
 
     // We finish SurfaceFlinger when post-composition finishes, so add that in here
-    nsecs_t flingerDuration =
+    Duration flingerDuration =
             estimatedFlingerEndTime + mLastPostcompDuration - mCommitStartTimes[0];
+    Duration estimatedGpuDuration = firstGpuTimeline.has_value()
+            ? estimatedGpuEndTime.value_or(TimePoint{0ns}) - firstGpuTimeline->startTime
+            : Duration::fromNs(0);
 
     // Combine the two timings into a single normalized one
-    nsecs_t combinedDuration = combineTimingEstimates(totalDuration, flingerDuration);
+    Duration combinedDuration = combineTimingEstimates(totalDuration, flingerDuration);
+    Duration cpuDuration = combineTimingEstimates(totalDurationWithoutGpu, flingerDuration);
 
-    return std::make_optional(combinedDuration);
+    WorkDuration duration{
+            .timeStampNanos = TimePoint::now().ns(),
+            .durationNanos = combinedDuration.ns(),
+            .workPeriodStartTimestampNanos = mCommitStartTimes[0].ns(),
+            .cpuDurationNanos = supportsGpuReporting() ? cpuDuration.ns() : 0,
+            .gpuDurationNanos = supportsGpuReporting() ? estimatedGpuDuration.ns() : 0,
+    };
+    if (sTraceHintSessionData) {
+        SFTRACE_INT64("Idle duration", idleDuration.ns());
+        SFTRACE_INT64("Total duration", totalDuration.ns());
+        SFTRACE_INT64("Flinger duration", flingerDuration.ns());
+    }
+    return std::make_optional(duration);
 }
 
-nsecs_t PowerAdvisor::combineTimingEstimates(nsecs_t totalDuration, nsecs_t flingerDuration) {
-    nsecs_t targetDuration;
-    {
-        std::lock_guard lock(mPowerHalMutex);
-        targetDuration = *getPowerHal()->getTargetWorkDuration();
-    }
+Duration PowerAdvisor::combineTimingEstimates(Duration totalDuration, Duration flingerDuration) {
+    Duration targetDuration{0ns};
+    targetDuration = mTargetDuration;
     if (!mTotalFrameTargetDuration.has_value()) return flingerDuration;
 
     // Normalize total to the flinger target (vsync period) since that's how often we actually send
     // hints
-    nsecs_t normalizedTotalDuration = (targetDuration * totalDuration) / *mTotalFrameTargetDuration;
+    Duration normalizedTotalDuration = Duration::fromNs((targetDuration.ns() * totalDuration.ns()) /
+                                                        mTotalFrameTargetDuration->ns());
     return std::max(flingerDuration, normalizedTotalDuration);
 }
 
-PowerAdvisor::DisplayTimeline PowerAdvisor::DisplayTimeline::estimateTimelineFromReference(
-        nsecs_t fenceTime, nsecs_t displayStartTime) {
-    DisplayTimeline estimated;
-    estimated.hwcPresentStartTime = displayStartTime;
-
-    // We don't predict waiting for vsync alignment yet
-    estimated.hwcPresentDelayDuration = 0;
-
-    // How long we expect to run before we start waiting for the fence
-    // For now just re-use last frame's post-present duration and assume it will not change much
-    // Excludes time spent waiting for vsync since that's not going to be consistent
-    estimated.presentFenceWaitStartTime = estimated.hwcPresentStartTime +
-            (presentFenceWaitStartTime - (hwcPresentStartTime + hwcPresentDelayDuration));
-    estimated.probablyWaitsForPresentFence = fenceTime > estimated.presentFenceWaitStartTime;
-    estimated.hwcPresentEndTime = postPresentFenceHwcPresentDuration +
-            (estimated.probablyWaitsForPresentFence ? fenceTime
-                                                    : estimated.presentFenceWaitStartTime);
-    return estimated;
-}
-
 PowerAdvisor::DisplayTimeline PowerAdvisor::DisplayTimingData::calculateDisplayTimeline(
-        nsecs_t fenceTime) {
+        TimePoint fenceTime) {
     DisplayTimeline timeline;
     // How long between calling hwc present and trying to wait on the fence
-    const nsecs_t fenceWaitStartDelay =
-            (skippedValidate ? kFenceWaitStartDelaySkippedValidate : kFenceWaitStartDelayValidated)
-                    .count();
+    const Duration fenceWaitStartDelay =
+            (skippedValidate ? kFenceWaitStartDelaySkippedValidate : kFenceWaitStartDelayValidated);
 
     // Did our reference frame wait for an appropriate vsync before calling into hwc
     const bool waitedOnHwcPresentTime = hwcPresentDelayedTime.has_value() &&
@@ -522,7 +703,7 @@ PowerAdvisor::DisplayTimeline PowerAdvisor::DisplayTimingData::calculateDisplayT
 
     // How long hwc present was delayed waiting for the next appropriate vsync
     timeline.hwcPresentDelayDuration =
-            (waitedOnHwcPresentTime ? *hwcPresentDelayedTime - *hwcPresentStartTime : 0);
+            (waitedOnHwcPresentTime ? *hwcPresentDelayedTime - *hwcPresentStartTime : 0ns);
     // When we started waiting for the present fence after calling into hwc present
     timeline.presentFenceWaitStartTime =
             timeline.hwcPresentStartTime + timeline.hwcPresentDelayDuration + fenceWaitStartDelay;
@@ -537,366 +718,45 @@ PowerAdvisor::DisplayTimeline PowerAdvisor::DisplayTimingData::calculateDisplayT
 }
 
 std::optional<PowerAdvisor::GpuTimeline> PowerAdvisor::DisplayTimingData::estimateGpuTiming(
-        std::optional<nsecs_t> previousEnd) {
-    if (!(usedClientComposition && lastValidGpuStartTime.has_value() && gpuEndFenceTime)) {
+        std::optional<TimePoint> previousEndTime) {
+    if (!(requiresRenderEngine && lastValidGpuStartTime.has_value() && gpuEndFenceTime)) {
         return std::nullopt;
     }
-    const nsecs_t latestGpuStartTime = std::max(previousEnd.value_or(0), *gpuStartTime);
-    const nsecs_t latestGpuEndTime = gpuEndFenceTime->getSignalTime();
-    nsecs_t gpuDuration = 0;
-    if (latestGpuEndTime != Fence::SIGNAL_TIME_INVALID &&
-        latestGpuEndTime != Fence::SIGNAL_TIME_PENDING) {
+    const TimePoint latestGpuStartTime =
+            std::max(previousEndTime.value_or(TimePoint{0ns}), *gpuStartTime);
+    const nsecs_t gpuEndFenceSignal = gpuEndFenceTime->getSignalTime();
+    Duration gpuDuration{0ns};
+    if (gpuEndFenceSignal != Fence::SIGNAL_TIME_INVALID &&
+        gpuEndFenceSignal != Fence::SIGNAL_TIME_PENDING) {
+        const TimePoint latestGpuEndTime = TimePoint::fromNs(gpuEndFenceSignal);
+
         // If we know how long the most recent gpu duration was, use that
         gpuDuration = latestGpuEndTime - latestGpuStartTime;
     } else if (lastValidGpuEndTime.has_value()) {
         // If we don't have the fence data, use the most recent information we do have
         gpuDuration = *lastValidGpuEndTime - *lastValidGpuStartTime;
-        if (latestGpuEndTime == Fence::SIGNAL_TIME_PENDING) {
+        if (gpuEndFenceSignal == Fence::SIGNAL_TIME_PENDING) {
             // If pending but went over the previous duration, use current time as the end
-            gpuDuration = std::max(gpuDuration, systemTime() - latestGpuStartTime);
+            gpuDuration = std::max(gpuDuration, Duration{TimePoint::now() - latestGpuStartTime});
         }
     }
     return GpuTimeline{.duration = gpuDuration, .startTime = latestGpuStartTime};
 }
 
-class HidlPowerHalWrapper : public PowerAdvisor::HalWrapper {
-public:
-    HidlPowerHalWrapper(sp<V1_3::IPower> powerHal) : mPowerHal(std::move(powerHal)) {}
-
-    ~HidlPowerHalWrapper() override = default;
-
-    static std::unique_ptr<HalWrapper> connect() {
-        // Power HAL 1.3 is not guaranteed to be available, thus we need to query
-        // Power HAL 1.0 first and try to cast it to Power HAL 1.3.
-        sp<V1_3::IPower> powerHal = nullptr;
-        sp<V1_0::IPower> powerHal_1_0 = V1_0::IPower::getService();
-        if (powerHal_1_0 != nullptr) {
-            // Try to cast to Power HAL 1.3
-            powerHal = V1_3::IPower::castFrom(powerHal_1_0);
-            if (powerHal == nullptr) {
-                ALOGW("No Power HAL 1.3 service in system, disabling PowerAdvisor");
-            } else {
-                ALOGI("Loaded Power HAL 1.3 service");
-            }
-        } else {
-            ALOGW("No Power HAL found, disabling PowerAdvisor");
-        }
-
-        if (powerHal == nullptr) {
-            return nullptr;
-        }
-
-        return std::make_unique<HidlPowerHalWrapper>(std::move(powerHal));
-    }
-
-    bool setExpensiveRendering(bool enabled) override {
-        ALOGV("HIDL setExpensiveRendering %s", enabled ? "T" : "F");
-        auto ret = mPowerHal->powerHintAsync_1_3(PowerHint::EXPENSIVE_RENDERING, enabled);
-        if (ret.isOk()) {
-            traceExpensiveRendering(enabled);
-        }
-        return ret.isOk();
-    }
-
-    bool notifyDisplayUpdateImminent() override {
-        // Power HAL 1.x doesn't have a notification for this
-        ALOGV("HIDL notifyUpdateImminent received but can't send");
-        return true;
-    }
-
-    bool supportsPowerHintSession() override { return false; }
-
-    bool isPowerHintSessionRunning() override { return false; }
-
-    void restartPowerHintSession() override {}
-
-    void setPowerHintSessionThreadIds(const std::vector<int32_t>&) override {}
-
-    bool startPowerHintSession() override { return false; }
-
-    void setTargetWorkDuration(int64_t) override {}
-
-    void sendActualWorkDuration(int64_t, nsecs_t) override {}
-
-    bool shouldReconnectHAL() override { return false; }
-
-    std::vector<int32_t> getPowerHintSessionThreadIds() override { return std::vector<int32_t>{}; }
-
-    std::optional<int64_t> getTargetWorkDuration() override { return std::nullopt; }
-
-private:
-    const sp<V1_3::IPower> mPowerHal = nullptr;
-};
-
-AidlPowerHalWrapper::AidlPowerHalWrapper(sp<IPower> powerHal) : mPowerHal(std::move(powerHal)) {
-    auto ret = mPowerHal->isModeSupported(Mode::EXPENSIVE_RENDERING, &mHasExpensiveRendering);
-    if (!ret.isOk()) {
-        mHasExpensiveRendering = false;
-    }
-
-    ret = mPowerHal->isBoostSupported(Boost::DISPLAY_UPDATE_IMMINENT, &mHasDisplayUpdateImminent);
-    if (!ret.isOk()) {
-        mHasDisplayUpdateImminent = false;
-    }
-
-    mSupportsPowerHint = checkPowerHintSessionSupported();
-
-    // Currently set to 0 to disable rate limiter by default
-    mAllowedActualDeviation = base::GetIntProperty<nsecs_t>("debug.sf.allowed_actual_deviation", 0);
-}
-
-AidlPowerHalWrapper::~AidlPowerHalWrapper() {
-    if (mPowerHintSession != nullptr) {
-        mPowerHintSession->close();
-        mPowerHintSession = nullptr;
-    }
-}
-
-std::unique_ptr<PowerAdvisor::HalWrapper> AidlPowerHalWrapper::connect() {
-    // This only waits if the service is actually declared
-    sp<IPower> powerHal = waitForVintfService<IPower>();
-    if (powerHal == nullptr) {
-        return nullptr;
-    }
-    ALOGI("Loaded AIDL Power HAL service");
-
-    return std::make_unique<AidlPowerHalWrapper>(std::move(powerHal));
-}
-
-bool AidlPowerHalWrapper::setExpensiveRendering(bool enabled) {
-    ALOGV("AIDL setExpensiveRendering %s", enabled ? "T" : "F");
-    if (!mHasExpensiveRendering) {
-        ALOGV("Skipped sending EXPENSIVE_RENDERING because HAL doesn't support it");
-        return true;
-    }
-
-    auto ret = mPowerHal->setMode(Mode::EXPENSIVE_RENDERING, enabled);
-    if (ret.isOk()) {
-        traceExpensiveRendering(enabled);
-    }
-    return ret.isOk();
-}
-
-bool AidlPowerHalWrapper::notifyDisplayUpdateImminent() {
-    ALOGV("AIDL notifyDisplayUpdateImminent");
-    if (!mHasDisplayUpdateImminent) {
-        ALOGV("Skipped sending DISPLAY_UPDATE_IMMINENT because HAL doesn't support it");
-        return true;
-    }
-
-    auto ret = mPowerHal->setBoost(Boost::DISPLAY_UPDATE_IMMINENT, 0);
-    return ret.isOk();
-}
-
-// Only version 2+ of the aidl supports power hint sessions, hidl has no support
-bool AidlPowerHalWrapper::supportsPowerHintSession() {
-    return mSupportsPowerHint;
-}
-
-bool AidlPowerHalWrapper::checkPowerHintSessionSupported() {
-    int64_t unused;
-    // Try to get preferred rate to determine if hint sessions are supported
-    // We check for isOk not EX_UNSUPPORTED_OPERATION to lump together errors
-    return mPowerHal->getHintSessionPreferredRate(&unused).isOk();
-}
-
-bool AidlPowerHalWrapper::isPowerHintSessionRunning() {
-    return mPowerHintSession != nullptr;
-}
-
-void AidlPowerHalWrapper::closePowerHintSession() {
-    if (mPowerHintSession != nullptr) {
-        mPowerHintSession->close();
-        mPowerHintSession = nullptr;
-    }
-}
-
-void AidlPowerHalWrapper::restartPowerHintSession() {
-    closePowerHintSession();
-    startPowerHintSession();
-}
-
-void AidlPowerHalWrapper::setPowerHintSessionThreadIds(const std::vector<int32_t>& threadIds) {
-    if (threadIds != mPowerHintThreadIds) {
-        mPowerHintThreadIds = threadIds;
-        if (isPowerHintSessionRunning()) {
-            restartPowerHintSession();
-        }
-    }
-}
-
-bool AidlPowerHalWrapper::startPowerHintSession() {
-    if (mPowerHintSession != nullptr || mPowerHintThreadIds.empty()) {
-        ALOGV("Cannot start power hint session, skipping");
-        return false;
-    }
-    auto ret =
-            mPowerHal->createHintSession(getpid(), static_cast<int32_t>(getuid()),
-                                         mPowerHintThreadIds, mTargetDuration, &mPowerHintSession);
-    if (!ret.isOk()) {
-        ALOGW("Failed to start power hint session with error: %s",
-              ret.exceptionToString(ret.exceptionCode()).c_str());
-    } else {
-        mLastTargetDurationSent = mTargetDuration;
-    }
-    return isPowerHintSessionRunning();
-}
-
-void AidlPowerHalWrapper::setTargetWorkDuration(int64_t targetDuration) {
-    ATRACE_CALL();
-    mTargetDuration = targetDuration;
-    if (sTraceHintSessionData) ATRACE_INT64("Time target", targetDuration);
-    if (isPowerHintSessionRunning() && (targetDuration != mLastTargetDurationSent)) {
-        ALOGV("Sending target time: %" PRId64 "ns", targetDuration);
-        mLastTargetDurationSent = targetDuration;
-        auto ret = mPowerHintSession->updateTargetWorkDuration(targetDuration);
-        if (!ret.isOk()) {
-            ALOGW("Failed to set power hint target work duration with error: %s",
-                  ret.exceptionMessage().c_str());
-            mShouldReconnectHal = true;
-        }
-    }
-}
-
-bool AidlPowerHalWrapper::shouldReportActualDurations() {
-    // Report if we have never reported before or are approaching a stale session
-    if (!mLastActualDurationSent.has_value() ||
-        (systemTime() - mLastActualReportTimestamp) > kStaleTimeout.count()) {
-        return true;
-    }
-
-    if (!mActualDuration.has_value()) {
-        return false;
-    }
-    // Report if the change in actual duration exceeds the threshold
-    return abs(*mActualDuration - *mLastActualDurationSent) > mAllowedActualDeviation;
-}
-
-void AidlPowerHalWrapper::sendActualWorkDuration(int64_t actualDuration, nsecs_t timestamp) {
-    ATRACE_CALL();
-
-    if (actualDuration < 0 || !isPowerHintSessionRunning()) {
-        ALOGV("Failed to send actual work duration, skipping");
-        return;
-    }
-    const nsecs_t reportedDuration = actualDuration;
-
-    mActualDuration = reportedDuration;
-    WorkDuration duration;
-    duration.durationNanos = reportedDuration;
-    duration.timeStampNanos = timestamp;
-    mPowerHintQueue.push_back(duration);
-
-    if (sTraceHintSessionData) {
-        ATRACE_INT64("Measured duration", actualDuration);
-        ATRACE_INT64("Target error term", actualDuration - mTargetDuration);
-
-        ATRACE_INT64("Reported duration", reportedDuration);
-        ATRACE_INT64("Reported target", mLastTargetDurationSent);
-        ATRACE_INT64("Reported target error term", reportedDuration - mLastTargetDurationSent);
-    }
-
-    ALOGV("Sending actual work duration of: %" PRId64 " on reported target: %" PRId64
-          " with error: %" PRId64,
-          reportedDuration, mLastTargetDurationSent, reportedDuration - mLastTargetDurationSent);
-
-    // This rate limiter queues similar duration reports to the powerhal into
-    // batches to avoid excessive binder calls. The criteria to send a given batch
-    // are outlined in shouldReportActualDurationsNow()
-    if (shouldReportActualDurations()) {
-        ALOGV("Sending hint update batch");
-        mLastActualReportTimestamp = systemTime();
-        auto ret = mPowerHintSession->reportActualWorkDuration(mPowerHintQueue);
-        if (!ret.isOk()) {
-            ALOGW("Failed to report actual work durations with error: %s",
-                  ret.exceptionMessage().c_str());
-            mShouldReconnectHal = true;
-        }
-        mPowerHintQueue.clear();
-        // We save the actual duration here for rate limiting
-        mLastActualDurationSent = actualDuration;
-    }
-}
-
-bool AidlPowerHalWrapper::shouldReconnectHAL() {
-    return mShouldReconnectHal;
-}
-
-std::vector<int32_t> AidlPowerHalWrapper::getPowerHintSessionThreadIds() {
-    return mPowerHintThreadIds;
-}
-
-std::optional<int64_t> AidlPowerHalWrapper::getTargetWorkDuration() {
-    return mTargetDuration;
-}
-
-void AidlPowerHalWrapper::setAllowedActualDeviation(nsecs_t allowedDeviation) {
-    mAllowedActualDeviation = allowedDeviation;
-}
-
-const bool AidlPowerHalWrapper::sTraceHintSessionData =
+const bool PowerAdvisor::sTraceHintSessionData =
         base::GetBoolProperty(std::string("debug.sf.trace_hint_sessions"), false);
 
-PowerAdvisor::HalWrapper* PowerAdvisor::getPowerHal() {
-    if (!mHasHal) {
-        return nullptr;
-    }
+const Duration PowerAdvisor::sTargetSafetyMargin = std::chrono::microseconds(
+        base::GetIntProperty<int64_t>("debug.sf.hint_margin_us",
+                                      ticks<std::micro>(PowerAdvisor::kDefaultTargetSafetyMargin)));
 
-    // Grab old hint session values before we destroy any existing wrapper
-    std::vector<int32_t> oldPowerHintSessionThreadIds;
-    std::optional<int64_t> oldTargetWorkDuration;
+const bool PowerAdvisor::sUseReportActualDuration =
+        base::GetBoolProperty(std::string("debug.adpf.use_report_actual_duration"), true);
 
-    if (mHalWrapper != nullptr) {
-        oldPowerHintSessionThreadIds = mHalWrapper->getPowerHintSessionThreadIds();
-        oldTargetWorkDuration = mHalWrapper->getTargetWorkDuration();
-    }
-
-    // If we used to have a HAL, but it stopped responding, attempt to reconnect
-    if (mReconnectPowerHal) {
-        mHalWrapper = nullptr;
-        mReconnectPowerHal = false;
-    }
-
-    if (mHalWrapper != nullptr) {
-        auto wrapper = mHalWrapper.get();
-        // If the wrapper is fine, return it, but if it indicates a reconnect, remake it
-        if (!wrapper->shouldReconnectHAL()) {
-            return wrapper;
-        }
-        ALOGD("Reconnecting Power HAL");
-        mHalWrapper = nullptr;
-    }
-
-    // At this point, we know for sure there is no running session
-    mPowerHintSessionRunning = false;
-
-    // First attempt to connect to the AIDL Power HAL
-    mHalWrapper = AidlPowerHalWrapper::connect();
-
-    // If that didn't succeed, attempt to connect to the HIDL Power HAL
-    if (mHalWrapper == nullptr) {
-        mHalWrapper = HidlPowerHalWrapper::connect();
-    } else {
-        ALOGD("Successfully connecting AIDL Power HAL");
-        // If AIDL, pass on any existing hint session values
-        mHalWrapper->setPowerHintSessionThreadIds(oldPowerHintSessionThreadIds);
-        // Only set duration and start if duration is defined
-        if (oldTargetWorkDuration.has_value()) {
-            mHalWrapper->setTargetWorkDuration(*oldTargetWorkDuration);
-            // Only start if possible to run and both threadids and duration are defined
-            if (usePowerHintSession() && !oldPowerHintSessionThreadIds.empty()) {
-                mPowerHintSessionRunning = mHalWrapper->startPowerHintSession();
-            }
-        }
-    }
-
-    // If we make it to this point and still don't have a HAL, it's unlikely we
-    // will, so stop trying
-    if (mHalWrapper == nullptr) {
-        mHasHal = false;
-    }
-
-    return mHalWrapper.get();
+power::PowerHalController& PowerAdvisor::getPowerHal() {
+    static std::once_flag halFlag;
+    std::call_once(halFlag, [this] { mPowerHal->init(); });
+    return *mPowerHal;
 }
 
 } // namespace impl

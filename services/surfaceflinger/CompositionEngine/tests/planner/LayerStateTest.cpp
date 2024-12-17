@@ -18,6 +18,7 @@
 #define LOG_TAG "LayerStateTest"
 
 #include <aidl/android/hardware/graphics/common/BufferUsage.h>
+#include <common/include/common/test/FlagUtils.h>
 #include <compositionengine/impl/OutputLayer.h>
 #include <compositionengine/impl/planner/LayerState.h>
 #include <compositionengine/mock/LayerFE.h>
@@ -26,6 +27,7 @@
 #include <log/log.h>
 
 #include "android/hardware_buffer.h"
+#include "com_android_graphics_surfaceflinger_flags.h"
 #include "compositionengine/LayerFECompositionState.h"
 
 #include <aidl/android/hardware/graphics/composer3/Composition.h>
@@ -112,6 +114,9 @@ struct LayerStateTest : public testing::Test {
     sp<mock::LayerFE> mLayerFE = sp<mock::LayerFE>::make();
     mock::OutputLayer mOutputLayer;
     std::unique_ptr<LayerState> mLayerState;
+
+    static constexpr auto kUsageFlags = static_cast<uint32_t>(
+            AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN);
 };
 
 TEST_F(LayerStateTest, getOutputLayer) {
@@ -301,6 +306,16 @@ TEST_F(LayerStateTest, getCompositionType_forcedClient) {
     EXPECT_EQ(Composition::CLIENT, mLayerState->getCompositionType());
 }
 
+TEST_F(LayerStateTest, getHdrSdrRatio) {
+    OutputLayerCompositionState outputLayerCompositionState;
+    LayerFECompositionState layerFECompositionState;
+    layerFECompositionState.currentHdrSdrRatio = 2.f;
+    setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
+                       layerFECompositionState);
+    mLayerState = std::make_unique<LayerState>(&mOutputLayer);
+    EXPECT_EQ(2.f, mLayerState->getHdrSdrRatio());
+}
+
 TEST_F(LayerStateTest, updateCompositionType) {
     OutputLayerCompositionState outputLayerCompositionState;
     LayerFECompositionState layerFECompositionState;
@@ -346,7 +361,7 @@ TEST_F(LayerStateTest, compareCompositionType) {
 TEST_F(LayerStateTest, updateBuffer) {
     OutputLayerCompositionState outputLayerCompositionState;
     LayerFECompositionState layerFECompositionState;
-    layerFECompositionState.buffer = new GraphicBuffer();
+    layerFECompositionState.buffer = sp<GraphicBuffer>::make();
     setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
                        layerFECompositionState);
     mLayerState = std::make_unique<LayerState>(&mOutputLayer);
@@ -354,7 +369,7 @@ TEST_F(LayerStateTest, updateBuffer) {
     mock::OutputLayer newOutputLayer;
     sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
     LayerFECompositionState layerFECompositionStateTwo;
-    layerFECompositionStateTwo.buffer = new GraphicBuffer();
+    layerFECompositionStateTwo.buffer = sp<GraphicBuffer>::make();
     setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
                        layerFECompositionStateTwo);
     ftl::Flags<LayerStateField> updates = mLayerState->update(&newOutputLayer);
@@ -364,7 +379,7 @@ TEST_F(LayerStateTest, updateBuffer) {
 TEST_F(LayerStateTest, updateBufferSingleBufferedLegacy) {
     OutputLayerCompositionState outputLayerCompositionState;
     LayerFECompositionState layerFECompositionState;
-    layerFECompositionState.buffer = new GraphicBuffer();
+    layerFECompositionState.buffer = sp<GraphicBuffer>::make();
     setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
                        layerFECompositionState);
     mLayerState = std::make_unique<LayerState>(&mOutputLayer);
@@ -372,7 +387,7 @@ TEST_F(LayerStateTest, updateBufferSingleBufferedLegacy) {
     mock::OutputLayer newOutputLayer;
     sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
     LayerFECompositionState layerFECompositionStateTwo;
-    layerFECompositionStateTwo.buffer = new GraphicBuffer();
+    layerFECompositionStateTwo.buffer = sp<GraphicBuffer>::make();
     setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
                        layerFECompositionStateTwo);
 
@@ -388,7 +403,7 @@ TEST_F(LayerStateTest, updateBufferSingleBufferedLegacy) {
 TEST_F(LayerStateTest, updateBufferSingleBufferedUsage) {
     OutputLayerCompositionState outputLayerCompositionState;
     LayerFECompositionState layerFECompositionState;
-    layerFECompositionState.buffer = new GraphicBuffer();
+    layerFECompositionState.buffer = sp<GraphicBuffer>::make();
     setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
                        layerFECompositionState);
     mLayerState = std::make_unique<LayerState>(&mOutputLayer);
@@ -396,7 +411,7 @@ TEST_F(LayerStateTest, updateBufferSingleBufferedUsage) {
     mock::OutputLayer newOutputLayer;
     sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
     LayerFECompositionState layerFECompositionStateTwo;
-    layerFECompositionStateTwo.buffer = new GraphicBuffer();
+    layerFECompositionStateTwo.buffer = sp<GraphicBuffer>::make();
     layerFECompositionStateTwo.buffer->usage = static_cast<uint64_t>(BufferUsage::FRONT_BUFFER);
     setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
                        layerFECompositionStateTwo);
@@ -412,14 +427,14 @@ TEST_F(LayerStateTest, updateBufferSingleBufferedUsage) {
 TEST_F(LayerStateTest, compareBuffer) {
     OutputLayerCompositionState outputLayerCompositionState;
     LayerFECompositionState layerFECompositionState;
-    layerFECompositionState.buffer = new GraphicBuffer();
+    layerFECompositionState.buffer = sp<GraphicBuffer>::make();
     setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
                        layerFECompositionState);
     mLayerState = std::make_unique<LayerState>(&mOutputLayer);
     mock::OutputLayer newOutputLayer;
     sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
     LayerFECompositionState layerFECompositionStateTwo;
-    layerFECompositionStateTwo.buffer = new GraphicBuffer();
+    layerFECompositionStateTwo.buffer = sp<GraphicBuffer>::make();
     setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
                        layerFECompositionStateTwo);
     auto otherLayerState = std::make_unique<LayerState>(&newOutputLayer);
@@ -451,6 +466,9 @@ TEST_F(LayerStateTest, updateSourceCrop) {
 }
 
 TEST_F(LayerStateTest, compareSourceCrop) {
+    SET_FLAG_FOR_TEST(com::android::graphics::surfaceflinger::flags::
+                              cache_when_source_crop_layer_only_moved,
+                      false);
     OutputLayerCompositionState outputLayerCompositionState;
     outputLayerCompositionState.sourceCrop = sFloatRectOne;
     LayerFECompositionState layerFECompositionState;
@@ -720,10 +738,7 @@ TEST_F(LayerStateTest, updatePixelFormat) {
     OutputLayerCompositionState outputLayerCompositionState;
     LayerFECompositionState layerFECompositionState;
     layerFECompositionState.buffer =
-            new GraphicBuffer(1, 1, PIXEL_FORMAT_RGBA_8888,
-                              AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
-                                      AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
-                              "buffer1");
+            sp<GraphicBuffer>::make(1u, 1u, PIXEL_FORMAT_RGBA_8888, kUsageFlags, "buffer1");
     setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
                        layerFECompositionState);
     mLayerState = std::make_unique<LayerState>(&mOutputLayer);
@@ -732,10 +747,7 @@ TEST_F(LayerStateTest, updatePixelFormat) {
     sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
     LayerFECompositionState layerFECompositionStateTwo;
     layerFECompositionStateTwo.buffer =
-            new GraphicBuffer(1, 1, PIXEL_FORMAT_RGBX_8888,
-                              AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
-                                      AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
-                              "buffer2");
+            sp<GraphicBuffer>::make(1u, 1u, PIXEL_FORMAT_RGBX_8888, kUsageFlags, "buffer2");
     setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
                        layerFECompositionStateTwo);
     ftl::Flags<LayerStateField> updates = mLayerState->update(&newOutputLayer);
@@ -748,10 +760,7 @@ TEST_F(LayerStateTest, comparePixelFormat) {
     OutputLayerCompositionState outputLayerCompositionState;
     LayerFECompositionState layerFECompositionState;
     layerFECompositionState.buffer =
-            new GraphicBuffer(1, 1, PIXEL_FORMAT_RGBA_8888,
-                              AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
-                                      AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
-                              "buffer1");
+            sp<GraphicBuffer>::make(1u, 1u, PIXEL_FORMAT_RGBA_8888, kUsageFlags, "buffer1");
     setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
                        layerFECompositionState);
     mLayerState = std::make_unique<LayerState>(&mOutputLayer);
@@ -759,10 +768,7 @@ TEST_F(LayerStateTest, comparePixelFormat) {
     sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
     LayerFECompositionState layerFECompositionStateTwo;
     layerFECompositionStateTwo.buffer =
-            new GraphicBuffer(1, 1, PIXEL_FORMAT_RGBX_8888,
-                              AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
-                                      AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
-                              "buffer2");
+            sp<GraphicBuffer>::make(1u, 1u, PIXEL_FORMAT_RGBX_8888, kUsageFlags, "buffer2");
     setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
                        layerFECompositionStateTwo);
     auto otherLayerState = std::make_unique<LayerState>(&newOutputLayer);
@@ -1003,6 +1009,86 @@ TEST_F(LayerStateTest, hasBlurBehind_withBlurRegion_returnsTrue) {
     EXPECT_TRUE(mLayerState->hasBlurBehind());
 }
 
+TEST_F(LayerStateTest, updateCachingHint) {
+    OutputLayerCompositionState outputLayerCompositionState;
+    LayerFECompositionState layerFECompositionState;
+    layerFECompositionState.cachingHint = gui::CachingHint::Enabled;
+    setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
+                       layerFECompositionState);
+    mLayerState = std::make_unique<LayerState>(&mOutputLayer);
+
+    mock::OutputLayer newOutputLayer;
+    sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
+    LayerFECompositionState layerFECompositionStateTwo;
+    layerFECompositionStateTwo.cachingHint = gui::CachingHint::Disabled;
+    setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
+                       layerFECompositionStateTwo);
+    ftl::Flags<LayerStateField> updates = mLayerState->update(&newOutputLayer);
+    EXPECT_EQ(ftl::Flags<LayerStateField>(LayerStateField::CachingHint), updates);
+}
+
+TEST_F(LayerStateTest, compareCachingHint) {
+    OutputLayerCompositionState outputLayerCompositionState;
+    LayerFECompositionState layerFECompositionState;
+    layerFECompositionState.cachingHint = gui::CachingHint::Enabled;
+    setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
+                       layerFECompositionState);
+    mLayerState = std::make_unique<LayerState>(&mOutputLayer);
+    mock::OutputLayer newOutputLayer;
+    sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
+    LayerFECompositionState layerFECompositionStateTwo;
+    layerFECompositionStateTwo.cachingHint = gui::CachingHint::Disabled;
+    setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
+                       layerFECompositionStateTwo);
+    auto otherLayerState = std::make_unique<LayerState>(&newOutputLayer);
+
+    verifyNonUniqueDifferingFields(*mLayerState, *otherLayerState, LayerStateField::CachingHint);
+
+    EXPECT_TRUE(mLayerState->compare(*otherLayerState));
+    EXPECT_TRUE(otherLayerState->compare(*mLayerState));
+}
+
+TEST_F(LayerStateTest, updateDimmingEnabled) {
+    OutputLayerCompositionState outputLayerCompositionState;
+    LayerFECompositionState layerFECompositionState;
+    layerFECompositionState.dimmingEnabled = true;
+    setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
+                       layerFECompositionState);
+    mLayerState = std::make_unique<LayerState>(&mOutputLayer);
+    EXPECT_TRUE(mLayerState->isDimmingEnabled());
+
+    mock::OutputLayer newOutputLayer;
+    sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
+    LayerFECompositionState layerFECompositionStateTwo;
+    layerFECompositionStateTwo.dimmingEnabled = false;
+    setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
+                       layerFECompositionStateTwo);
+    ftl::Flags<LayerStateField> updates = mLayerState->update(&newOutputLayer);
+    EXPECT_EQ(ftl::Flags<LayerStateField>(LayerStateField::DimmingEnabled), updates);
+    EXPECT_FALSE(mLayerState->isDimmingEnabled());
+}
+
+TEST_F(LayerStateTest, compareDimmingEnabled) {
+    OutputLayerCompositionState outputLayerCompositionState;
+    LayerFECompositionState layerFECompositionState;
+    layerFECompositionState.dimmingEnabled = true;
+    setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
+                       layerFECompositionState);
+    mLayerState = std::make_unique<LayerState>(&mOutputLayer);
+    mock::OutputLayer newOutputLayer;
+    sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
+    LayerFECompositionState layerFECompositionStateTwo;
+    layerFECompositionStateTwo.dimmingEnabled = false;
+    setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
+                       layerFECompositionStateTwo);
+    auto otherLayerState = std::make_unique<LayerState>(&newOutputLayer);
+
+    verifyNonUniqueDifferingFields(*mLayerState, *otherLayerState, LayerStateField::DimmingEnabled);
+
+    EXPECT_TRUE(mLayerState->compare(*otherLayerState));
+    EXPECT_TRUE(otherLayerState->compare(*mLayerState));
+}
+
 TEST_F(LayerStateTest, dumpDoesNotCrash) {
     OutputLayerCompositionState outputLayerCompositionState;
     LayerFECompositionState layerFECompositionState;
@@ -1069,7 +1155,7 @@ TEST_F(LayerStateTest, getNonBufferHash_isIdempotent) {
 TEST_F(LayerStateTest, getNonBufferHash_filtersOutBuffers) {
     OutputLayerCompositionState outputLayerCompositionState;
     LayerFECompositionState layerFECompositionState;
-    layerFECompositionState.buffer = new GraphicBuffer();
+    layerFECompositionState.buffer = sp<GraphicBuffer>::make();
     setupMocksForLayer(mOutputLayer, *mLayerFE, outputLayerCompositionState,
                        layerFECompositionState);
     mLayerState = std::make_unique<LayerState>(&mOutputLayer);
@@ -1077,7 +1163,7 @@ TEST_F(LayerStateTest, getNonBufferHash_filtersOutBuffers) {
     mock::OutputLayer newOutputLayer;
     sp<mock::LayerFE> newLayerFE = sp<mock::LayerFE>::make();
     LayerFECompositionState layerFECompositionStateTwo;
-    layerFECompositionStateTwo.buffer = new GraphicBuffer();
+    layerFECompositionStateTwo.buffer = sp<GraphicBuffer>::make();
     setupMocksForLayer(newOutputLayer, *newLayerFE, outputLayerCompositionState,
                        layerFECompositionStateTwo);
     auto otherLayerState = std::make_unique<LayerState>(&newOutputLayer);

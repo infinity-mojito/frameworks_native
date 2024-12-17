@@ -17,19 +17,10 @@
 #include <vibrator/ExternalVibration.h>
 #include <vibrator/ExternalVibrationUtils.h>
 
-#include <android/os/IExternalVibratorService.h>
+#include <android/os/ExternalVibrationScale.h>
 #include <binder/Parcel.h>
 #include <log/log.h>
 #include <utils/Errors.h>
-
-
-// To guarantee if HapticScale enum has the same value as IExternalVibratorService
-static_assert(static_cast<int>(android::os::HapticScale::MUTE) == static_cast<int>(android::os::IExternalVibratorService::SCALE_MUTE));
-static_assert(static_cast<int>(android::os::HapticScale::VERY_LOW) == static_cast<int>(android::os::IExternalVibratorService::SCALE_VERY_LOW));
-static_assert(static_cast<int>(android::os::HapticScale::LOW) == static_cast<int>(android::os::IExternalVibratorService::SCALE_LOW));
-static_assert(static_cast<int>(android::os::HapticScale::NONE) == static_cast<int>(android::os::IExternalVibratorService::SCALE_NONE));
-static_assert(static_cast<int>(android::os::HapticScale::HIGH) == static_cast<int>(android::os::IExternalVibratorService::SCALE_HIGH));
-static_assert(static_cast<int>(android::os::HapticScale::VERY_HIGH) == static_cast<int>(android::os::IExternalVibratorService::SCALE_VERY_HIGH));
 
 void writeAudioAttributes(const audio_attributes_t& attrs, android::Parcel* out) {
     out->writeInt32(attrs.usage);
@@ -72,6 +63,38 @@ status_t ExternalVibration::readFromParcel(const Parcel* parcel) {
 
 inline bool ExternalVibration::operator==(const ExternalVibration& rhs) const {
     return mToken == rhs.mToken;
+}
+
+os::HapticScale ExternalVibration::externalVibrationScaleToHapticScale(
+        os::ExternalVibrationScale externalVibrationScale) {
+    os::HapticLevel scaleLevel = os::HapticLevel::NONE;
+
+    switch (externalVibrationScale.scaleLevel) {
+        case os::ExternalVibrationScale::ScaleLevel::SCALE_MUTE:
+            scaleLevel = os::HapticLevel::MUTE;
+            break;
+        case os::ExternalVibrationScale::ScaleLevel::SCALE_VERY_LOW:
+            scaleLevel = os::HapticLevel::VERY_LOW;
+            break;
+        case os::ExternalVibrationScale::ScaleLevel::SCALE_LOW:
+            scaleLevel = os::HapticLevel::LOW;
+            break;
+        case os::ExternalVibrationScale::ScaleLevel::SCALE_NONE:
+            scaleLevel = os::HapticLevel::NONE;
+            break;
+        case os::ExternalVibrationScale::ScaleLevel::SCALE_HIGH:
+            scaleLevel = os::HapticLevel::HIGH;
+            break;
+        case os::ExternalVibrationScale::ScaleLevel::SCALE_VERY_HIGH:
+            scaleLevel = os::HapticLevel::VERY_HIGH;
+            break;
+        default:
+            ALOGE("Unknown ExternalVibrationScale %d, not applying scaling",
+                  externalVibrationScale.scaleLevel);
+    }
+
+    return os::HapticScale(scaleLevel, externalVibrationScale.scaleFactor,
+                           externalVibrationScale.adaptiveHapticsScale);
 }
 
 } // namespace os

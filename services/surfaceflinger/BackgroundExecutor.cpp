@@ -19,41 +19,50 @@
 #define LOG_TAG "BackgroundExecutor"
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
+#include <processgroup/sched_policy.h>
+#include <pthread.h>
+#include <sched.h>
 #include <utils/Log.h>
+#include <mutex>
 
 #include "BackgroundExecutor.h"
 
 namespace android {
 
-ANDROID_SINGLETON_STATIC_INSTANCE(BackgroundExecutor);
+namespace {
 
-BackgroundExecutor::BackgroundExecutor() : Singleton<BackgroundExecutor>() {
-    mThread = std::thread([&]() {
-        LOG_ALWAYS_FATAL_IF(sem_init(&mSemaphore, 0, 0), "sem_init failed");
+void set_thread_priority(bool highPriority) {
+    set_sched_policy(0, highPriority ? SP_FOREGROUND : SP_BACKGROUND);
+    struct sched_param param = {0};
+    param.sched_priority = highPriority ? 2 : 0 /* must be 0 for non-RT */;
+    sched_setscheduler(gettid(), highPriority ? SCHED_FIFO : SCHED_NORMAL, &param);
+}
+
+} // anonymous namespace
+
+BackgroundExecutor::BackgroundExecutor(bool highPriority) {
+    // mSemaphore must be initialized before any calls to
+    // BackgroundExecutor::sendCallbacks. For this reason, we initialize it
+    // within the constructor instead of within mThread.
+    LOG_ALWAYS_FATAL_IF(sem_init(&mSemaphore, 0, 0), "sem_init failed");
+    mThread = std::thread([&, highPriority]() {
+        set_thread_priority(highPriority);
         while (!mDone) {
             LOG_ALWAYS_FATAL_IF(sem_wait(&mSemaphore), "sem_wait failed (%d)", errno);
-
-            ftl::SmallVector<Work*, 10> workItems;
-
-            Work* work = mWorks.pop();
-            while (work) {
-                workItems.push_back(work);
-                work = mWorks.pop();
+            auto callbacks = mCallbacksQueue.pop();
+            if (!callbacks) {
+                continue;
             }
-
-            // Sequence numbers are guaranteed to be in intended order, as we assume a single
-            // producer and single consumer.
-            std::stable_sort(workItems.begin(), workItems.end(), [](Work* left, Work* right) {
-                return left->sequence < right->sequence;
-            });
-            for (Work* work : workItems) {
-                for (auto& task : work->tasks) {
-                    task();
-                }
-                delete work;
+            for (auto& callback : *callbacks) {
+                callback();
             }
         }
     });
+    if (highPriority) {
+        pthread_setname_np(mThread.native_handle(), "BckgrndExec HP");
+    } else {
+        pthread_setname_np(mThread.native_handle(), "BckgrndExec LP");
+    }
 }
 
 BackgroundExecutor::~BackgroundExecutor() {
@@ -66,12 +75,21 @@ BackgroundExecutor::~BackgroundExecutor() {
 }
 
 void BackgroundExecutor::sendCallbacks(Callbacks&& tasks) {
-    Work* work = new Work();
-    work->sequence = mSequence;
-    work->tasks = std::move(tasks);
-    mWorks.push(work);
-    mSequence++;
+    mCallbacksQueue.push(std::move(tasks));
     LOG_ALWAYS_FATAL_IF(sem_post(&mSemaphore), "sem_post failed");
+}
+
+void BackgroundExecutor::flushQueue() {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool flushComplete = false;
+    sendCallbacks({[&]() {
+        std::scoped_lock lock{mutex};
+        flushComplete = true;
+        cv.notify_one();
+    }});
+    std::unique_lock<std::mutex> lock{mutex};
+    cv.wait(lock, [&]() { return flushComplete; });
 }
 
 } // namespace android

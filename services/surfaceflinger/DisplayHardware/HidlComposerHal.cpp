@@ -24,22 +24,31 @@
 
 #include "HidlComposerHal.h"
 
+#include <SurfaceFlingerProperties.h>
+#include <aidl/android/hardware/graphics/common/DisplayHotplugEvent.h>
 #include <android/binder_manager.h>
+#include <common/trace.h>
 #include <composer-command-buffer/2.2/ComposerCommandBuffer.h>
 #include <hidl/HidlTransportSupport.h>
 #include <hidl/HidlTransportUtils.h>
 #include <log/log.h>
-#include <utils/Trace.h>
+
 #include "HWC2.h"
 #include "Hal.h"
 
 #include <algorithm>
 #include <cinttypes>
 
+using aidl::android::hardware::graphics::common::DisplayHotplugEvent;
+using aidl::android::hardware::graphics::common::HdrConversionCapability;
+using aidl::android::hardware::graphics::common::HdrConversionStrategy;
 using aidl::android::hardware::graphics::composer3::Capability;
 using aidl::android::hardware::graphics::composer3::ClientTargetPropertyWithBrightness;
 using aidl::android::hardware::graphics::composer3::DimmingStage;
 using aidl::android::hardware::graphics::composer3::DisplayCapability;
+using aidl::android::hardware::graphics::composer3::DisplayLuts;
+using aidl::android::hardware::graphics::composer3::Lut;
+using aidl::android::hardware::graphics::composer3::OverlayProperties;
 
 namespace android {
 
@@ -59,8 +68,13 @@ public:
     ComposerCallbackBridge(ComposerCallback& callback, bool vsyncSwitchingSupported)
           : mCallback(callback), mVsyncSwitchingSupported(vsyncSwitchingSupported) {}
 
+    // For code sharing purposes, `ComposerCallback` (implemented by SurfaceFlinger)
+    // replaced `onComposerHalHotplug` with `onComposerHalHotplugEvent` by converting
+    // from HIDL's connection into an AIDL DisplayHotplugEvent.
     Return<void> onHotplug(Display display, Connection connection) override {
-        mCallback.onComposerHalHotplug(display, connection);
+        const auto event = connection == Connection::CONNECTED ? DisplayHotplugEvent::CONNECTED
+                                                               : DisplayHotplugEvent::DISCONNECTED;
+        mCallback.onComposerHalHotplugEvent(display, event);
         return Void();
     }
 
@@ -185,9 +199,25 @@ std::vector<To> translate(const hidl_vec<From>& in) {
     return out;
 }
 
+sp<GraphicBuffer> allocateClearSlotBuffer() {
+    if (!sysprop::clear_slots_with_set_layer_buffer(false)) {
+        return nullptr;
+    }
+    sp<GraphicBuffer> buffer = sp<GraphicBuffer>::make(1, 1, PIXEL_FORMAT_RGBX_8888,
+                                                       GraphicBuffer::USAGE_HW_COMPOSER |
+                                                               GraphicBuffer::USAGE_SW_READ_OFTEN |
+                                                               GraphicBuffer::USAGE_SW_WRITE_OFTEN,
+                                                       "HidlComposer");
+    if (!buffer || buffer->initCheck() != ::android::OK) {
+        return nullptr;
+    }
+    return buffer;
+}
+
 } // anonymous namespace
 
-HidlComposer::HidlComposer(const std::string& serviceName) : mWriter(kWriterInitialSize) {
+HidlComposer::HidlComposer(const std::string& serviceName)
+      : mClearSlotBuffer(allocateClearSlotBuffer()), mWriter(kWriterInitialSize) {
     mComposer = V2_1::IComposer::getService(serviceName);
 
     if (mComposer == nullptr) {
@@ -229,6 +259,11 @@ HidlComposer::HidlComposer(const std::string& serviceName) : mWriter(kWriterInit
     if (mClient == nullptr) {
         LOG_ALWAYS_FATAL("failed to create composer client");
     }
+
+    if (!mClearSlotBuffer && sysprop::clear_slots_with_set_layer_buffer(false)) {
+        LOG_ALWAYS_FATAL("Failed to allocate a buffer for clearing layer buffer slots");
+        return;
+    }
 }
 
 bool HidlComposer::isSupported(OptionalFeature feature) const {
@@ -243,6 +278,11 @@ bool HidlComposer::isSupported(OptionalFeature feature) const {
     }
 }
 
+bool HidlComposer::isVrrSupported() const {
+    // VRR is not supported on the HIDL composer.
+    return false;
+};
+
 std::vector<Capability> HidlComposer::getCapabilities() {
     std::vector<Capability> capabilities;
     mComposer->getCapabilities([&](const auto& tmpCapabilities) {
@@ -253,6 +293,7 @@ std::vector<Capability> HidlComposer::getCapabilities() {
 
 std::string HidlComposer::dumpDebugInfo() {
     std::string info;
+    info += std::string(mComposer->descriptor) + "\n";
     mComposer->dumpDebugInfo([&](const auto& tmpInfo) { info = tmpInfo.c_str(); });
 
     return info;
@@ -272,11 +313,7 @@ void HidlComposer::registerCallback(const sp<IComposerCallback>& callback) {
     }
 }
 
-void HidlComposer::resetCommands() {
-    mWriter.reset();
-}
-
-Error HidlComposer::executeCommands() {
+Error HidlComposer::executeCommands(Display) {
     return execute();
 }
 
@@ -455,6 +492,12 @@ Error HidlComposer::getDisplayConfigs(Display display, std::vector<Config>* outC
     return error;
 }
 
+Error HidlComposer::getDisplayConfigurations(Display, int32_t /*maxFrameIntervalNs*/,
+                                             std::vector<DisplayConfiguration>*) {
+    LOG_ALWAYS_FATAL("getDisplayConfigurations should not have been called on this, as "
+                     "it's a HWC3 interface version 3 feature");
+}
+
 Error HidlComposer::getDisplayName(Display display, std::string* outName) {
     Error error = kDefaultError;
     mClient->getDisplayName(display, [&](const auto& tmpError, const auto& tmpName) {
@@ -495,13 +538,13 @@ Error HidlComposer::hasDisplayIdleTimerCapability(Display, bool*) {
                      "OptionalFeature::KernelIdleTimer is not supported on HIDL");
 }
 
-Error HidlComposer::getHdrCapabilities(Display display, std::vector<Hdr>* outTypes,
+Error HidlComposer::getHdrCapabilities(Display display, std::vector<Hdr>* outHdrTypes,
                                        float* outMaxLuminance, float* outMaxAverageLuminance,
                                        float* outMinLuminance) {
     Error error = kDefaultError;
     if (mClient_2_3) {
         mClient_2_3->getHdrCapabilities_2_3(display,
-                                            [&](const auto& tmpError, const auto& tmpTypes,
+                                            [&](const auto& tmpError, const auto& tmpHdrTypes,
                                                 const auto& tmpMaxLuminance,
                                                 const auto& tmpMaxAverageLuminance,
                                                 const auto& tmpMinLuminance) {
@@ -509,15 +552,15 @@ Error HidlComposer::getHdrCapabilities(Display display, std::vector<Hdr>* outTyp
                                                 if (error != Error::NONE) {
                                                     return;
                                                 }
+                                                *outHdrTypes = translate<ui::Hdr>(tmpHdrTypes);
 
-                                                *outTypes = tmpTypes;
                                                 *outMaxLuminance = tmpMaxLuminance;
                                                 *outMaxAverageLuminance = tmpMaxAverageLuminance;
                                                 *outMinLuminance = tmpMinLuminance;
                                             });
     } else {
         mClient->getHdrCapabilities(display,
-                                    [&](const auto& tmpError, const auto& tmpTypes,
+                                    [&](const auto& tmpError, const auto& tmpHdrTypes,
                                         const auto& tmpMaxLuminance,
                                         const auto& tmpMaxAverageLuminance,
                                         const auto& tmpMinLuminance) {
@@ -525,11 +568,7 @@ Error HidlComposer::getHdrCapabilities(Display display, std::vector<Hdr>* outTyp
                                         if (error != Error::NONE) {
                                             return;
                                         }
-
-                                        outTypes->clear();
-                                        for (auto type : tmpTypes) {
-                                            outTypes->push_back(static_cast<Hdr>(type));
-                                        }
+                                        *outHdrTypes = translate<ui::Hdr>(tmpHdrTypes);
 
                                         *outMaxLuminance = tmpMaxLuminance;
                                         *outMaxAverageLuminance = tmpMaxAverageLuminance;
@@ -540,6 +579,10 @@ Error HidlComposer::getHdrCapabilities(Display display, std::vector<Hdr>* outTyp
     return error;
 }
 
+Error HidlComposer::getOverlaySupport(OverlayProperties* /*outProperties*/) {
+    return Error::NONE;
+}
+
 Error HidlComposer::getReleaseFences(Display display, std::vector<Layer>* outLayers,
                                      std::vector<int>* outReleaseFences) {
     mReader.takeReleaseFences(display, outLayers, outReleaseFences);
@@ -547,7 +590,7 @@ Error HidlComposer::getReleaseFences(Display display, std::vector<Layer>* outLay
 }
 
 Error HidlComposer::presentDisplay(Display display, int* outPresentFence) {
-    ATRACE_NAME("HwcPresentDisplay");
+    SFTRACE_NAME("HwcPresentDisplay");
     mWriter.selectDisplay(display);
     mWriter.presentDisplay();
 
@@ -568,7 +611,8 @@ Error HidlComposer::setActiveConfig(Display display, Config config) {
 
 Error HidlComposer::setClientTarget(Display display, uint32_t slot, const sp<GraphicBuffer>& target,
                                     int acquireFence, Dataspace dataspace,
-                                    const std::vector<IComposerClient::Rect>& damage) {
+                                    const std::vector<IComposerClient::Rect>& damage,
+                                    float /*hdrSdrRatio*/) {
     mWriter.selectDisplay(display);
 
     const native_handle_t* handle = nullptr;
@@ -632,8 +676,9 @@ Error HidlComposer::setClientTargetSlotCount(Display display) {
 }
 
 Error HidlComposer::validateDisplay(Display display, nsecs_t /*expectedPresentTime*/,
-                                    uint32_t* outNumTypes, uint32_t* outNumRequests) {
-    ATRACE_NAME("HwcValidateDisplay");
+                                    int32_t /*frameIntervalNs*/, uint32_t* outNumTypes,
+                                    uint32_t* outNumRequests) {
+    SFTRACE_NAME("HwcValidateDisplay");
     mWriter.selectDisplay(display);
     mWriter.validateDisplay();
 
@@ -648,9 +693,10 @@ Error HidlComposer::validateDisplay(Display display, nsecs_t /*expectedPresentTi
 }
 
 Error HidlComposer::presentOrValidateDisplay(Display display, nsecs_t /*expectedPresentTime*/,
-                                             uint32_t* outNumTypes, uint32_t* outNumRequests,
-                                             int* outPresentFence, uint32_t* state) {
-    ATRACE_NAME("HwcPresentOrValidateDisplay");
+                                             int32_t /*frameIntervalNs*/, uint32_t* outNumTypes,
+                                             uint32_t* outNumRequests, int* outPresentFence,
+                                             uint32_t* state) {
+    SFTRACE_NAME("HwcPresentOrValidateDisplay");
     mWriter.selectDisplay(display);
     mWriter.presentOrvalidateDisplay();
 
@@ -690,6 +736,36 @@ Error HidlComposer::setLayerBuffer(Display display, Layer layer, uint32_t slot,
     }
 
     mWriter.setLayerBuffer(slot, handle, acquireFence);
+    return Error::NONE;
+}
+
+Error HidlComposer::setLayerBufferSlotsToClear(Display display, Layer layer,
+                                               const std::vector<uint32_t>& slotsToClear,
+                                               uint32_t activeBufferSlot) {
+    if (slotsToClear.empty()) {
+        return Error::NONE;
+    }
+    // This can be null when the HAL hasn't explicitly enabled this feature.
+    if (mClearSlotBuffer == nullptr) {
+        return Error::NONE;
+    }
+    //  Backwards compatible way of clearing buffer is to set the layer buffer with a placeholder
+    // buffer, using the slot that needs to cleared... tricky.
+    for (uint32_t slot : slotsToClear) {
+        // Don't clear the active buffer slot because we need to restore the active buffer after
+        // setting the requested buffer slots with a placeholder buffer.
+        if (slot != activeBufferSlot) {
+            mWriter.selectDisplay(display);
+            mWriter.selectLayer(layer);
+            mWriter.setLayerBuffer(slot, mClearSlotBuffer->handle, /*fence*/ -1);
+        }
+    }
+    // Since we clear buffers by setting them to a placeholder buffer, we want to make sure that the
+    // last setLayerBuffer command is sent with the currently active buffer, not the placeholder
+    // buffer, so that there is no perceptual change.
+    mWriter.selectDisplay(display);
+    mWriter.selectLayer(layer);
+    mWriter.setLayerBuffer(activeBufferSlot, /*buffer*/ nullptr, /*fence*/ -1);
     return Error::NONE;
 }
 
@@ -1303,6 +1379,22 @@ Error HidlComposer::getPreferredBootDisplayConfig(Display /*displayId*/, Config*
     return Error::UNSUPPORTED;
 }
 
+Error HidlComposer::getHdrConversionCapabilities(std::vector<HdrConversionCapability>*) {
+    return Error::UNSUPPORTED;
+}
+
+Error HidlComposer::setHdrConversionStrategy(HdrConversionStrategy, Hdr*) {
+    return Error::UNSUPPORTED;
+}
+
+Error HidlComposer::setRefreshRateChangedCallbackDebugEnabled(Display, bool) {
+    return Error::UNSUPPORTED;
+}
+
+Error HidlComposer::notifyExpectedPresent(Display, nsecs_t, int32_t) {
+    return Error::UNSUPPORTED;
+}
+
 Error HidlComposer::getClientTargetProperty(
         Display display, ClientTargetPropertyWithBrightness* outClientTargetProperty) {
     IComposerClient::ClientTargetProperty property;
@@ -1315,6 +1407,14 @@ Error HidlComposer::getClientTargetProperty(
                     property.pixelFormat);
     outClientTargetProperty->brightness = 1.f;
     outClientTargetProperty->dimmingStage = DimmingStage::NONE;
+    return Error::NONE;
+}
+
+Error HidlComposer::getRequestedLuts(Display, std::vector<DisplayLuts::LayerLut>*) {
+    return Error::NONE;
+}
+
+Error HidlComposer::setLayerLuts(Display, Layer, std::vector<Lut>&) {
     return Error::NONE;
 }
 
@@ -1351,6 +1451,9 @@ void HidlComposer::registerCallback(ComposerCallback& callback) {
 
     registerCallback(sp<ComposerCallbackBridge>::make(callback, vsyncSwitchingSupported));
 }
+
+void HidlComposer::onHotplugConnect(Display) {}
+void HidlComposer::onHotplugDisconnect(Display) {}
 
 CommandReader::~CommandReader() {
     resetData();

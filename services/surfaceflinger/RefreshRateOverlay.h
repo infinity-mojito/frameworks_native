@@ -16,9 +16,11 @@
 
 #pragma once
 
-#include <SkColor.h>
+#include "Utils/OverlayUtils.h"
+
 #include <vector>
 
+#include <ftl/flags.h>
 #include <ftl/small_map.h>
 #include <ui/LayerStack.h>
 #include <ui/Size.h>
@@ -32,62 +34,69 @@ class SkCanvas;
 namespace android {
 
 class GraphicBuffer;
-class SurfaceControl;
 class SurfaceFlinger;
 
-// Helper class to delete the SurfaceControl on a helper thread as
-// SurfaceControl assumes its destruction happens without SurfaceFlinger::mStateLock held.
-class SurfaceControlHolder {
-public:
-    explicit SurfaceControlHolder(sp<SurfaceControl> sc) : mSurfaceControl(std::move(sc)){};
-    ~SurfaceControlHolder();
-
-    const sp<SurfaceControl>& get() const { return mSurfaceControl; }
-
-private:
-    sp<SurfaceControl> mSurfaceControl;
-};
-
 class RefreshRateOverlay {
+private:
+    // Effectively making the constructor private, while keeping std::make_unique work
+    struct ConstructorTag {};
+
 public:
-    RefreshRateOverlay(FpsRange, bool showSpinner);
+    enum class Features {
+        Spinner = 1 << 0,
+        RenderRate = 1 << 1,
+        ShowInMiddle = 1 << 2,
+        SetByHwc = 1 << 3,
+    };
+
+    static std::unique_ptr<RefreshRateOverlay> create(FpsRange, ftl::Flags<Features>);
 
     void setLayerStack(ui::LayerStack);
     void setViewport(ui::Size);
-    void changeRefreshRate(Fps);
+    void changeRefreshRate(Fps, Fps);
+    void changeRenderRate(Fps);
     void animate();
+    bool isSetByHwc() const { return mFeatures.test(RefreshRateOverlay::Features::SetByHwc); }
+    void onVrrIdle(bool idle);
+
+    RefreshRateOverlay(ConstructorTag, FpsRange, ftl::Flags<Features>);
 
 private:
+    bool initCheck() const;
+
     using Buffers = std::vector<sp<GraphicBuffer>>;
 
-    class SevenSegmentDrawer {
-    public:
-        static Buffers draw(int number, SkColor, ui::Transform::RotationFlags, bool showSpinner);
+    static Buffers draw(int refreshRate, int renderFps, bool idle, SkColor,
+                        ui::Transform::RotationFlags, ftl::Flags<Features>);
+    static void drawNumber(int number, int left, SkColor, SkCanvas&);
+    static void drawDash(int left, SkCanvas&);
 
-    private:
-        enum class Segment { Upper, UpperLeft, UpperRight, Middle, LowerLeft, LowerRight, Bottom };
+    const Buffers& getOrCreateBuffers(Fps, Fps, bool);
 
-        static void drawSegment(Segment, int left, SkColor, SkCanvas&);
-        static void drawDigit(int digit, int left, SkColor, SkCanvas&);
-    };
-
-    const Buffers& getOrCreateBuffers(Fps);
+    SurfaceComposerClient::Transaction createTransaction() const;
 
     struct Key {
-        int fps;
+        int refreshRate;
+        int renderFps;
         ui::Transform::RotationFlags flags;
+        bool idle;
 
-        bool operator==(Key other) const { return fps == other.fps && flags == other.flags; }
+        bool operator==(Key other) const {
+            return refreshRate == other.refreshRate && renderFps == other.renderFps &&
+                    flags == other.flags && idle == other.idle;
+        }
     };
 
     using BufferCache = ftl::SmallMap<Key, Buffers, 9>;
     BufferCache mBufferCache;
 
-    std::optional<Fps> mCurrentFps;
+    std::optional<Fps> mRefreshRate;
+    std::optional<Fps> mRenderFps;
+    bool mIsVrrIdle = false;
     size_t mFrame = 0;
 
     const FpsRange mFpsRange; // For color interpolation.
-    const bool mShowSpinner;
+    const ftl::Flags<Features> mFeatures;
 
     const std::unique_ptr<SurfaceControlHolder> mSurfaceControl;
 };

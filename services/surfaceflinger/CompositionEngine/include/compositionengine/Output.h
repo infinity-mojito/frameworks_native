@@ -23,8 +23,10 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <compositionengine/LayerFE.h>
+#include <ftl/future.h>
 #include <renderengine/LayerSettings.h>
 #include <ui/Fence.h>
 #include <ui/FenceTime.h>
@@ -60,7 +62,7 @@ struct GpuCompositionResult;
 } // namespace impl
 
 /**
- * Encapsulates all the state involved with composing layers for an output
+ * Encapsulates all the states involved with composing layers for an output
  */
 class Output {
 public:
@@ -135,7 +137,6 @@ public:
         ui::ColorMode mode{ui::ColorMode::NATIVE};
         ui::Dataspace dataspace{ui::Dataspace::UNKNOWN};
         ui::RenderIntent renderIntent{ui::RenderIntent::COLORIMETRIC};
-        ui::Dataspace colorSpaceAgnosticDataspace{ui::Dataspace::UNKNOWN};
     };
 
     // Use internally to incrementally compute visibility/coverage
@@ -152,6 +153,10 @@ public:
         Region aboveOpaqueLayers;
         // The region of the output which should be considered dirty
         Region dirtyRegion;
+        // The region of the output which is covered by layers, excluding display overlays. This
+        // only has a value if there's something needing it, like when a TrustedPresentationListener
+        // is set
+        std::optional<Region> aboveCoveredLayersExcludingOverlays;
     };
 
     virtual ~Output();
@@ -259,11 +264,15 @@ public:
     // Prepare the output, updating the OutputLayers used in the output
     virtual void prepare(const CompositionRefreshArgs&, LayerFESet&) = 0;
 
-    // Presents the output, finalizing all composition details
-    virtual void present(const CompositionRefreshArgs&) = 0;
+    // Presents the output, finalizing all composition details. This may happen
+    // asynchronously, in which case the returned future must be waited upon.
+    virtual ftl::Future<std::monostate> present(const CompositionRefreshArgs&) = 0;
 
-    // Latches the front-end layer state for each output layer
-    virtual void updateLayerStateFromFE(const CompositionRefreshArgs&) const = 0;
+    // Whether this output can be presented from another thread.
+    virtual bool supportsOffloadPresent() const = 0;
+
+    // Make the next call to `present` run asynchronously.
+    virtual void offloadPresentNextFrame() = 0;
 
     // Enables predicting composition strategy to run client composition earlier
     virtual void setPredictCompositionStrategy(bool) = 0;
@@ -275,6 +284,7 @@ protected:
     virtual void setDisplayColorProfile(std::unique_ptr<DisplayColorProfile>) = 0;
     virtual void setRenderSurface(std::unique_ptr<RenderSurface>) = 0;
 
+    virtual void uncacheBuffers(const std::vector<uint64_t>&) = 0;
     virtual void rebuildLayerStacks(const CompositionRefreshArgs&, LayerFESet&) = 0;
     virtual void collectVisibleLayers(const CompositionRefreshArgs&, CoverageState&) = 0;
     virtual void ensureOutputLayerIfVisible(sp<LayerFE>&, CoverageState&) = 0;
@@ -291,20 +301,20 @@ protected:
     using GpuCompositionResult = compositionengine::impl::GpuCompositionResult;
     // Runs prepare frame in another thread while running client composition using
     // the previous frame's composition strategy.
-    virtual GpuCompositionResult prepareFrameAsync(const CompositionRefreshArgs&) = 0;
+    virtual GpuCompositionResult prepareFrameAsync() = 0;
     virtual void devOptRepaintFlash(const CompositionRefreshArgs&) = 0;
-    virtual void finishFrame(const CompositionRefreshArgs&, GpuCompositionResult&&) = 0;
+    virtual void finishFrame(GpuCompositionResult&&) = 0;
     virtual std::optional<base::unique_fd> composeSurfaces(
-            const Region&, const compositionengine::CompositionRefreshArgs&,
-            std::shared_ptr<renderengine::ExternalTexture>, base::unique_fd&) = 0;
-    virtual void postFramebuffer() = 0;
+            const Region&, std::shared_ptr<renderengine::ExternalTexture>, base::unique_fd&) = 0;
+    virtual void presentFrameAndReleaseLayers(bool flushEvenWhenDisabled) = 0;
     virtual void renderCachedSets(const CompositionRefreshArgs&) = 0;
     virtual bool chooseCompositionStrategy(
             std::optional<android::HWComposer::DeviceRequestedChanges>*) = 0;
     virtual void applyCompositionStrategy(
             const std::optional<android::HWComposer::DeviceRequestedChanges>& changes) = 0;
     virtual bool getSkipColorTransform() const = 0;
-    virtual FrameFences presentAndGetFrameFences() = 0;
+    virtual FrameFences presentFrame() = 0;
+    virtual void executeCommands() = 0;
     virtual std::vector<LayerFE::LayerSettings> generateClientCompositionRequests(
             bool supportsProtectedContent, ui::Dataspace outputDataspace,
             std::vector<LayerFE*> &outLayerRef) = 0;
@@ -312,8 +322,11 @@ protected:
             const Region& flashRegion,
             std::vector<LayerFE::LayerSettings>& clientCompositionLayers) = 0;
     virtual void setExpensiveRenderingExpected(bool enabled) = 0;
+    virtual void setHintSessionGpuStart(TimePoint startTime) = 0;
     virtual void setHintSessionGpuFence(std::unique_ptr<FenceTime>&& gpuFence) = 0;
+    virtual void setHintSessionRequiresRenderEngine(bool requiresRenderEngine) = 0;
     virtual bool isPowerHintSessionEnabled() = 0;
+    virtual bool isPowerHintSessionGpuReportingEnabled() = 0;
     virtual void cacheClientCompositionRequests(uint32_t cacheSize) = 0;
     virtual bool canPredictCompositionStrategy(const CompositionRefreshArgs&) = 0;
 };

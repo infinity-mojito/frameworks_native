@@ -25,7 +25,11 @@
 #include <android/gui/IDisplayEventConnection.h>
 #include <private/gui/BitTube.h>
 #include <utils/Looper.h>
+#include <utils/StrongPointer.h>
 #include <utils/Timers.h>
+
+#include <scheduler/Time.h>
+#include <scheduler/VsyncId.h>
 
 #include "EventThread.h"
 #include "TracedOrdinal.h"
@@ -33,19 +37,15 @@
 
 namespace android {
 
-struct ICompositor {
-    virtual bool commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expectedVsyncTime) = 0;
-    virtual void composite(nsecs_t frameTime, int64_t vsyncId) = 0;
-    virtual void sample() = 0;
-
-protected:
-    ~ICompositor() = default;
-};
+struct ICompositor;
 
 template <typename F>
 class Task : public MessageHandler {
     template <typename G>
     friend auto makeTask(G&&);
+
+    template <typename... Args>
+    friend sp<Task<F>> sp<Task<F>>::make(Args&&... args);
 
     explicit Task(F&& f) : mTask(std::move(f)) {}
 
@@ -57,7 +57,7 @@ class Task : public MessageHandler {
 
 template <typename F>
 inline auto makeTask(F&& f) {
-    sp<Task<F>> task = new Task<F>(std::move(f));
+    sp<Task<F>> task = sp<Task<F>>::make(std::forward<F>(f));
     return std::make_pair(task, task->mTask.get_future());
 }
 
@@ -65,16 +65,18 @@ class MessageQueue {
 public:
     virtual ~MessageQueue() = default;
 
-    virtual void initVsync(scheduler::VSyncDispatch&, frametimeline::TokenManager&,
-                           std::chrono::nanoseconds workDuration) = 0;
+    virtual void initVsyncInternal(std::shared_ptr<scheduler::VSyncDispatch>,
+                                   frametimeline::TokenManager&,
+                                   std::chrono::nanoseconds workDuration) = 0;
+    virtual void destroyVsync() = 0;
     virtual void setDuration(std::chrono::nanoseconds workDuration) = 0;
-    virtual void setInjector(sp<EventThreadConnection>) = 0;
     virtual void waitMessage() = 0;
     virtual void postMessage(sp<MessageHandler>&&) = 0;
-    virtual void scheduleFrame() = 0;
+    virtual void postMessageDelayed(sp<MessageHandler>&&, nsecs_t uptimeDelay) = 0;
+    virtual void scheduleConfigure() = 0;
+    virtual void scheduleFrame(Duration workDurationSlack = Duration::fromNs(0)) = 0;
 
-    using Clock = std::chrono::steady_clock;
-    virtual std::optional<Clock::time_point> getScheduledFrameTime() const = 0;
+    virtual std::optional<scheduler::ScheduleResult> getScheduledFrameResult() const = 0;
 };
 
 namespace impl {
@@ -84,16 +86,19 @@ protected:
     class Handler : public MessageHandler {
         MessageQueue& mQueue;
         std::atomic_bool mFramePending = false;
-        std::atomic<int64_t> mVsyncId = 0;
-        std::atomic<nsecs_t> mExpectedVsyncTime = 0;
+
+        std::atomic<VsyncId> mVsyncId;
+        std::atomic<TimePoint> mExpectedVsyncTime;
 
     public:
         explicit Handler(MessageQueue& queue) : mQueue(queue) {}
         void handleMessage(const Message& message) override;
 
-        bool isFramePending() const;
+        virtual TimePoint getExpectedVsyncTime() const { return mExpectedVsyncTime.load(); }
 
-        virtual void dispatchFrame(int64_t vsyncId, nsecs_t expectedVsyncTime);
+        virtual bool isFramePending() const;
+
+        virtual void dispatchFrame(VsyncId, TimePoint expectedVsyncTime);
     };
 
     friend class Handler;
@@ -103,48 +108,50 @@ protected:
 
     void vsyncCallback(nsecs_t vsyncTime, nsecs_t targetWakeupTime, nsecs_t readyTime);
 
+    void onNewVsyncSchedule(std::shared_ptr<scheduler::VSyncDispatch>) EXCLUDES(mVsync.mutex);
+
 private:
+    virtual void onFrameSignal(ICompositor&, VsyncId, TimePoint expectedVsyncTime) = 0;
+
     ICompositor& mCompositor;
     const sp<Looper> mLooper;
     const sp<Handler> mHandler;
 
     struct Vsync {
         frametimeline::TokenManager* tokenManager = nullptr;
-        std::unique_ptr<scheduler::VSyncCallbackRegistration> registration;
 
         mutable std::mutex mutex;
+        std::unique_ptr<scheduler::VSyncCallbackRegistration> registration GUARDED_BY(mutex);
         TracedOrdinal<std::chrono::nanoseconds> workDuration
                 GUARDED_BY(mutex) = {"VsyncWorkDuration-sf", std::chrono::nanoseconds(0)};
-        std::chrono::nanoseconds lastCallbackTime GUARDED_BY(mutex) = std::chrono::nanoseconds{0};
-        std::optional<nsecs_t> scheduledFrameTime GUARDED_BY(mutex);
+        TimePoint lastCallbackTime GUARDED_BY(mutex);
+        std::optional<scheduler::ScheduleResult> scheduledFrameTimeOpt GUARDED_BY(mutex);
         TracedOrdinal<int> value = {"VSYNC-sf", 0};
     };
 
-    struct Injector {
-        gui::BitTube tube;
-        std::mutex mutex;
-        sp<EventThreadConnection> connection GUARDED_BY(mutex);
-    };
-
     Vsync mVsync;
-    Injector mInjector;
 
-    void injectorCallback();
+    // Returns the old registration so it can be destructed outside the lock to
+    // avoid deadlock.
+    std::unique_ptr<scheduler::VSyncCallbackRegistration> onNewVsyncScheduleLocked(
+            std::shared_ptr<scheduler::VSyncDispatch>) REQUIRES(mVsync.mutex);
 
 public:
     explicit MessageQueue(ICompositor&);
 
-    void initVsync(scheduler::VSyncDispatch&, frametimeline::TokenManager&,
-                   std::chrono::nanoseconds workDuration) override;
+    void initVsyncInternal(std::shared_ptr<scheduler::VSyncDispatch>, frametimeline::TokenManager&,
+                           std::chrono::nanoseconds workDuration) override;
+    void destroyVsync() override;
     void setDuration(std::chrono::nanoseconds workDuration) override;
-    void setInjector(sp<EventThreadConnection>) override;
 
     void waitMessage() override;
     void postMessage(sp<MessageHandler>&&) override;
+    void postMessageDelayed(sp<MessageHandler>&&, nsecs_t uptimeDelay) override;
 
-    void scheduleFrame() override;
+    void scheduleConfigure() override;
+    void scheduleFrame(Duration workDurationSlack = Duration::fromNs(0)) override;
 
-    std::optional<Clock::time_point> getScheduledFrameTime() const override;
+    std::optional<scheduler::ScheduleResult> getScheduledFrameResult() const override;
 };
 
 } // namespace impl

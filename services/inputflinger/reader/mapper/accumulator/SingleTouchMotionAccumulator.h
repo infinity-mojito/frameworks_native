@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUTREADER_SINGLE_TOUCH_MOTION_ACCUMULATOR_H
-#define _UI_INPUTREADER_SINGLE_TOUCH_MOTION_ACCUMULATOR_H
+#pragma once
 
 #include <stdint.h>
 
@@ -29,7 +28,7 @@ class SingleTouchMotionAccumulator {
 public:
     SingleTouchMotionAccumulator();
 
-    void process(const RawEvent* rawEvent);
+    void process(const RawEvent& rawEvent);
     void reset(InputDeviceContext& deviceContext);
 
     inline int32_t getAbsoluteX() const { return mAbsX; }
@@ -53,5 +52,3 @@ private:
 };
 
 } // namespace android
-
-#endif // _UI_INPUTREADER_SINGLE_TOUCH_MOTION_ACCUMULATOR_H

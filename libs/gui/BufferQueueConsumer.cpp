@@ -33,36 +33,38 @@
 #include <gui/BufferQueueCore.h>
 #include <gui/IConsumerListener.h>
 #include <gui/IProducerListener.h>
+#include <gui/TraceUtils.h>
 
 #include <private/gui/BufferQueueThreadState.h>
-#ifndef __ANDROID_VNDK__
+#if !defined(__ANDROID_VNDK__) && !defined(NO_BINDER)
 #include <binder/PermissionCache.h>
-#include <vndksupport/linker.h>
 #endif
 
 #include <system/window.h>
+
+#include <com_android_graphics_libgui_flags.h>
 
 namespace android {
 
 // Macros for include BufferQueueCore information in log messages
 #define BQ_LOGV(x, ...)                                                                           \
-    ALOGV("[%s](id:%" PRIx64 ",api:%d,p:%d,c:%" PRIu64 ") " x, mConsumerName.string(),            \
+    ALOGV("[%s](id:%" PRIx64 ",api:%d,p:%d,c:%" PRIu64 ") " x, mConsumerName.c_str(),             \
           mCore->mUniqueId, mCore->mConnectedApi, mCore->mConnectedPid, (mCore->mUniqueId) >> 32, \
           ##__VA_ARGS__)
 #define BQ_LOGD(x, ...)                                                                           \
-    ALOGD("[%s](id:%" PRIx64 ",api:%d,p:%d,c:%" PRIu64 ") " x, mConsumerName.string(),            \
+    ALOGD("[%s](id:%" PRIx64 ",api:%d,p:%d,c:%" PRIu64 ") " x, mConsumerName.c_str(),             \
           mCore->mUniqueId, mCore->mConnectedApi, mCore->mConnectedPid, (mCore->mUniqueId) >> 32, \
           ##__VA_ARGS__)
 #define BQ_LOGI(x, ...)                                                                           \
-    ALOGI("[%s](id:%" PRIx64 ",api:%d,p:%d,c:%" PRIu64 ") " x, mConsumerName.string(),            \
+    ALOGI("[%s](id:%" PRIx64 ",api:%d,p:%d,c:%" PRIu64 ") " x, mConsumerName.c_str(),             \
           mCore->mUniqueId, mCore->mConnectedApi, mCore->mConnectedPid, (mCore->mUniqueId) >> 32, \
           ##__VA_ARGS__)
 #define BQ_LOGW(x, ...)                                                                           \
-    ALOGW("[%s](id:%" PRIx64 ",api:%d,p:%d,c:%" PRIu64 ") " x, mConsumerName.string(),            \
+    ALOGW("[%s](id:%" PRIx64 ",api:%d,p:%d,c:%" PRIu64 ") " x, mConsumerName.c_str(),             \
           mCore->mUniqueId, mCore->mConnectedApi, mCore->mConnectedPid, (mCore->mUniqueId) >> 32, \
           ##__VA_ARGS__)
 #define BQ_LOGE(x, ...)                                                                           \
-    ALOGE("[%s](id:%" PRIx64 ",api:%d,p:%d,c:%" PRIu64 ") " x, mConsumerName.string(),            \
+    ALOGE("[%s](id:%" PRIx64 ",api:%d,p:%d,c:%" PRIu64 ") " x, mConsumerName.c_str(),             \
           mCore->mUniqueId, mCore->mConnectedApi, mCore->mConnectedPid, (mCore->mUniqueId) >> 32, \
           ##__VA_ARGS__)
 
@@ -297,8 +299,7 @@ status_t BufferQueueConsumer::acquireBuffer(BufferItem* outBuffer,
         // decrease.
         mCore->mDequeueCondition.notify_all();
 
-        ATRACE_INT(mCore->mConsumerName.string(),
-                static_cast<int32_t>(mCore->mQueue.size()));
+        ATRACE_INT(mCore->mConsumerName.c_str(), static_cast<int32_t>(mCore->mQueue.size()));
 #ifndef NO_BINDER
         mCore->mOccupancyTracker.registerOccupancyChange(mCore->mQueue.size());
 #endif
@@ -318,35 +319,44 @@ status_t BufferQueueConsumer::detachBuffer(int slot) {
     ATRACE_CALL();
     ATRACE_BUFFER_INDEX(slot);
     BQ_LOGV("detachBuffer: slot %d", slot);
-    std::lock_guard<std::mutex> lock(mCore->mMutex);
+    sp<IProducerListener> listener;
+    {
+        std::lock_guard<std::mutex> lock(mCore->mMutex);
 
-    if (mCore->mIsAbandoned) {
-        BQ_LOGE("detachBuffer: BufferQueue has been abandoned");
-        return NO_INIT;
+        if (mCore->mIsAbandoned) {
+            BQ_LOGE("detachBuffer: BufferQueue has been abandoned");
+            return NO_INIT;
+        }
+
+        if (mCore->mSharedBufferMode || slot == mCore->mSharedBufferSlot) {
+            BQ_LOGE("detachBuffer: detachBuffer not allowed in shared buffer mode");
+            return BAD_VALUE;
+        }
+
+        if (slot < 0 || slot >= BufferQueueDefs::NUM_BUFFER_SLOTS) {
+            BQ_LOGE("detachBuffer: slot index %d out of range [0, %d)",
+                    slot, BufferQueueDefs::NUM_BUFFER_SLOTS);
+            return BAD_VALUE;
+        } else if (!mSlots[slot].mBufferState.isAcquired()) {
+            BQ_LOGE("detachBuffer: slot %d is not owned by the consumer "
+                    "(state = %s)", slot, mSlots[slot].mBufferState.string());
+            return BAD_VALUE;
+        }
+        if (mCore->mBufferReleasedCbEnabled) {
+            listener = mCore->mConnectedProducerListener;
+        }
+
+        mSlots[slot].mBufferState.detachConsumer();
+        mCore->mActiveBuffers.erase(slot);
+        mCore->mFreeSlots.insert(slot);
+        mCore->clearBufferSlotLocked(slot);
+        mCore->mDequeueCondition.notify_all();
+        VALIDATE_CONSISTENCY();
     }
 
-    if (mCore->mSharedBufferMode || slot == mCore->mSharedBufferSlot) {
-        BQ_LOGE("detachBuffer: detachBuffer not allowed in shared buffer mode");
-        return BAD_VALUE;
+    if (listener) {
+        listener->onBufferDetached(slot);
     }
-
-    if (slot < 0 || slot >= BufferQueueDefs::NUM_BUFFER_SLOTS) {
-        BQ_LOGE("detachBuffer: slot index %d out of range [0, %d)",
-                slot, BufferQueueDefs::NUM_BUFFER_SLOTS);
-        return BAD_VALUE;
-    } else if (!mSlots[slot].mBufferState.isAcquired()) {
-        BQ_LOGE("detachBuffer: slot %d is not owned by the consumer "
-                "(state = %s)", slot, mSlots[slot].mBufferState.string());
-        return BAD_VALUE;
-    }
-
-    mSlots[slot].mBufferState.detachConsumer();
-    mCore->mActiveBuffers.erase(slot);
-    mCore->mFreeSlots.insert(slot);
-    mCore->clearBufferSlotLocked(slot);
-    mCore->mDequeueCondition.notify_all();
-    VALIDATE_CONSISTENCY();
-
     return NO_ERROR;
 }
 
@@ -362,79 +372,94 @@ status_t BufferQueueConsumer::attachBuffer(int* outSlot,
         return BAD_VALUE;
     }
 
-    std::lock_guard<std::mutex> lock(mCore->mMutex);
+    sp<IProducerListener> listener;
+    {
+        std::lock_guard<std::mutex> lock(mCore->mMutex);
 
-    if (mCore->mSharedBufferMode) {
-        BQ_LOGE("attachBuffer: cannot attach a buffer in shared buffer mode");
-        return BAD_VALUE;
-    }
-
-    // Make sure we don't have too many acquired buffers
-    int numAcquiredBuffers = 0;
-    for (int s : mCore->mActiveBuffers) {
-        if (mSlots[s].mBufferState.isAcquired()) {
-            ++numAcquiredBuffers;
+        if (mCore->mSharedBufferMode) {
+            BQ_LOGE("attachBuffer: cannot attach a buffer in shared buffer mode");
+            return BAD_VALUE;
         }
+
+        // Make sure we don't have too many acquired buffers
+        int numAcquiredBuffers = 0;
+        for (int s : mCore->mActiveBuffers) {
+            if (mSlots[s].mBufferState.isAcquired()) {
+                ++numAcquiredBuffers;
+            }
+        }
+
+        if (numAcquiredBuffers >= mCore->mMaxAcquiredBufferCount + 1) {
+            BQ_LOGE("attachBuffer: max acquired buffer count reached: %d "
+                    "(max %d)", numAcquiredBuffers,
+                    mCore->mMaxAcquiredBufferCount);
+            return INVALID_OPERATION;
+        }
+
+        if (buffer->getGenerationNumber() != mCore->mGenerationNumber) {
+            BQ_LOGE("attachBuffer: generation number mismatch [buffer %u] "
+                    "[queue %u]", buffer->getGenerationNumber(),
+                    mCore->mGenerationNumber);
+            return BAD_VALUE;
+        }
+
+        // Find a free slot to put the buffer into
+        int found = BufferQueueCore::INVALID_BUFFER_SLOT;
+        if (!mCore->mFreeSlots.empty()) {
+            auto slot = mCore->mFreeSlots.begin();
+            found = *slot;
+            mCore->mFreeSlots.erase(slot);
+        } else if (!mCore->mFreeBuffers.empty()) {
+            found = mCore->mFreeBuffers.front();
+            mCore->mFreeBuffers.remove(found);
+        }
+        if (found == BufferQueueCore::INVALID_BUFFER_SLOT) {
+            BQ_LOGE("attachBuffer: could not find free buffer slot");
+            return NO_MEMORY;
+        }
+
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_CONSUMER_ATTACH_CALLBACK)
+        if (mCore->mBufferAttachedCbEnabled) {
+            listener = mCore->mConnectedProducerListener;
+        }
+#endif
+
+        mCore->mActiveBuffers.insert(found);
+        *outSlot = found;
+        ATRACE_BUFFER_INDEX(*outSlot);
+        BQ_LOGV("attachBuffer: returning slot %d", *outSlot);
+
+        mSlots[*outSlot].mGraphicBuffer = buffer;
+        mSlots[*outSlot].mBufferState.attachConsumer();
+        mSlots[*outSlot].mNeedsReallocation = true;
+        mSlots[*outSlot].mFence = Fence::NO_FENCE;
+        mSlots[*outSlot].mFrameNumber = 0;
+
+        // mAcquireCalled tells BufferQueue that it doesn't need to send a valid
+        // GraphicBuffer pointer on the next acquireBuffer call, which decreases
+        // Binder traffic by not un/flattening the GraphicBuffer. However, it
+        // requires that the consumer maintain a cached copy of the slot <--> buffer
+        // mappings, which is why the consumer doesn't need the valid pointer on
+        // acquire.
+        //
+        // The StreamSplitter is one of the primary users of the attach/detach
+        // logic, and while it is running, all buffers it acquires are immediately
+        // detached, and all buffers it eventually releases are ones that were
+        // attached (as opposed to having been obtained from acquireBuffer), so it
+        // doesn't make sense to maintain the slot/buffer mappings, which would
+        // become invalid for every buffer during detach/attach. By setting this to
+        // false, the valid GraphicBuffer pointer will always be sent with acquire
+        // for attached buffers.
+        mSlots[*outSlot].mAcquireCalled = false;
+
+        VALIDATE_CONSISTENCY();
     }
 
-    if (numAcquiredBuffers >= mCore->mMaxAcquiredBufferCount + 1) {
-        BQ_LOGE("attachBuffer: max acquired buffer count reached: %d "
-                "(max %d)", numAcquiredBuffers,
-                mCore->mMaxAcquiredBufferCount);
-        return INVALID_OPERATION;
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_CONSUMER_ATTACH_CALLBACK)
+    if (listener != nullptr) {
+        listener->onBufferAttached();
     }
-
-    if (buffer->getGenerationNumber() != mCore->mGenerationNumber) {
-        BQ_LOGE("attachBuffer: generation number mismatch [buffer %u] "
-                "[queue %u]", buffer->getGenerationNumber(),
-                mCore->mGenerationNumber);
-        return BAD_VALUE;
-    }
-
-    // Find a free slot to put the buffer into
-    int found = BufferQueueCore::INVALID_BUFFER_SLOT;
-    if (!mCore->mFreeSlots.empty()) {
-        auto slot = mCore->mFreeSlots.begin();
-        found = *slot;
-        mCore->mFreeSlots.erase(slot);
-    } else if (!mCore->mFreeBuffers.empty()) {
-        found = mCore->mFreeBuffers.front();
-        mCore->mFreeBuffers.remove(found);
-    }
-    if (found == BufferQueueCore::INVALID_BUFFER_SLOT) {
-        BQ_LOGE("attachBuffer: could not find free buffer slot");
-        return NO_MEMORY;
-    }
-
-    mCore->mActiveBuffers.insert(found);
-    *outSlot = found;
-    ATRACE_BUFFER_INDEX(*outSlot);
-    BQ_LOGV("attachBuffer: returning slot %d", *outSlot);
-
-    mSlots[*outSlot].mGraphicBuffer = buffer;
-    mSlots[*outSlot].mBufferState.attachConsumer();
-    mSlots[*outSlot].mNeedsReallocation = true;
-    mSlots[*outSlot].mFence = Fence::NO_FENCE;
-    mSlots[*outSlot].mFrameNumber = 0;
-
-    // mAcquireCalled tells BufferQueue that it doesn't need to send a valid
-    // GraphicBuffer pointer on the next acquireBuffer call, which decreases
-    // Binder traffic by not un/flattening the GraphicBuffer. However, it
-    // requires that the consumer maintain a cached copy of the slot <--> buffer
-    // mappings, which is why the consumer doesn't need the valid pointer on
-    // acquire.
-    //
-    // The StreamSplitter is one of the primary users of the attach/detach
-    // logic, and while it is running, all buffers it acquires are immediately
-    // detached, and all buffers it eventually releases are ones that were
-    // attached (as opposed to having been obtained from acquireBuffer), so it
-    // doesn't make sense to maintain the slot/buffer mappings, which would
-    // become invalid for every buffer during detach/attach. By setting this to
-    // false, the valid GraphicBuffer pointer will always be sent with acquire
-    // for attached buffers.
-    mSlots[*outSlot].mAcquireCalled = false;
-
-    VALIDATE_CONSISTENCY();
+#endif
 
     return NO_ERROR;
 }
@@ -646,7 +671,7 @@ status_t BufferQueueConsumer::setMaxBufferCount(int bufferCount) {
 
 status_t BufferQueueConsumer::setMaxAcquiredBufferCount(
         int maxAcquiredBuffers) {
-    ATRACE_CALL();
+    ATRACE_FORMAT("%s(%d)", __func__, maxAcquiredBuffers);
 
     if (maxAcquiredBuffers < 1 ||
             maxAcquiredBuffers > BufferQueueCore::MAX_MAX_ACQUIRED_BUFFERS) {
@@ -717,7 +742,7 @@ status_t BufferQueueConsumer::setMaxAcquiredBufferCount(
 
 status_t BufferQueueConsumer::setConsumerName(const String8& name) {
     ATRACE_CALL();
-    BQ_LOGV("setConsumerName: '%s'", name.string());
+    BQ_LOGV("setConsumerName: '%s'", name.c_str());
     std::lock_guard<std::mutex> lock(mCore->mMutex);
     mCore->mConsumerName = name;
     mConsumerName = name;
@@ -802,18 +827,14 @@ status_t BufferQueueConsumer::dumpState(const String8& prefix, String8* outResul
     const uid_t uid = BufferQueueThreadState::getCallingUid();
 #if !defined(__ANDROID_VNDK__) && !defined(NO_BINDER)
     // permission check can't be done for vendors as vendors have no access to
-    // the PermissionController. We need to do a runtime check as well, since
-    // the system variant of libgui can be loaded in a vendor process. For eg:
-    // if a HAL uses an llndk library that depends on libgui (libmediandk etc).
-    if (!android_is_in_vendor_process()) {
-        const pid_t pid = BufferQueueThreadState::getCallingPid();
-        if ((uid != shellUid) &&
-            !PermissionCache::checkPermission(String16("android.permission.DUMP"), pid, uid)) {
-            outResult->appendFormat("Permission Denial: can't dump BufferQueueConsumer "
-                                    "from pid=%d, uid=%d\n",
-                                    pid, uid);
-            denied = true;
-        }
+    // the PermissionController.
+    const pid_t pid = BufferQueueThreadState::getCallingPid();
+    if ((uid != shellUid) &&
+        !PermissionCache::checkPermission(String16("android.permission.DUMP"), pid, uid)) {
+        outResult->appendFormat("Permission Denial: can't dump BufferQueueConsumer "
+                                "from pid=%d, uid=%d\n",
+                                pid, uid);
+        denied = true;
     }
 #else
     if (uid != shellUid) {

@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUT_INPUTDISPATCHER_INPUTDISPATCHERCONFIGURATION_H
-#define _UI_INPUT_INPUTDISPATCHER_INPUTDISPATCHERCONFIGURATION_H
+#pragma once
 
 #include <utils/Timers.h>
 
@@ -35,10 +34,13 @@ struct InputDispatcherConfiguration {
     // The key repeat inter-key delay.
     nsecs_t keyRepeatDelay;
 
+    // Whether key repeat is enabled.
+    bool keyRepeatEnabled;
+
     InputDispatcherConfiguration()
-          : keyRepeatTimeout(500 * 1000000LL), keyRepeatDelay(50 * 1000000LL) {}
+          : keyRepeatTimeout(500 * 1000000LL),
+            keyRepeatDelay(50 * 1000000LL),
+            keyRepeatEnabled(true) {}
 };
 
 } // namespace android
-
-#endif // _UI_INPUT_INPUTDISPATCHER_INPUTDISPATCHERCONFIGURATION_H

@@ -126,6 +126,7 @@ void LatencyAggregator::processTimeline(const InputEventTimeline& timeline) {
 }
 
 void LatencyAggregator::processStatistics(const InputEventTimeline& timeline) {
+    std::scoped_lock lock(mLock);
     // Before we do any processing, check that we have not yet exceeded MAX_SIZE
     if (mNumSketchEventsProcessed >= MAX_EVENTS_FOR_STATISTICS) {
         return;
@@ -133,7 +134,9 @@ void LatencyAggregator::processStatistics(const InputEventTimeline& timeline) {
     mNumSketchEventsProcessed++;
 
     std::array<std::unique_ptr<KllQuantile>, SketchIndex::SIZE>& sketches =
-            timeline.isDown ? mDownSketches : mMoveSketches;
+            timeline.inputEventActionType == InputEventActionType::MOTION_ACTION_DOWN
+            ? mDownSketches
+            : mMoveSketches;
 
     // Process common ones first
     const nsecs_t eventToRead = timeline.readTime - timeline.eventTime;
@@ -167,6 +170,7 @@ void LatencyAggregator::processStatistics(const InputEventTimeline& timeline) {
 }
 
 AStatsManager_PullAtomCallbackReturn LatencyAggregator::pullData(AStatsEventList* data) {
+    std::scoped_lock lock(mLock);
     std::array<std::unique_ptr<SafeBytesField>, SketchIndex::SIZE> serializedDownData;
     std::array<std::unique_ptr<SafeBytesField>, SketchIndex::SIZE> serializedMoveData;
     for (size_t i = 0; i < SketchIndex::SIZE; i++) {
@@ -240,7 +244,9 @@ void LatencyAggregator::processSlowEvent(const InputEventTimeline& timeline) {
         const nsecs_t consumeToGpuComplete = gpuCompletedTime - connectionTimeline.consumeTime;
         const nsecs_t gpuCompleteToPresent = presentTime - gpuCompletedTime;
 
-        android::util::stats_write(android::util::SLOW_INPUT_EVENT_REPORTED, timeline.isDown,
+        android::util::stats_write(android::util::SLOW_INPUT_EVENT_REPORTED,
+                                   timeline.inputEventActionType ==
+                                           InputEventActionType::MOTION_ACTION_DOWN,
                                    static_cast<int32_t>(ns2us(eventToRead)),
                                    static_cast<int32_t>(ns2us(readToDeliver)),
                                    static_cast<int32_t>(ns2us(deliverToConsume)),
@@ -256,7 +262,8 @@ void LatencyAggregator::processSlowEvent(const InputEventTimeline& timeline) {
     }
 }
 
-std::string LatencyAggregator::dump(const char* prefix) {
+std::string LatencyAggregator::dump(const char* prefix) const {
+    std::scoped_lock lock(mLock);
     std::string sketchDump = StringPrintf("%s  Sketches:\n", prefix);
     for (size_t i = 0; i < SketchIndex::SIZE; i++) {
         const int64_t numDown = mDownSketches[i]->num_values();

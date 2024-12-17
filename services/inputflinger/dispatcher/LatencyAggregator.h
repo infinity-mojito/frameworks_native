@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUT_INPUTDISPATCHER_LATENCYAGGREGATOR_H
-#define _UI_INPUT_INPUTDISPATCHER_LATENCYAGGREGATOR_H
+#pragma once
 
+#include <android-base/thread_annotations.h>
 #include <kll.h>
 #include <statslog.h>
 #include <utils/Timers.h>
@@ -57,15 +57,18 @@ public:
      */
     void processTimeline(const InputEventTimeline& timeline) override;
 
-    std::string dump(const char* prefix);
+    std::string dump(const char* prefix) const;
 
     ~LatencyAggregator();
 
 private:
+    // Binder call -- called on a binder thread. This is different from the thread where the rest of
+    // the public API is called.
     static AStatsManager_PullAtomCallbackReturn pullAtomCallback(int32_t atom_tag,
                                                                  AStatsEventList* data,
                                                                  void* cookie);
     AStatsManager_PullAtomCallbackReturn pullData(AStatsEventList* data);
+
     // ---------- Slow event handling ----------
     void processSlowEvent(const InputEventTimeline& timeline);
     nsecs_t mLastSlowEventTime = 0;
@@ -75,16 +78,17 @@ private:
     size_t mNumEventsSinceLastSlowEventReport = 0;
 
     // ---------- Statistics handling ----------
+    // Statistics is pulled rather than pushed. It's pulled on a binder thread, and therefore will
+    // be accessed by two different threads. The lock is needed to protect the pulled data.
+    mutable std::mutex mLock;
     void processStatistics(const InputEventTimeline& timeline);
     // Sketches
     std::array<std::unique_ptr<dist_proc::aggregation::KllQuantile>, SketchIndex::SIZE>
-            mDownSketches;
+            mDownSketches GUARDED_BY(mLock);
     std::array<std::unique_ptr<dist_proc::aggregation::KllQuantile>, SketchIndex::SIZE>
-            mMoveSketches;
+            mMoveSketches GUARDED_BY(mLock);
     // How many events have been processed so far
-    size_t mNumSketchEventsProcessed = 0;
+    size_t mNumSketchEventsProcessed GUARDED_BY(mLock) = 0;
 };
 
 } // namespace android::inputdispatcher
-
-#endif // _UI_INPUT_INPUTDISPATCHER_LATENCYAGGREGATOR_H

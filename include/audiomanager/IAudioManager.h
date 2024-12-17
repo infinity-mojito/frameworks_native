@@ -17,15 +17,17 @@
 #ifndef ANDROID_IAUDIOMANAGER_H
 #define ANDROID_IAUDIOMANAGER_H
 
+#include <audiomanager/AudioManager.h>
 #include <utils/Errors.h>
 #include <binder/IInterface.h>
+#include <binder/PersistableBundle.h>
 #include <hardware/power.h>
 #include <system/audio.h>
 
 namespace android {
 
 // ----------------------------------------------------------------------------
-
+// TODO(b/309532236) replace this class with AIDL generated parcelable
 class IAudioManager : public IInterface
 {
 public:
@@ -40,6 +42,8 @@ public:
         RECORDER_EVENT                        = IBinder::FIRST_CALL_TRANSACTION + 5,
         RELEASE_RECORDER                      = IBinder::FIRST_CALL_TRANSACTION + 6,
         PLAYER_SESSION_ID                     = IBinder::FIRST_CALL_TRANSACTION + 7,
+        PORT_EVENT                            = IBinder::FIRST_CALL_TRANSACTION + 8,
+        PERMISSION_UPDATE_BARRIER             = IBinder::FIRST_CALL_TRANSACTION + 9,
     };
 
     DECLARE_META_INTERFACE(AudioManager)
@@ -52,12 +56,15 @@ public:
     /*oneway*/ virtual status_t playerAttributes(audio_unique_id_t piid, audio_usage_t usage,
                 audio_content_type_t content)= 0;
     /*oneway*/ virtual status_t playerEvent(audio_unique_id_t piid, player_state_t event,
-                audio_port_handle_t deviceId) = 0;
+                audio_port_handle_t eventId) = 0;
     /*oneway*/ virtual status_t releasePlayer(audio_unique_id_t piid) = 0;
     virtual audio_unique_id_t trackRecorder(const sp<IBinder>& recorder) = 0;
     /*oneway*/ virtual status_t recorderEvent(audio_unique_id_t riid, recorder_state_t event) = 0;
     /*oneway*/ virtual status_t releaseRecorder(audio_unique_id_t riid) = 0;
     /*oneway*/ virtual status_t playerSessionId(audio_unique_id_t piid, audio_session_t sessionId) = 0;
+    /*oneway*/ virtual status_t portEvent(audio_port_handle_t portId, player_state_t event,
+                const std::unique_ptr<os::PersistableBundle>& extras) = 0;
+    virtual status_t permissionUpdateBarrier() = 0;
 };
 
 // ----------------------------------------------------------------------------

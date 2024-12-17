@@ -15,26 +15,24 @@
  */
 
 #include <android/binder_process.h>
+#include <binder/IPCThreadState.h>
 
 #include <mutex>
-
-#include <android-base/logging.h>
-#include <binder/IPCThreadState.h>
 
 using ::android::IPCThreadState;
 using ::android::ProcessState;
 
-void ABinderProcess_startThreadPool() {
+void ABinderProcess_startThreadPool(void) {
     ProcessState::self()->startThreadPool();
     ProcessState::self()->giveThreadPoolName();
 }
 bool ABinderProcess_setThreadPoolMaxThreadCount(uint32_t numThreads) {
     return ProcessState::self()->setThreadPoolMaxThreadCount(numThreads) == 0;
 }
-bool ABinderProcess_isThreadPoolStarted() {
+bool ABinderProcess_isThreadPoolStarted(void) {
     return ProcessState::self()->isThreadPoolStarted();
 }
-void ABinderProcess_joinThreadPool() {
+void ABinderProcess_joinThreadPool(void) {
     IPCThreadState::self()->joinThreadPool();
 }
 
@@ -42,6 +40,6 @@ binder_status_t ABinderProcess_setupPolling(int* fd) {
     return IPCThreadState::self()->setupPolling(fd);
 }
 
-binder_status_t ABinderProcess_handlePolledCommands() {
+binder_status_t ABinderProcess_handlePolledCommands(void) {
     return IPCThreadState::self()->handlePolledCommands();
 }

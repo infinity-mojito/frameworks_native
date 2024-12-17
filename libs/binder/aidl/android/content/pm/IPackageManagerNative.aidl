@@ -17,7 +17,6 @@
 
 package android.content.pm;
 
-import android.content.pm.IPackageChangeObserver;
 import android.content.pm.IStagedApexObserver;
 import android.content.pm.StagedApexInfo;
 
@@ -42,6 +41,18 @@ interface IPackageManagerNative {
      * strings.
      */
     @utf8InCpp String[] getNamesForUids(in int[] uids);
+
+    /**
+     * Return the UID associated with the given package name.
+     * Note that the same package will have different UIDs under different UserHandle on
+     * the same device.
+     * @param packageName The full name (i.e. com.google.apps.contacts) of the desired package.
+     * @param flags Additional option flags to modify the data returned.
+     * @param userId The user handle identifier to look up the package under.
+     * @return Returns an integer UID who owns the given package name, or -1 if no such package is
+     *            available to the caller.
+     */
+     int getPackageUid(in @utf8InCpp String packageName, in long flags, in int userId);
 
     /**
      * Returns the name of the installer (a package) which installed the named
@@ -91,18 +102,6 @@ interface IPackageManagerNative {
      * package.
      */
     @utf8InCpp String getModuleMetadataPackageName();
-
-    /* Returns the names of all packages. */
-    @utf8InCpp String[] getAllPackages();
-
-    /** Register an extra package change observer to receive the multi-cast. */
-    void registerPackageChangeObserver(in IPackageChangeObserver observer);
-
-    /**
-     * Unregister an existing package change observer.
-     * This does nothing if this observer was not already registered.
-     */
-    void unregisterPackageChangeObserver(in IPackageChangeObserver observer);
 
     /**
      * Returns true if the package has the SHA 256 version of the signing certificate.

@@ -29,13 +29,18 @@ namespace android {
 
 struct NativeLoaderNamespace;
 
+// The GraphicsEnv is a singleton per application process and is used to properly set up the
+// graphics drivers for the application process during application starts. The architecture of
+// the graphics driver loader does not support runtime switch and only supports switch to different
+// graphics drivers when application process launches and hence the only way to switch to different
+// graphics drivers is to completely kill the application process and relaunch the application.
 class GraphicsEnv {
 public:
     static GraphicsEnv& getInstance();
 
     // Check if the process is debuggable. It returns false except in any of the
     // following circumstances:
-    // 1. ro.debuggable=1 (global debuggable enabled).
+    // 1. ANDROID_DEBUGGABLE is defined (global debuggable enabled).
     // 2. android:debuggable="true" in the manifest for an individual app.
     // 3. An app which explicitly calls prctl(PR_SET_DUMPABLE, 1).
     // 4. GraphicsEnv calls prctl(PR_SET_DUMPABLE, 1) in the presence of
@@ -55,7 +60,7 @@ public:
     // Also set additional required sphal libraries to the linker for loading
     // graphics drivers. The string is a list of libraries separated by ':',
     // which is required by android_link_namespaces.
-    void setDriverPathAndSphalLibraries(const std::string path, const std::string sphalLibraries);
+    void setDriverPathAndSphalLibraries(const std::string& path, const std::string& sphalLibraries);
     // Get the updatable driver namespace.
     android_namespace_t* getDriverNamespace();
     std::string getDriverPath() const;
@@ -71,10 +76,21 @@ public:
                      const std::string& appPackageName, const int32_t vulkanVersion);
     // Set stats for target GpuStatsInfo::Stats type.
     void setTargetStats(const GpuStatsInfo::Stats stats, const uint64_t value = 0);
+    // Set array of stats for target GpuStatsInfo::Stats type.
+    void setTargetStatsArray(const GpuStatsInfo::Stats stats, const uint64_t* values,
+                             const uint32_t valueCount);
     // Set which driver is intended to load.
     void setDriverToLoad(GpuStatsInfo::Driver driver);
     // Set which driver is actually loaded.
     void setDriverLoaded(GpuStatsInfo::Api api, bool isDriverLoaded, int64_t driverLoadingTime);
+    // Set which instance extensions are enabled for the app.
+    void setVulkanInstanceExtensions(uint32_t enabledExtensionCount,
+                                     const char* const* ppEnabledExtensionNames);
+    // Set which device extensions are enabled for the app.
+    void setVulkanDeviceExtensions(uint32_t enabledExtensionCount,
+                                   const char* const* ppEnabledExtensionNames);
+    // Add the engine name passed in VkApplicationInfo during CreateInstance
+    void addVulkanEngineName(const char* engineName);
 
     /*
      * Api for Vk/GL layer injection.  Presently, drivers enable certain
@@ -87,105 +103,109 @@ public:
     /*
      * Apis for ANGLE
      */
-    // Check if the requested app should use ANGLE.
-    bool shouldUseAngle(std::string appName);
     // Check if this app process should use ANGLE.
     bool shouldUseAngle();
-    // If ANGLE is the system GLES driver
-    bool angleIsSystemDriver();
-    // If should use legacy driver instead of a system ANGLE driver
-    bool shouldForceLegacyDriver();
     // Set a search path for loading ANGLE libraries. The path is a list of
     // directories separated by ':'. A directory can be contained in a zip file
     // (libraries must be stored uncompressed and page aligned); such elements
     // in the search path must have a '!' after the zip filename, e.g.
     //     /system/app/ANGLEPrebuilt/ANGLEPrebuilt.apk!/lib/arm64-v8a
-    void setAngleInfo(const std::string path, const std::string appName,
-                      const bool angleIsSystemDriver, std::string devOptIn,
-                      const std::vector<std::string> eglFeatures);
-    // Set the state so that the legacy driver will be used, and in case ANGLE
-    // is the system driver, provide the name of the legacy driver.
-    void setLegacyDriverInfo(const std::string appName, const bool angleIsSystemDriver,
-                             const std::string legacyDriverName);
+    // If the search patch is "system", then it means the system ANGLE should be used.
+    // If shouldUseNativeDriver is true, it means native GLES drivers must be used for the process.
+    // If path is set to nonempty and shouldUseNativeDriver is true, ANGLE will be used regardless.
+    void setAngleInfo(const std::string& path, const bool shouldUseNativeDriver,
+                      const std::string& packageName, const std::vector<std::string> eglFeatures);
     // Get the ANGLE driver namespace.
     android_namespace_t* getAngleNamespace();
-    // Get the app name for ANGLE debug message.
-    std::string& getAngleAppName();
-    // Get the legacy driver's suffix name.
-    std::string getLegacySuffix();
-
+    // Get the app package name.
+    std::string& getPackageName();
     const std::vector<std::string>& getAngleEglFeatures();
+    // Set the persist.graphics.egl system property value.
+    void nativeToggleAngleAsSystemDriver(bool enabled);
+    bool shouldUseSystemAngle();
+    bool shouldUseNativeDriver();
 
     /*
      * Apis for debug layer
      */
     // Set additional layer search paths.
-    void setLayerPaths(NativeLoaderNamespace* appNamespace, const std::string layerPaths);
+    void setLayerPaths(NativeLoaderNamespace* appNamespace, const std::string& layerPaths);
     // Get the app namespace for loading layers.
     NativeLoaderNamespace* getAppNamespace();
     // Get additional layer search paths.
     const std::string& getLayerPaths();
     // Set the Vulkan debug layers.
-    void setDebugLayers(const std::string layers);
+    void setDebugLayers(const std::string& layers);
     // Set the GL debug layers.
-    void setDebugLayersGLES(const std::string layers);
+    void setDebugLayersGLES(const std::string& layers);
     // Get the debug layers to load.
     const std::string& getDebugLayers();
     // Get the debug layers to load.
     const std::string& getDebugLayersGLES();
 
 private:
-    enum UseAngle { UNKNOWN, YES, NO };
-
-    // Load requested ANGLE library.
-    void* loadLibrary(std::string name);
-    // Update whether ANGLE should be used.
-    void updateUseAngle();
     // Link updatable driver namespace with llndk and vndk-sp libs.
-    bool linkDriverNamespaceLocked(android_namespace_t* vndkNamespace);
+    bool linkDriverNamespaceLocked(android_namespace_t* destNamespace,
+                                   android_namespace_t* vndkNamespace,
+                                   const std::string& sharedSphalLibraries);
     // Check whether this process is ready to send stats.
     bool readyToSendGpuStatsLocked();
     // Send the initial complete GpuStats to GpuService.
     void sendGpuStatsLocked(GpuStatsInfo::Api api, bool isDriverLoaded, int64_t driverLoadingTime);
 
     GraphicsEnv() = default;
+
+    // This mutex protects the namespace creation.
+    std::mutex mNamespaceMutex;
+
+    /**
+     * Updatable driver variables.
+     */
     // Path to updatable driver libs.
     std::string mDriverPath;
     // Path to additional sphal libs linked to updatable driver namespace.
     std::string mSphalLibraries;
+    // Updatable driver namespace.
+    android_namespace_t* mDriverNamespace = nullptr;
+
+    /**
+     * ANGLE variables.
+     */
+    // Path to ANGLE libs.
+    std::string mAnglePath;
+    // App's package name.
+    std::string mPackageName;
+    // ANGLE EGL features;
+    std::vector<std::string> mAngleEglFeatures;
+    // Whether ANGLE should be used.
+    bool mShouldUseAngle = false;
+    // Whether loader should load system ANGLE.
+    bool mShouldUseSystemAngle = false;
+    // Whether loader should load native GLES driver.
+    bool mShouldUseNativeDriver = false;
+    // ANGLE namespace.
+    android_namespace_t* mAngleNamespace = nullptr;
+
+    /**
+     * GPU metrics.
+     */
     // This mutex protects mGpuStats and get gpuservice call.
     std::mutex mStatsLock;
     // Cache the activity launch info
     bool mActivityLaunched = false;
     // Information bookkept for GpuStats.
     GpuStatsInfo mGpuStats;
-    // Path to ANGLE libs.
-    std::string mAnglePath;
-    // This App's name.
-    std::string mAngleAppName;
-    // ANGLE developer opt in status.
-    std::string mAngleDeveloperOptIn;
-    // ANGLE EGL features;
-    std::vector<std::string> mAngleEglFeatures;
-    // ANGLE is System Driver flag.
-    UseAngle mAngleIsSystemDriver = UNKNOWN;
-    // Legacy driver name to use when ANGLE is the system driver.
-    std::string mLegacyDriverSuffix;
-    // Use ANGLE flag.
-    UseAngle mUseAngle = UNKNOWN;
+
+    /**
+     * Debug layers.
+     */
     // Vulkan debug layers libs.
     std::string mDebugLayers;
     // GL debug layers libs.
     std::string mDebugLayersGLES;
     // Additional debug layers search path.
     std::string mLayerPaths;
-    // This mutex protects the namespace creation.
-    std::mutex mNamespaceMutex;
-    // Updatable driver namespace.
-    android_namespace_t* mDriverNamespace = nullptr;
-    // ANGLE namespace.
-    android_namespace_t* mAngleNamespace = nullptr;
-    // This App's namespace.
+    // This App's namespace to open native libraries.
     NativeLoaderNamespace* mAppNamespace = nullptr;
 };
 

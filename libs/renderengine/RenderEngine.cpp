@@ -16,38 +16,71 @@
 
 #include <renderengine/RenderEngine.h>
 
+#include "renderengine/ExternalTexture.h"
+#include "skia/GaneshVkRenderEngine.h"
+#include "skia/GraphiteVkRenderEngine.h"
+#include "skia/SkiaGLRenderEngine.h"
+#include "threaded/RenderEngineThreaded.h"
+#include "ui/GraphicTypes.h"
+
+#include <com_android_graphics_surfaceflinger_flags.h>
 #include <cutils/properties.h>
 #include <log/log.h>
-#include "gl/GLESRenderEngine.h"
-#include "threaded/RenderEngineThreaded.h"
 
-#include "skia/SkiaGLRenderEngine.h"
+// TODO: b/341728634 - Clean up conditional compilation.
+#if COM_ANDROID_GRAPHICS_SURFACEFLINGER_FLAGS(GRAPHITE_RENDERENGINE) || \
+        COM_ANDROID_GRAPHICS_SURFACEFLINGER_FLAGS(FORCE_COMPILE_GRAPHITE_RENDERENGINE)
+#define COMPILE_GRAPHITE_RENDERENGINE 1
+#else
+#define COMPILE_GRAPHITE_RENDERENGINE 0
+#endif
 
 namespace android {
 namespace renderengine {
 
 std::unique_ptr<RenderEngine> RenderEngine::create(const RenderEngineCreationArgs& args) {
-    switch (args.renderEngineType) {
-        case RenderEngineType::THREADED:
-            ALOGD("Threaded RenderEngine with GLES Backend");
-            return renderengine::threaded::RenderEngineThreaded::create(
-                    [args]() { return android::renderengine::gl::GLESRenderEngine::create(args); },
-                    args.renderEngineType);
-        case RenderEngineType::SKIA_GL:
-            ALOGD("RenderEngine with SkiaGL Backend");
-            return renderengine::skia::SkiaGLRenderEngine::create(args);
-        case RenderEngineType::SKIA_GL_THREADED: {
-            ALOGD("Threaded RenderEngine with SkiaGL Backend");
-            return renderengine::threaded::RenderEngineThreaded::create(
-                    [args]() {
-                        return android::renderengine::skia::SkiaGLRenderEngine::create(args);
-                    },
-                    args.renderEngineType);
+    threaded::CreateInstanceFactory createInstanceFactory;
+
+// TODO: b/341728634 - Clean up conditional compilation.
+#if COMPILE_GRAPHITE_RENDERENGINE
+    const RenderEngine::SkiaBackend actualSkiaBackend = args.skiaBackend;
+#else
+    if (args.skiaBackend == RenderEngine::SkiaBackend::GRAPHITE) {
+        ALOGE("RenderEngine with Graphite Skia backend was requested, but Graphite was not "
+              "included in the build. Falling back to Ganesh (%s)",
+              args.graphicsApi == RenderEngine::GraphicsApi::GL ? "GL" : "Vulkan");
+    }
+    const RenderEngine::SkiaBackend actualSkiaBackend = RenderEngine::SkiaBackend::GANESH;
+#endif
+
+    ALOGD("%sRenderEngine with %s Backend (%s)", args.threaded == Threaded::YES ? "Threaded " : "",
+          args.graphicsApi == GraphicsApi::GL ? "SkiaGL" : "SkiaVK",
+          actualSkiaBackend == SkiaBackend::GANESH ? "Ganesh" : "Graphite");
+
+// TODO: b/341728634 - Clean up conditional compilation.
+#if COMPILE_GRAPHITE_RENDERENGINE
+    if (actualSkiaBackend == SkiaBackend::GRAPHITE) {
+        createInstanceFactory = [args]() {
+            return android::renderengine::skia::GraphiteVkRenderEngine::create(args);
+        };
+    } else
+#endif
+    { // GANESH
+        if (args.graphicsApi == GraphicsApi::VK) {
+            createInstanceFactory = [args]() {
+                return android::renderengine::skia::GaneshVkRenderEngine::create(args);
+            };
+        } else { // GL
+            createInstanceFactory = [args]() {
+                return android::renderengine::skia::SkiaGLRenderEngine::create(args);
+            };
         }
-        case RenderEngineType::GLES:
-        default:
-            ALOGD("RenderEngine with GLES Backend");
-            return renderengine::gl::GLESRenderEngine::create(args);
+    }
+
+    if (args.threaded == Threaded::YES) {
+        return renderengine::threaded::RenderEngineThreaded::create(createInstanceFactory);
+    } else {
+        return createInstanceFactory();
     }
 }
 
@@ -63,15 +96,43 @@ void RenderEngine::validateOutputBufferUsage(const sp<GraphicBuffer>& buffer) {
                         "output buffer not gpu writeable");
 }
 
-std::future<RenderEngineResult> RenderEngine::drawLayers(
-        const DisplaySettings& display, const std::vector<LayerSettings>& layers,
-        const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
-        base::unique_fd&& bufferFence) {
-    const auto resultPromise = std::make_shared<std::promise<RenderEngineResult>>();
-    std::future<RenderEngineResult> resultFuture = resultPromise->get_future();
-    drawLayersInternal(std::move(resultPromise), display, layers, buffer, useFramebufferCache,
-                       std::move(bufferFence));
+ftl::Future<FenceResult> RenderEngine::drawLayers(const DisplaySettings& display,
+                                                  const std::vector<LayerSettings>& layers,
+                                                  const std::shared_ptr<ExternalTexture>& buffer,
+                                                  base::unique_fd&& bufferFence) {
+    const auto resultPromise = std::make_shared<std::promise<FenceResult>>();
+    std::future<FenceResult> resultFuture = resultPromise->get_future();
+    updateProtectedContext(layers, {buffer.get()});
+    drawLayersInternal(std::move(resultPromise), display, layers, buffer, std::move(bufferFence));
     return resultFuture;
+}
+
+ftl::Future<FenceResult> RenderEngine::drawGainmap(
+        const std::shared_ptr<ExternalTexture>& sdr, base::borrowed_fd&& sdrFence,
+        const std::shared_ptr<ExternalTexture>& hdr, base::borrowed_fd&& hdrFence,
+        float hdrSdrRatio, ui::Dataspace dataspace,
+        const std::shared_ptr<ExternalTexture>& gainmap) {
+    const auto resultPromise = std::make_shared<std::promise<FenceResult>>();
+    std::future<FenceResult> resultFuture = resultPromise->get_future();
+    updateProtectedContext({}, {sdr.get(), hdr.get(), gainmap.get()});
+    drawGainmapInternal(std::move(resultPromise), sdr, std::move(sdrFence), hdr,
+                        std::move(hdrFence), hdrSdrRatio, dataspace, gainmap);
+    return resultFuture;
+}
+
+void RenderEngine::updateProtectedContext(const std::vector<LayerSettings>& layers,
+                                          vector<const ExternalTexture*> buffers) {
+    const bool needsProtectedContext =
+            std::any_of(layers.begin(), layers.end(),
+                        [](const LayerSettings& layer) {
+                            const std::shared_ptr<ExternalTexture>& buffer =
+                                    layer.source.buffer.buffer;
+                            return buffer && (buffer->getUsage() & GRALLOC_USAGE_PROTECTED);
+                        }) ||
+            std::any_of(buffers.begin(), buffers.end(), [](const ExternalTexture* buffer) {
+                return buffer && (buffer->getUsage() & GRALLOC_USAGE_PROTECTED);
+            });
+    useProtectedContext(needsProtectedContext);
 }
 
 } // namespace renderengine
